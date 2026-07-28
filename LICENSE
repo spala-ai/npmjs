@@ -1,0 +1,17 @@
+Spala MCP Installer Developer-Use License
+
+Copyright (c) Spala.
+All rights reserved.
+
+Permission is granted to use, copy, and run this package for connecting
+development tools to Spala MCP servers and for developing, testing, or operating
+Spala projects.
+
+You may not sell, relicense, redistribute as a standalone competing installer,
+or use this package to provide a non-Spala MCP installation service without
+prior written permission from Spala.
+
+This package is provided "as is", without warranty of any kind, express or
+implied, including but not limited to warranties of merchantability, fitness for
+a particular purpose, and noninfringement. Spala is not liable for any claim,
+damages, or other liability arising from use of this package.

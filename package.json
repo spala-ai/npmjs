@@ -1,0 +1,53 @@
+{
+  "name": "@spala-ai/mcp-install",
+  "version": "0.1.14",
+  "description": "Install Spala Public MCP and project MCP servers into local AI coding clients.",
+  "homepage": "https://docs.spala.ai/agents/mcp/",
+  "readmeFilename": "README.md",
+  "keywords": [
+    "spala",
+    "spala-mcp",
+    "public-mcp",
+    "mcp",
+    "remote-mcp",
+    "model-context-protocol",
+    "agents",
+    "codex",
+    "claude-code",
+    "gemini-cli",
+    "ai-backend",
+    "backend-builder",
+    "ai-tools",
+    "installer"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spala-ai/npmjs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/spala-ai/npmjs/issues"
+  },
+  "bin": {
+    "spala-ai": "bin/spala-mcp-install.js",
+    "spala-mcp-install": "bin/spala-mcp-install.js",
+    "mcp-install": "bin/spala-mcp-install.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "ci": "pnpm test && pnpm pack"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@10.13.1",
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "license": "SEE LICENSE IN LICENSE"
+}

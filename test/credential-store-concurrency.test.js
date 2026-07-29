@@ -109,6 +109,25 @@ async function runWorker(options) {
 
   installLockHooks(options);
 
+  if (options.pauseAfterRestoreGuardRename) {
+    const renameSync = fs.renameSync;
+    let paused = false;
+    fs.renameSync = (source, destination, ...args) => {
+      const result = renameSync(source, destination, ...args);
+      if (
+        !paused
+        && source === path.basename(storePath)
+        && typeof destination === 'string'
+        && destination.startsWith('.mcp-credentials.restore-')
+      ) {
+        paused = true;
+        writeMarker(options.markerPath);
+        waitForRelease(options.releasePath);
+      }
+      return result;
+    };
+  }
+
   if (options.pauseAfterRecoveryPublication) {
     const renameSync = fs.renameSync;
     let paused = false;
@@ -835,6 +854,53 @@ if (process.argv[2] !== WORKER_FLAG) test('a prepared 0.1.15 rename landing afte
   ].sort());
 });
 
+if (process.argv[2] !== WORKER_FLAG) test('a same-project 0.1.15 rename landing after 0.1.16 returns cannot replace the new credential', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'legacy-late-same-project';
+  const markerPath = path.join(coordination, 'legacy-ready');
+  const releasePath = path.join(coordination, 'release-legacy');
+  const landedPath = path.join(coordination, 'legacy-landed');
+  storeFixtureCredential(credentialHome, projectId, 'mcp_legacy_late_same_original');
+  const storePath = credentialStorePath(env);
+  const legacy = startWorker({
+    credentialHome,
+    writerVersion: '0.1.15',
+    version015ModulePath: prepareVersion015Module(),
+    projectId,
+    bearerToken: 'mcp_legacy_late_same_stale',
+    pauseBeforeLegacyRename: true,
+    markerPath,
+    releasePath,
+    landedPath,
+  });
+  await waitForPath(markerPath, legacy);
+
+  const current = storeFixtureCredential(
+    credentialHome,
+    projectId,
+    'mcp_legacy_late_same_current',
+  );
+  assert.equal(current.changed, true);
+  writeMarker(releasePath);
+  await waitForPath(landedPath, legacy);
+  assertSuccessfulWorker(await legacy.exited);
+  assert.equal(
+    JSON.parse(fs.readFileSync(storePath, 'utf8')).projects[projectId].bearerToken,
+    'mcp_legacy_late_same_stale',
+  );
+
+  assert.equal(
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_legacy_late_same_current',
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(storePath, 'utf8')).projects[projectId].bearerToken,
+    'mcp_legacy_late_same_current',
+  );
+});
+
 if (process.argv[2] !== WORKER_FLAG) test('process death after recovery publication repairs a missing canonical store', async () => {
   const credentialHome = tempHome();
   const coordination = tempHome();
@@ -866,6 +932,46 @@ if (process.argv[2] !== WORKER_FLAG) test('process death after recovery publicat
   );
   assertCredentialPathKindsAndModes(storePath);
   assert.equal((fs.statSync(`${storePath}.recovery`).mode & 0o777), 0o600);
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('restart removes a restore guard containing the historical credential after process death', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'crashed-restore-guard-project';
+  const historicalBearer = 'mcp_crashed_restore_guard_historical';
+  const currentBearer = 'mcp_crashed_restore_guard_current';
+  const markerPath = path.join(coordination, 'guard-renamed');
+  storeFixtureCredential(credentialHome, projectId, historicalBearer);
+  const storePath = credentialStorePath(env);
+  const worker = startWorker({
+    credentialHome,
+    projectId,
+    bearerToken: currentBearer,
+    pauseAfterRestoreGuardRename: true,
+    markerPath,
+    releasePath: path.join(coordination, 'never-release'),
+  });
+  await waitForPath(markerPath, worker);
+  worker.child.kill('SIGKILL');
+  const crashed = await worker.exited;
+  assert.notEqual(crashed.code, 0);
+
+  const credentialDirectory = path.dirname(storePath);
+  const guards = fs.readdirSync(credentialDirectory)
+    .filter(name => name.startsWith('.mcp-credentials.restore-'));
+  assert.equal(guards.length, 1);
+  assert.equal(
+    fs.readFileSync(path.join(credentialDirectory, guards[0]), 'utf8')
+      .includes(historicalBearer),
+    true,
+  );
+  const staleTime = new Date(Date.now() - 60_000);
+  fs.utimesSync(`${storePath}.lock`, staleTime, staleTime);
+
+  assert.equal(readProjectCredential(projectId, env).bearerToken, currentBearer);
+  assertNoCredentialArtifacts(credentialDirectory);
+  assertTreeDoesNotContain(credentialDirectory, historicalBearer);
 });
 
 if (process.argv[2] !== WORKER_FLAG) test('process death during canonical write repairs a partial file from recovery state', async () => {
@@ -1139,13 +1245,7 @@ if (process.argv[2] !== WORKER_FLAG) test('bounded publication contention fails 
   assert.equal(readProjectCredential(legacyProject, env).bearerToken, legacyBearer);
   assert.throws(() => readProjectCredential(intendedProject, env), /No agentic MCP credential/);
 
-  const guardedStores = fs.readdirSync(path.dirname(storePath))
-    .filter(name => name.startsWith('.mcp-credentials.restore-'))
-    .map(name => JSON.parse(fs.readFileSync(path.join(path.dirname(storePath), name), 'utf8')));
-  assert.ok(guardedStores.some(store => (
-    store.projects[existingProject]?.bearerToken === existingBearer
-  )));
-  assert.equal(guardedStores.some(store => Object.hasOwn(store.projects, intendedProject)), false);
+  assertNoCredentialArtifacts(path.dirname(storePath));
 });
 
 if (process.argv[2] !== WORKER_FLAG) test('a hard-linked credential store fails closed', {

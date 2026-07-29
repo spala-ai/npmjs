@@ -35,8 +35,8 @@ import {
   hasProjectCredential,
   preflightCredentialStore,
   removeProjectCredential,
-  restoreCredentialStore,
-  snapshotCredentialStore,
+  restoreProjectCredentialIfCurrent,
+  snapshotProjectCredential,
   storeProjectCredential,
 } from './credentialStore.js';
 import { runProxy } from './proxy.js';
@@ -1098,7 +1098,11 @@ function preserveExistingCanonicalBinding(cwd, requestedBinding) {
     && existing.projectId === requestedBinding.projectId
     && existing.projectUrl === requestedBinding.projectUrl
     && existing.serverName === requestedBinding.serverName;
-  return sameProject && mcpEndpointsMatch(existing.mcpUrl, requestedBinding.mcpUrl)
+  const existingScope = new URL(existing.mcpUrl).searchParams.get('scope');
+  const requestedScope = new URL(requestedBinding.mcpUrl).searchParams.get('scope');
+  const compatibleEndpoint = mcpUrlsMatch(existing.mcpUrl, requestedBinding.mcpUrl)
+    || (!existingScope || !requestedScope) && mcpEndpointsMatch(existing.mcpUrl, requestedBinding.mcpUrl);
+  return sameProject && compatibleEndpoint
     ? existing
     : requestedBinding;
 }
@@ -1239,9 +1243,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       mcpUrl,
       serverName,
     };
-    const bindingInput = agentic
-      ? preserveExistingCanonicalBinding(cwd, requestedBinding)
-      : requestedBinding;
+    const bindingInput = preserveExistingCanonicalBinding(cwd, requestedBinding);
     const bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
     const plan = agentic
       ? createProxyInstallPlan({
@@ -1261,7 +1263,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         exactUrl: true,
         installScope: 'workspace',
         scope: '',
-        mcpUrl,
+        mcpUrl: bindingPlan.binding.mcpUrl,
         serverName,
       });
     const selectedUnsupported = plan.skipped.filter(item => item.unsupportedScope);
@@ -1303,11 +1305,16 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
     let credentialSnapshot;
+    let attemptedCredential;
     try {
       let bootstrapUrl;
       if (agentic) {
         bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
-        credentialSnapshot = snapshotCredentialStore(env, bindingPlan.workspaceRoot);
+        credentialSnapshot = snapshotProjectCredential(
+          bindingPlan.binding.projectId,
+          env,
+          bindingPlan.workspaceRoot,
+        );
         preflightCredentialStore(env, bindingPlan.workspaceRoot);
       }
 
@@ -1333,18 +1340,25 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           );
         }
         const persistCredential = runtime.storeProjectCredential || storeProjectCredential;
-        persistCredential({
+        attemptedCredential = {
           projectId: bindingPlan.binding.projectId,
           mcpUrl: exchanged.mcpUrl,
           bearerToken: exchanged.bearerToken,
           expiresAt: exchanged.expiresAt,
-        }, env, bindingPlan.workspaceRoot);
+        };
+        persistCredential(attemptedCredential, env, bindingPlan.workspaceRoot);
       }
     } catch (error) {
       const failures = [];
-      if (agentic && credentialSnapshot !== undefined) {
+      if (agentic && attemptedCredential) {
         try {
-          restoreCredentialStore(credentialSnapshot);
+          restoreProjectCredentialIfCurrent(
+            bindingPlan.binding.projectId,
+            credentialSnapshot,
+            attemptedCredential,
+            env,
+            bindingPlan.workspaceRoot,
+          );
         } catch (rollbackError) {
           failures.push(`credential rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
         }

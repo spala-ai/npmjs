@@ -1,7 +1,13 @@
 import fs from 'node:fs';
-import { mcpEndpointsMatch, normalizeComparableMcpUrl } from './installer.js';
+import {
+  DEFAULT_PROJECT_SCOPE,
+  mcpEndpointsMatch,
+  normalizeComparableMcpUrl,
+  normalizeMcpUrl,
+} from './installer.js';
 
 const MAX_BOOTSTRAP_CAPABILITY_BYTES = 16 * 1024;
+const ALLOWED_PROJECT_SCOPES = new Set(DEFAULT_PROJECT_SCOPE.split(','));
 
 function isLocalHost(hostname) {
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname);
@@ -114,8 +120,44 @@ export async function readBootstrapCapability({ stdin, fd, stderr } = {}) {
   return values[0];
 }
 
+function projectScopeSet(mcpUrl, label) {
+  const parsed = new URL(normalizeMcpUrl(mcpUrl, '', true));
+  const values = parsed.searchParams.getAll('scope');
+  if (values.length === 0) return null;
+  if (values.length !== 1 || !values[0]) {
+    throw new Error(`${label} contains an invalid project MCP scope.`);
+  }
+  const scopes = values[0].split(',');
+  if (scopes.some(scope => !scope || !ALLOWED_PROJECT_SCOPES.has(scope))) {
+    throw new Error(`${label} contains an unknown project MCP scope.`);
+  }
+  if (new Set(scopes).size !== scopes.length) {
+    throw new Error(`${label} contains duplicate project MCP scopes.`);
+  }
+  return new Set(scopes);
+}
+
+function scopesEqual(left, right) {
+  return left.size === right.size && [...left].every(scope => right.has(scope));
+}
+
+function validateBootstrapScopes(requestedMcpUrl, responseMcpUrl) {
+  const requested = projectScopeSet(requestedMcpUrl, 'The requested MCP URL');
+  const response = projectScopeSet(responseMcpUrl, 'The bootstrap response MCP URL');
+  if (requested) {
+    if (!response || !scopesEqual(requested, response)) {
+      throw new Error('The one-time project bootstrap response changed the requested MCP authorization scope.');
+    }
+    return;
+  }
+  if (response && !scopesEqual(response, new Set(ALLOWED_PROJECT_SCOPES))) {
+    throw new Error('A bare MCP URL may only adopt the canonical default project scope.');
+  }
+}
+
 export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, fetchImpl = globalThis.fetch }) {
   const validatedUrl = validateBootstrapUrl(bootstrapUrl, projectUrl);
+  projectScopeSet(mcpUrl, 'The requested MCP URL');
   if (typeof fetchImpl !== 'function') throw new Error('Bootstrap exchange is unavailable in this Node runtime.');
   let response;
   try {
@@ -149,6 +191,7 @@ export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, fetch
   if (!responseMcpUrl || !mcpEndpointsMatch(responseMcpUrl, mcpUrl)) {
     throw new Error('The one-time project bootstrap response did not match the requested MCP endpoint.');
   }
+  validateBootstrapScopes(mcpUrl, responseMcpUrl);
   const expiresAt = payload?.expires_at;
   if (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.now()) {
     throw new Error('The one-time project bootstrap response did not include a valid credential expiry.');

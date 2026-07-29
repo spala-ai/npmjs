@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { mcpUrlsMatch, normalizeMcpUrl } from './installer.js';
+import { mcpEndpointsMatch, normalizeComparableMcpUrl } from './installer.js';
 
 const MAX_BOOTSTRAP_CAPABILITY_BYTES = 16 * 1024;
 
@@ -141,13 +141,12 @@ export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, fetch
   if (typeof bearerToken !== 'string' || !bearerToken || bearerToken.length > 16 * 1024 || /[\0\r\n]/.test(bearerToken)) {
     throw new Error('The one-time project bootstrap response did not contain a valid MCP bearer.');
   }
-  let responseMcpUrl;
-  try {
-    responseMcpUrl = typeof payload?.mcp_url === 'string' ? normalizeMcpUrl(payload.mcp_url, '', true) : undefined;
-  } catch {
-    throw new Error('The one-time project bootstrap response did not match the requested MCP endpoint.');
-  }
-  if (!responseMcpUrl || !mcpUrlsMatch(responseMcpUrl, mcpUrl)) {
+  // Canonical endpoint form: validated https URL, trailing slash trimmed,
+  // scope query preserved. This is what gets stored and bound.
+  const responseMcpUrl = typeof payload?.mcp_url === 'string'
+    ? normalizeComparableMcpUrl(payload.mcp_url)
+    : undefined;
+  if (!responseMcpUrl || !mcpEndpointsMatch(responseMcpUrl, mcpUrl)) {
     throw new Error('The one-time project bootstrap response did not match the requested MCP endpoint.');
   }
   const expiresAt = payload?.expires_at;

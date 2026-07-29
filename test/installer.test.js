@@ -4576,6 +4576,70 @@ test('proxy reads its user credential and forwards bearer auth without printing 
   assert.doesNotMatch(output, new RegExp(bearerToken));
 });
 
+test('proxy re-reads credentials per request, errors on expiry, and heals after a re-bind', async () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const filePath = credentialStorePath(env);
+  const writeCredential = (bearerToken, expiresAt) => {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      schemaVersion: 1,
+      projects: {
+        'project-123': {
+          mcpUrl: 'https://shared.spala.ai/p123/mcp',
+          bearerToken,
+          expiresAt,
+          status: 'active',
+        },
+      },
+    })}\n`, { mode: 0o600 });
+  };
+  writeCredential('bearer-alpha', new Date(Date.now() + 60_000).toISOString());
+
+  const lines = [];
+  const seenBearers = [];
+  const outputReaches = async count => {
+    while (lines.length < count) await new Promise(resolve => setTimeout(resolve, 5));
+  };
+  // Readable.from pre-pulls generator values, so each mutation must wait for
+  // the proxy to have answered the previous request before it runs.
+  async function* script() {
+    yield `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`;
+    await outputReaches(1);
+    // Simulate the bearer expiring while the proxy process keeps running.
+    writeCredential('bearer-alpha', new Date(Date.now() - 1_000).toISOString());
+    yield `${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`;
+    await outputReaches(2);
+    // Simulate a fresh project bind writing a new credential to the store.
+    writeCredential('bearer-bravo', new Date(Date.now() + 60_000).toISOString());
+    yield `${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} })}\n`;
+  }
+  await runProxy({
+    projectId: 'project-123',
+    env,
+    stdin: Readable.from(script()),
+    stdout: { write: chunk => { lines.push(...String(chunk).split('\n').filter(Boolean)); } },
+    fetchImpl: async (url, options) => {
+      seenBearers.push(options.headers.authorization);
+      const request = JSON.parse(options.body);
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [] } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+
+  assert.deepEqual(seenBearers, ['Bearer bearer-alpha', 'Bearer bearer-bravo']);
+  const responses = lines.map(line => JSON.parse(line));
+  assert.equal(responses.length, 3);
+  assert.ok(responses[0].result);
+  assert.equal(responses[1].id, 2);
+  assert.match(responses[1].error?.message || '', /expired/i);
+  assert.match(responses[1].error?.message || '', /project_connect/);
+  assert.ok(responses[2].result, 'proxy must heal live after a re-bind');
+  assert.doesNotMatch(lines.join('\n'), /bearer-alpha|bearer-bravo/);
+});
+
 test('proxy rejects oversized JSON responses instead of buffering them', async () => {
   const credentialHome = tempHome();
   storeProjectCredential({

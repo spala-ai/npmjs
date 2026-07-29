@@ -5,6 +5,13 @@ import { randomUUID } from 'node:crypto';
 export const PROJECT_BINDING_SCHEMA_VERSION = 1;
 export const PROJECT_BINDING_RELATIVE_PATH = path.join('.spala', 'project.json');
 
+const PROJECT_BINDING_FILE_NAME = 'project.json';
+const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const DIRECTORY_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_DIRECTORY || 0)
+  | NOFOLLOW;
+const DIRECTORY_HANDLE_MARKER = Symbol('projectBindingDirectoryHandle');
+
 const BINDING_KEYS = new Set([
   'schemaVersion',
   'projectId',
@@ -111,6 +118,188 @@ function bindingPath(workspaceRoot) {
   return path.join(workspaceRoot, PROJECT_BINDING_RELATIVE_PATH);
 }
 
+function pathKind(stat) {
+  if (stat.isDirectory()) return 'directory';
+  if (stat.isFile()) return 'file';
+  return 'other';
+}
+
+function pathIdentity(stat) {
+  return {
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    kind: pathKind(stat),
+  };
+}
+
+function samePathIdentity(left, right) {
+  return Boolean(left && right)
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.kind === right.kind;
+}
+
+function lstatOrUndefined(filePath) {
+  try {
+    return fs.lstatSync(filePath, { bigint: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function bindingDirectoryChangedError() {
+  return new Error('.spala changed after it was inspected; refusing to continue.');
+}
+
+function chdirToDescriptor(descriptor, fallbackPath, expectedIdentity, label) {
+  if (samePathIdentity(pathIdentity(fs.statSync('.', { bigint: true })), expectedIdentity)) return;
+
+  const descriptorPath = process.platform === 'win32' ? undefined : `/dev/fd/${descriptor}`;
+  if (descriptorPath) {
+    try {
+      process.chdir(descriptorPath);
+      if (!samePathIdentity(pathIdentity(fs.statSync('.', { bigint: true })), expectedIdentity)) {
+        throw new Error(`${label} changed after it was inspected; refusing to continue.`);
+      }
+      return;
+    } catch (error) {
+      const unsupported = error
+        && typeof error === 'object'
+        && ['ENOENT', 'ENOTDIR', 'EACCES', 'EINVAL'].includes(error.code);
+      if (!unsupported) throw error;
+    }
+  }
+
+  const named = lstatOrUndefined(fallbackPath);
+  if (
+    !named
+    || named.isSymbolicLink()
+    || !named.isDirectory()
+    || !samePathIdentity(pathIdentity(named), expectedIdentity)
+  ) {
+    throw new Error(`${label} changed after it was inspected; refusing to continue.`);
+  }
+  process.chdir(fallbackPath);
+  if (!samePathIdentity(pathIdentity(fs.statSync('.', { bigint: true })), expectedIdentity)) {
+    throw new Error(`${label} changed after it was inspected; refusing to continue.`);
+  }
+}
+
+export function openProjectBindingDirectory(cwd = process.cwd()) {
+  const workspaceRoot = findWorkspaceRoot(cwd);
+  const directoryPath = path.join(workspaceRoot, '.spala');
+  assertNotSymlink(directoryPath, '.spala');
+  fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
+
+  const descriptor = fs.openSync(directoryPath, DIRECTORY_FLAGS);
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const directoryIdentity = pathIdentity(opened);
+    const named = lstatOrUndefined(directoryPath);
+    if (
+      !opened.isDirectory()
+      || !named
+      || named.isSymbolicLink()
+      || !named.isDirectory()
+      || !samePathIdentity(pathIdentity(named), directoryIdentity)
+    ) {
+      throw bindingDirectoryChangedError();
+    }
+    return {
+      [DIRECTORY_HANDLE_MARKER]: true,
+      closed: false,
+      descriptor,
+      directoryIdentity,
+      directoryPath,
+      workspaceRoot,
+    };
+  } catch (error) {
+    fs.closeSync(descriptor);
+    throw error;
+  }
+}
+
+export function closeProjectBindingDirectory(handle) {
+  if (!handle?.[DIRECTORY_HANDLE_MARKER] || handle.closed) return;
+  fs.closeSync(handle.descriptor);
+  handle.closed = true;
+}
+
+function assertBindingDirectoryCurrent(handle) {
+  const opened = fs.fstatSync(handle.descriptor, { bigint: true });
+  const named = lstatOrUndefined(handle.directoryPath);
+  if (
+    !opened.isDirectory()
+    || !samePathIdentity(pathIdentity(opened), handle.directoryIdentity)
+    || !named
+    || named.isSymbolicLink()
+    || !named.isDirectory()
+    || !samePathIdentity(pathIdentity(named), handle.directoryIdentity)
+  ) {
+    throw bindingDirectoryChangedError();
+  }
+}
+
+function withAnchoredBindingDirectory(handle, action) {
+  if (!handle?.[DIRECTORY_HANDLE_MARKER] || handle.closed) {
+    throw new Error('Project binding directory handle is closed or invalid.');
+  }
+
+  const previousPath = process.cwd();
+  const previousDescriptor = fs.openSync('.', DIRECTORY_FLAGS);
+  const previousIdentity = pathIdentity(fs.fstatSync(previousDescriptor, { bigint: true }));
+  let changedDirectory = false;
+  let restorationError;
+  try {
+    const opened = fs.fstatSync(handle.descriptor, { bigint: true });
+    if (
+      !opened.isDirectory()
+      || !samePathIdentity(pathIdentity(opened), handle.directoryIdentity)
+    ) {
+      throw bindingDirectoryChangedError();
+    }
+    chdirToDescriptor(
+      handle.descriptor,
+      handle.directoryPath,
+      handle.directoryIdentity,
+      '.spala',
+    );
+    changedDirectory = true;
+    return action();
+  } finally {
+    if (changedDirectory) {
+      try {
+        chdirToDescriptor(
+          previousDescriptor,
+          previousPath,
+          previousIdentity,
+          'Installer working directory',
+        );
+      } catch (error) {
+        restorationError = error;
+      }
+    }
+    fs.closeSync(previousDescriptor);
+    if (restorationError) throw restorationError;
+  }
+}
+
+function withProjectBindingDirectory(cwd, suppliedHandle, action) {
+  const handle = suppliedHandle || openProjectBindingDirectory(cwd);
+  if (
+    suppliedHandle
+    && path.resolve(findWorkspaceRoot(cwd)) !== path.resolve(handle.workspaceRoot)
+  ) {
+    throw new Error('Project binding directory handle belongs to a different workspace.');
+  }
+  try {
+    return withAnchoredBindingDirectory(handle, () => action(handle));
+  } finally {
+    if (!suppliedHandle) closeProjectBindingDirectory(handle);
+  }
+}
+
 function inspectBindingFile(filePath, label) {
   const stat = fs.lstatSync(filePath, { bigint: true });
   if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link.`);
@@ -179,13 +368,12 @@ function bindingConflictError() {
   return new Error('Workspace binding changed while the project bind was pending; refusing to replace it.');
 }
 
-function revisionForBinding(workspaceRoot, expectedBinding) {
-  const filePath = bindingPath(workspaceRoot);
-  assertNotSymlink(path.dirname(filePath), '.spala');
+function revisionForBinding(expectedBinding) {
+  const filePath = PROJECT_BINDING_FILE_NAME;
   assertNotSymlink(filePath, '.spala/project.json');
   const descriptor = fs.openSync(
     filePath,
-    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
+    fs.constants.O_RDONLY | NOFOLLOW,
   );
   try {
     const before = fs.fstatSync(descriptor, { bigint: true });
@@ -225,8 +413,8 @@ export function planProjectBinding(cwd, input, { switchProject = false } = {}) {
   };
 }
 
-function prepareBindingFile(directory, binding, purpose = 'tmp') {
-  const temporary = path.join(directory, `.project.json.${purpose}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+function prepareBindingFile(binding, purpose = 'tmp') {
+  const temporary = `.project.json.${purpose}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const body = `${JSON.stringify(binding, null, 2)}\n`;
   try {
     fs.writeFileSync(temporary, body, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
@@ -249,64 +437,170 @@ function discardBindingName(filePath, expectedRevision, label) {
   fs.unlinkSync(filePath);
 }
 
-function publishBindingNoReplace(sourcePath, filePath, expectedRevision, label) {
+function readStableBindingFile(filePath, label) {
+  let descriptor;
   try {
-    fs.linkSync(sourcePath, filePath);
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | NOFOLLOW);
+  } catch (error) {
+    if (
+      error
+      && typeof error === 'object'
+      && ['ENOENT', 'ELOOP', 'EMLINK'].includes(error.code)
+    ) {
+      return null;
+    }
+    throw error;
+  }
+
+  try {
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile()) throw new Error(`${label} must be a regular file.`);
+    if (before.nlink !== 1n) throw new Error(`${label} must not be a hard-linked file.`);
+    const content = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const revision = bindingRevisionFromStat(after);
+    const named = lstatOrUndefined(filePath);
+    if (
+      !sameBindingRevision(bindingRevisionFromStat(before), revision)
+      || String(before.ctimeNs) !== String(after.ctimeNs)
+      || !named
+      || named.isSymbolicLink()
+      || !named.isFile()
+      || named.nlink !== 1n
+      || !sameBindingRevision(bindingRevisionFromStat(named), revision)
+      || String(named.ctimeNs) !== String(after.ctimeNs)
+    ) {
+      return null;
+    }
+    return { content, revision };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function publishBindingNoReplace(sourcePath, filePath, expectedRevision, label) {
+  const source = readStableBindingFile(sourcePath, label);
+  if (!source || !sameBindingRevision(source.revision, expectedRevision)) {
+    throw new Error(`${label} changed before it was published; refusing to continue.`);
+  }
+
+  try {
+    fs.copyFileSync(sourcePath, filePath, fs.constants.COPYFILE_EXCL);
   } catch (error) {
     if (!error || typeof error !== 'object' || error.code !== 'EEXIST') throw error;
-    discardBindingName(sourcePath, expectedRevision, label);
-    return false;
+    return null;
   }
 
-  const stat = inspectBindingFile(sourcePath, label);
-  if (!sameBindingRevision(bindingRevisionFromStat(stat), expectedRevision)) {
-    throw new Error(`${label} changed while it was being published; refusing to remove it.`);
+  const sourceAfter = readStableBindingFile(sourcePath, label);
+  if (
+    !sourceAfter
+    || !sameBindingRevision(sourceAfter.revision, expectedRevision)
+    || !sourceAfter.content.equals(source.content)
+  ) {
+    throw new Error(`${label} changed while it was being published; refusing to continue.`);
   }
-  if (stat.nlink === 1n) {
-    discardBindingName(sourcePath, expectedRevision, label);
-    return false;
+
+  const published = readStableBindingFile(filePath, '.spala/project.json');
+  if (!published || !published.content.equals(source.content)) {
+    return null;
   }
-  if (stat.nlink !== 2n) throw new Error(`${label} must not have unexpected hard links.`);
-  fs.unlinkSync(sourcePath);
-  return true;
+  return published.revision;
 }
 
-function writeBindingFile(workspaceRoot, binding) {
-  const directory = path.join(workspaceRoot, '.spala');
-  assertNotSymlink(directory, '.spala');
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const filePath = bindingPath(workspaceRoot);
-  assertNotSymlink(filePath, '.spala/project.json');
-  const prepared = prepareBindingFile(directory, binding);
+function restoreIsolatedBinding(isolatedPath, isolatedRevision, label) {
+  const restoredRevision = publishBindingNoReplace(
+    isolatedPath,
+    PROJECT_BINDING_FILE_NAME,
+    isolatedRevision,
+    label,
+  );
+  discardBindingName(isolatedPath, isolatedRevision, label);
+  return restoredRevision;
+}
+
+function isolateProjectBinding(purpose, label) {
+  const isolatedPath = `.project.json.${purpose}-${process.pid}-${randomUUID()}`;
   try {
-    fs.renameSync(prepared.filePath, filePath);
-    return prepared.revision;
-  } finally {
-    if (fs.existsSync(prepared.filePath)) fs.unlinkSync(prepared.filePath);
+    fs.renameSync(PROJECT_BINDING_FILE_NAME, isolatedPath);
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  const isolatedStat = inspectBindingFile(isolatedPath, label);
+  if (isolatedStat.nlink !== 1n) throw new Error(`${label} must not be a hard-linked file.`);
+  return {
+    filePath: isolatedPath,
+    revision: bindingRevisionFromStat(isolatedStat),
+  };
+}
+
+function recoverFailedReplacement(publishedRevision, previous) {
+  const published = isolateProjectBinding(
+    'failed-publication',
+    '.spala/project.json failed publication guard',
+  );
+  if (!published) {
+    discardBindingName(
+      previous.filePath,
+      previous.revision,
+      '.spala/project.json revision guard',
+    );
+    return null;
+  }
+
+  const publishedIsOurs = sameBindingRevision(published.revision, publishedRevision);
+  const winner = publishedIsOurs ? previous : published;
+  const restoredRevision = restoreIsolatedBinding(
+    winner.filePath,
+    winner.revision,
+    publishedIsOurs
+      ? '.spala/project.json revision guard'
+      : '.spala/project.json failed publication guard',
+  );
+  if (winner !== previous) {
+    discardBindingName(
+      previous.filePath,
+      previous.revision,
+      '.spala/project.json revision guard',
+    );
+  }
+  if (winner !== published) {
+    discardBindingName(
+      published.filePath,
+      published.revision,
+      '.spala/project.json failed publication guard',
+    );
+  }
+  return publishedIsOurs ? restoredRevision : null;
+}
+
+function finishDirectoryChangeRecovery(handle, error, restoredRevision, failureRollback) {
+  if (restoredRevision && failureRollback) {
+    rollbackBindingInCurrentDirectory(
+      handle.workspaceRoot,
+      restoredRevision,
+      failureRollback.previousBinding,
+    );
+    if (error && typeof error === 'object') error.bindingRollbackCompleted = true;
+    return;
+  }
+  if (restoredRevision && error && typeof error === 'object') {
+    error.bindingRevisionAfterRecovery = restoredRevision;
   }
 }
 
-export function writeProjectBinding(cwd, input, { switchProject = false } = {}) {
-  const { binding, changed, workspaceRoot } = planProjectBinding(cwd, input, { switchProject });
-  if (!changed) {
-    const revision = revisionForBinding(workspaceRoot, binding);
-    return { binding, changed: false, revision, workspaceRoot };
-  }
-
-  const revision = writeBindingFile(workspaceRoot, binding);
-  return { binding, changed: true, revision, workspaceRoot };
-}
-
-export function replaceProjectBindingIfRevision(cwd, input, expectedRevision) {
-  const workspaceRoot = findWorkspaceRoot(cwd);
-  const binding = validateProjectBinding(input);
-  const filePath = bindingPath(workspaceRoot);
-  const directory = path.dirname(filePath);
-  assertNotSymlink(directory, '.spala');
-
+function replaceBindingIfRevision(
+  handle,
+  binding,
+  expectedRevision,
+  purpose = 'revision-update',
+  failureRollback,
+) {
   let currentStat;
   try {
-    currentStat = inspectBindingFile(filePath, '.spala/project.json');
+    currentStat = inspectBindingFile(PROJECT_BINDING_FILE_NAME, '.spala/project.json');
   } catch (error) {
     if (error && typeof error === 'object' && error.code === 'ENOENT') {
       throw bindingConflictError();
@@ -320,75 +614,86 @@ export function replaceProjectBindingIfRevision(cwd, input, expectedRevision) {
     throw bindingConflictError();
   }
 
-  const prepared = prepareBindingFile(directory, binding, 'revision-update');
-  const isolatedPath = path.join(
-    directory,
-    `.project.json.revision-guard-${process.pid}-${randomUUID()}`,
-  );
-  let isolatedRevision;
+  const prepared = prepareBindingFile(binding, purpose);
+  let previous;
 
   try {
+    assertBindingDirectoryCurrent(handle);
+    previous = isolateProjectBinding(
+      'revision-guard',
+      '.spala/project.json revision guard',
+    );
+    if (!previous) throw bindingConflictError();
+    if (!sameBindingRevision(previous.revision, expectedRevision)) {
+      restoreIsolatedBinding(
+        previous.filePath,
+        previous.revision,
+        '.spala/project.json revision guard',
+      );
+      previous = null;
+      throw bindingConflictError();
+    }
+
     try {
-      fs.renameSync(filePath, isolatedPath);
+      assertBindingDirectoryCurrent(handle);
     } catch (error) {
-      if (error && typeof error === 'object' && error.code === 'ENOENT') {
-        throw bindingConflictError();
-      }
+      const restoredRevision = restoreIsolatedBinding(
+        previous.filePath,
+        previous.revision,
+        '.spala/project.json revision guard',
+      );
+      previous = null;
+      finishDirectoryChangeRecovery(handle, error, restoredRevision, failureRollback);
       throw error;
     }
 
-    const isolatedStat = inspectBindingFile(isolatedPath, '.spala/project.json revision guard');
-    isolatedRevision = bindingRevisionFromStat(isolatedStat);
-    if (isolatedStat.nlink !== 1n) {
-      throw new Error('.spala/project.json revision guard must not be a hard-linked file.');
-    }
-    if (!sameBindingRevision(isolatedRevision, expectedRevision)) {
-      publishBindingNoReplace(
-        isolatedPath,
-        filePath,
-        isolatedRevision,
-        '.spala/project.json revision guard',
-      );
-      isolatedRevision = null;
-      throw bindingConflictError();
-    }
-
-    const updated = publishBindingNoReplace(
+    const publishedRevision = publishBindingNoReplace(
       prepared.filePath,
-      filePath,
+      PROJECT_BINDING_FILE_NAME,
       prepared.revision,
       '.spala project binding revision update temporary file',
     );
-    if (!updated) {
+    if (!publishedRevision) {
       discardBindingName(
-        isolatedPath,
-        isolatedRevision,
+        previous.filePath,
+        previous.revision,
         '.spala/project.json revision guard',
       );
-      isolatedRevision = null;
+      previous = null;
       throw bindingConflictError();
     }
 
+    try {
+      assertBindingDirectoryCurrent(handle);
+    } catch (error) {
+      const restoredRevision = recoverFailedReplacement(publishedRevision, previous);
+      previous = null;
+      finishDirectoryChangeRecovery(handle, error, restoredRevision, failureRollback);
+      throw error;
+    }
+
     discardBindingName(
-      isolatedPath,
-      isolatedRevision,
+      previous.filePath,
+      previous.revision,
       '.spala/project.json revision guard',
     );
-    isolatedRevision = null;
+    previous = null;
     return {
       binding,
       changed: true,
-      revision: prepared.revision,
-      workspaceRoot,
+      revision: publishedRevision,
+      workspaceRoot: handle.workspaceRoot,
     };
   } catch (error) {
-    if (isolatedRevision && fs.existsSync(isolatedPath)) {
-      publishBindingNoReplace(
-        isolatedPath,
-        filePath,
-        isolatedRevision,
+    if (previous && fs.existsSync(previous.filePath)) {
+      const restoredRevision = restoreIsolatedBinding(
+        previous.filePath,
+        previous.revision,
         '.spala/project.json revision guard',
       );
+      if (restoredRevision && error && typeof error === 'object') {
+        error.bindingRevisionAfterRecovery = restoredRevision;
+      }
     }
     throw error;
   } finally {
@@ -402,14 +707,87 @@ export function replaceProjectBindingIfRevision(cwd, input, expectedRevision) {
   }
 }
 
-export function rollbackProjectBinding(cwd, expectedRevision, previousBinding = null) {
-  const workspaceRoot = findWorkspaceRoot(cwd);
-  const filePath = bindingPath(workspaceRoot);
-  const directory = path.dirname(filePath);
-  assertNotSymlink(directory, '.spala');
+export function writeProjectBinding(cwd, input, {
+  switchProject = false,
+  directoryHandle,
+} = {}) {
+  const { binding, changed, existing, workspaceRoot } = planProjectBinding(
+    cwd,
+    input,
+    { switchProject },
+  );
+  return withProjectBindingDirectory(workspaceRoot, directoryHandle, handle => {
+    assertBindingDirectoryCurrent(handle);
+    if (!changed) {
+      const revision = revisionForBinding(binding);
+      assertBindingDirectoryCurrent(handle);
+      return { binding, changed: false, revision, workspaceRoot };
+    }
+
+    if (existing) {
+      const expectedRevision = revisionForBinding(existing);
+      return replaceBindingIfRevision(handle, binding, expectedRevision, 'switch-update');
+    }
+
+    const prepared = prepareBindingFile(binding);
+    try {
+      const revision = publishBindingNoReplace(
+        prepared.filePath,
+        PROJECT_BINDING_FILE_NAME,
+        prepared.revision,
+        '.spala project binding temporary file',
+      );
+      if (!revision) throw bindingConflictError();
+      try {
+        assertBindingDirectoryCurrent(handle);
+      } catch (error) {
+        rollbackBindingInCurrentDirectory(handle.workspaceRoot, revision);
+        throw error;
+      }
+      return { binding, changed: true, revision, workspaceRoot };
+    } finally {
+      if (fs.existsSync(prepared.filePath)) {
+        discardBindingName(
+          prepared.filePath,
+          prepared.revision,
+          '.spala project binding temporary file',
+        );
+      }
+    }
+  });
+}
+
+export function replaceProjectBindingIfRevision(
+  cwd,
+  input,
+  expectedRevision,
+  {
+    directoryHandle,
+    failureRollbackBinding,
+    rollbackOnDirectoryChange = false,
+  } = {},
+) {
+  const binding = validateProjectBinding(input);
+  const workspaceRoot = directoryHandle?.workspaceRoot || findWorkspaceRoot(cwd);
+  return withProjectBindingDirectory(
+    workspaceRoot,
+    directoryHandle,
+    handle => replaceBindingIfRevision(
+      handle,
+      binding,
+      expectedRevision,
+      'revision-update',
+      rollbackOnDirectoryChange
+        ? { previousBinding: failureRollbackBinding || null }
+        : null,
+    ),
+  );
+}
+
+function rollbackBindingInCurrentDirectory(workspaceRoot, expectedRevision, previousBinding = null) {
   let currentStat;
   try {
-    currentStat = inspectBindingFile(filePath, '.spala/project.json');
+    currentStat = inspectBindingFile(PROJECT_BINDING_FILE_NAME, '.spala/project.json');
   } catch (error) {
     if (error && typeof error === 'object' && error.code === 'ENOENT') {
       return { changed: false, preserved: true, workspaceRoot };
@@ -421,89 +799,93 @@ export function rollbackProjectBinding(cwd, expectedRevision, previousBinding = 
   }
 
   const binding = previousBinding ? validateProjectBinding(previousBinding) : null;
-  const prepared = binding ? prepareBindingFile(directory, binding, 'rollback-restore') : null;
-  const isolatedPath = path.join(
-    directory,
-    `.project.json.rollback-guard-${process.pid}-${randomUUID()}`,
-  );
-
+  const prepared = binding ? prepareBindingFile(binding, 'rollback-restore') : null;
+  let isolated;
   try {
-    fs.renameSync(filePath, isolatedPath);
-  } catch (error) {
-    if (prepared) {
-      discardBindingName(
-        prepared.filePath,
-        prepared.revision,
-        '.spala project binding rollback temporary file',
-      );
-    }
-    if (error && typeof error === 'object' && error.code === 'ENOENT') {
-      return { changed: false, preserved: true, workspaceRoot };
-    }
-    throw error;
-  }
-
-  const isolatedStat = inspectBindingFile(isolatedPath, '.spala/project.json rollback guard');
-  const isolatedRevision = bindingRevisionFromStat(isolatedStat);
-  if (isolatedStat.nlink !== 1n) {
-    if (prepared) {
-      discardBindingName(
-        prepared.filePath,
-        prepared.revision,
-        '.spala project binding rollback temporary file',
-      );
-    }
-    throw new Error('.spala/project.json rollback guard must not be a hard-linked file.');
-  }
-
-  if (!sameBindingRevision(isolatedRevision, expectedRevision)) {
-    try {
-      publishBindingNoReplace(
-        isolatedPath,
-        filePath,
-        isolatedRevision,
-        '.spala/project.json rollback guard',
-      );
-    } finally {
-      if (prepared) {
-        discardBindingName(
-          prepared.filePath,
-          prepared.revision,
-          '.spala project binding rollback temporary file',
-        );
-      }
-    }
-    return { changed: false, preserved: true, workspaceRoot };
-  }
-
-  if (prepared) {
-    const restored = publishBindingNoReplace(
-      prepared.filePath,
-      filePath,
-      prepared.revision,
-      '.spala project binding rollback temporary file',
-    );
-    discardBindingName(
-      isolatedPath,
-      isolatedRevision,
+    isolated = isolateProjectBinding(
+      'rollback-guard',
       '.spala/project.json rollback guard',
     );
-    if (!restored) return { changed: false, preserved: true, workspaceRoot };
-    return {
-      binding,
-      changed: true,
-      preserved: false,
-      revision: prepared.revision,
-      workspaceRoot,
-    };
-  }
+    if (!isolated) return { changed: false, preserved: true, workspaceRoot };
 
-  discardBindingName(
-    isolatedPath,
-    isolatedRevision,
-    '.spala/project.json rollback guard',
+    if (!sameBindingRevision(isolated.revision, expectedRevision)) {
+      restoreIsolatedBinding(
+        isolated.filePath,
+        isolated.revision,
+        '.spala/project.json rollback guard',
+      );
+      isolated = null;
+      return { changed: false, preserved: true, workspaceRoot };
+    }
+
+    if (prepared) {
+      const restoredRevision = publishBindingNoReplace(
+        prepared.filePath,
+        PROJECT_BINDING_FILE_NAME,
+        prepared.revision,
+        '.spala project binding rollback temporary file',
+      );
+      discardBindingName(
+        isolated.filePath,
+        isolated.revision,
+        '.spala/project.json rollback guard',
+      );
+      isolated = null;
+      if (!restoredRevision) {
+        return { changed: false, preserved: true, workspaceRoot };
+      }
+      return {
+        binding,
+        changed: true,
+        preserved: false,
+        revision: restoredRevision,
+        workspaceRoot,
+      };
+    }
+
+    discardBindingName(
+      isolated.filePath,
+      isolated.revision,
+      '.spala/project.json rollback guard',
+    );
+    isolated = null;
+    return { binding: null, changed: true, preserved: false, revision: null, workspaceRoot };
+  } catch (error) {
+    if (isolated && fs.existsSync(isolated.filePath)) {
+      restoreIsolatedBinding(
+        isolated.filePath,
+        isolated.revision,
+        '.spala/project.json rollback guard',
+      );
+    }
+    throw error;
+  } finally {
+    if (prepared && fs.existsSync(prepared.filePath)) {
+      discardBindingName(
+        prepared.filePath,
+        prepared.revision,
+        '.spala project binding rollback temporary file',
+      );
+    }
+  }
+}
+
+export function rollbackProjectBinding(
+  cwd,
+  expectedRevision,
+  previousBinding = null,
+  { directoryHandle } = {},
+) {
+  const workspaceRoot = directoryHandle?.workspaceRoot || findWorkspaceRoot(cwd);
+  return withProjectBindingDirectory(
+    workspaceRoot,
+    directoryHandle,
+    () => rollbackBindingInCurrentDirectory(
+      workspaceRoot,
+      expectedRevision,
+      previousBinding,
+    ),
   );
-  return { binding: null, changed: true, preserved: false, revision: null, workspaceRoot };
 }
 
 export function removeProjectBinding(cwd = process.cwd()) {

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import lockfile from 'proper-lockfile';
 import { normalizeMcpUrl } from './installer.js';
 import { assertSafePath } from './pathSafety.js';
@@ -11,7 +11,10 @@ const CREDENTIAL_STORE_LOCK_TIMEOUT_MS = 5_000;
 const CREDENTIAL_STORE_STALE_LOCK_MS = 30_000;
 const CREDENTIAL_STORE_LOCK_RETRY_MS = 10;
 const CREDENTIAL_STORE_PUBLICATION_ATTEMPTS = 8;
-const CREDENTIAL_RECOVERY_SCHEMA_VERSION = 1;
+const CREDENTIAL_RECOVERY_SCHEMA_VERSION = 2;
+const LEGACY_CREDENTIAL_RECOVERY_SCHEMA_VERSION = 1;
+const RESTORE_GUARD_PREFIX = '.mcp-credentials.restore-';
+const RESTORE_GUARD_PATTERN = /^\.mcp-credentials\.restore-([a-f0-9]{32})-([1-9]\d*)$/;
 const LOCK_WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
 const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 const DIRECTORY_FLAGS = fs.constants.O_RDONLY
@@ -610,19 +613,90 @@ function mergeStoreProjects(current, observed) {
   };
 }
 
+function changedProjectIds(current, updated) {
+  const projectIds = new Set([
+    ...Object.keys(current.projects),
+    ...Object.keys(updated.projects),
+  ]);
+  return [...projectIds]
+    .filter(projectId => (
+      JSON.stringify(current.projects[projectId])
+      !== JSON.stringify(updated.projects[projectId])
+    ))
+    .sort();
+}
+
+function recoveryMetadata(recovery) {
+  return {
+    authoritativeProjectIds: recovery?.authoritativeProjectIds || [],
+    transactionId: recovery?.transactionId,
+  };
+}
+
+function createRecoveryTransaction(recovery, current, updated) {
+  return {
+    authoritativeProjectIds: [...new Set([
+      ...(recovery?.authoritativeProjectIds || []),
+      ...changedProjectIds(current, updated),
+    ])].sort(),
+    transactionId: randomBytes(16).toString('hex'),
+  };
+}
+
+function mergeRecoveryStore(recovery, observed) {
+  const authoritative = new Set(recovery.authoritativeProjectIds);
+  const projects = { ...recovery.store.projects };
+  for (const [projectId, credential] of Object.entries(observed.projects)) {
+    if (authoritative.has(projectId)) continue;
+    projects[projectId] = credential;
+  }
+  return {
+    schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION,
+    projects,
+  };
+}
+
+function mergeStoreWithAuthority(recovery, observed) {
+  const merged = mergeStoreProjects(recovery.store, observed);
+  for (const projectId of recovery.authoritativeProjectIds) {
+    if (Object.hasOwn(recovery.store.projects, projectId)) {
+      merged.projects[projectId] = recovery.store.projects[projectId];
+    } else {
+      delete merged.projects[projectId];
+    }
+  }
+  return merged;
+}
+
 function storeContent(store) {
   return Buffer.from(`${JSON.stringify(store, null, 2)}\n`, 'utf8');
 }
 
-function recoveryChecksum(store) {
-  return createHash('sha256').update(storeContent(store)).digest('hex');
+function recoveryChecksum(store, metadata) {
+  const content = metadata?.transactionId
+    ? Buffer.from(JSON.stringify({
+      authoritativeProjectIds: metadata.authoritativeProjectIds,
+      store,
+      transactionId: metadata.transactionId,
+    }), 'utf8')
+    : storeContent(store);
+  return createHash('sha256').update(content).digest('hex');
 }
 
-function recoveryContent(store) {
+function recoveryContent(store, metadata) {
+  if (!metadata?.transactionId) {
+    return Buffer.from(`${JSON.stringify({
+      schemaVersion: LEGACY_CREDENTIAL_RECOVERY_SCHEMA_VERSION,
+      store,
+      checksum: recoveryChecksum(store),
+    }, null, 2)}\n`, 'utf8');
+  }
   return Buffer.from(`${JSON.stringify({
     schemaVersion: CREDENTIAL_RECOVERY_SCHEMA_VERSION,
+    transactionId: metadata.transactionId,
+    authoritativeProjectIds: metadata.authoritativeProjectIds,
     store,
-    checksum: recoveryChecksum(store),
+    checksum: recoveryChecksum(store, metadata),
   }, null, 2)}\n`, 'utf8');
 }
 
@@ -636,11 +710,33 @@ function parseRecoveryRevision(content) {
   const keys = recovery && typeof recovery === 'object' && !Array.isArray(recovery)
     ? Object.keys(recovery).sort()
     : [];
+  const legacy = recovery?.schemaVersion === LEGACY_CREDENTIAL_RECOVERY_SCHEMA_VERSION;
+  const current = recovery?.schemaVersion === CREDENTIAL_RECOVERY_SCHEMA_VERSION;
+  const expectedKeys = legacy
+    ? 'checksum,schemaVersion,store'
+    : 'authoritativeProjectIds,checksum,schemaVersion,store,transactionId';
   if (
-    keys.join(',') !== 'checksum,schemaVersion,store'
-    || recovery.schemaVersion !== CREDENTIAL_RECOVERY_SCHEMA_VERSION
+    (!legacy && !current)
+    || keys.join(',') !== expectedKeys
     || typeof recovery.checksum !== 'string'
     || !/^[a-f0-9]{64}$/.test(recovery.checksum)
+    || (
+      current
+      && (
+        typeof recovery.transactionId !== 'string'
+        || !/^[a-f0-9]{32}$/.test(recovery.transactionId)
+        || !Array.isArray(recovery.authoritativeProjectIds)
+        || recovery.authoritativeProjectIds.some(projectId => (
+          typeof projectId !== 'string'
+          || !projectId
+          || projectId.trim() !== projectId
+          || projectId.length > 200
+          || /[\0\r\n/\\]/.test(projectId)
+        ))
+        || [...new Set(recovery.authoritativeProjectIds)].sort()
+          .join('\0') !== recovery.authoritativeProjectIds.join('\0')
+      )
+    )
   ) {
     throw new Error('Spala credential recovery state has an unsupported format.');
   }
@@ -648,10 +744,21 @@ function parseRecoveryRevision(content) {
     Buffer.from(JSON.stringify(recovery.store), 'utf8'),
     'Spala credential recovery state',
   );
-  if (recoveryChecksum(store) !== recovery.checksum) {
+  const metadata = current
+    ? {
+      authoritativeProjectIds: recovery.authoritativeProjectIds,
+      transactionId: recovery.transactionId,
+    }
+    : undefined;
+  if (recoveryChecksum(store, metadata) !== recovery.checksum) {
     throw new Error('Spala credential recovery state failed integrity validation.');
   }
-  return { checksum: recovery.checksum, store };
+  return {
+    authoritativeProjectIds: metadata?.authoritativeProjectIds || [],
+    checksum: recovery.checksum,
+    store,
+    transactionId: metadata?.transactionId,
+  };
 }
 
 function assertRecoveryPath(location, filePath = location.recoveryPath) {
@@ -688,9 +795,9 @@ function fsyncCurrentDirectory() {
   }
 }
 
-function publishRecoveryStore(location, store, verifyDirectory) {
+function publishRecoveryStore(location, store, verifyDirectory, metadata) {
   const existing = readRecoveryRevision(location);
-  const content = recoveryContent(store);
+  const content = recoveryContent(store, metadata);
   if (existing?.content.equals(content)) return existing;
 
   const recoveryName = path.basename(location.recoveryPath);
@@ -882,13 +989,18 @@ function isolateNamedStore(
   guards,
   observe,
   verifyDirectory,
+  transactionId,
+  sequenceOffset = 0,
 ) {
   verifyDirectory();
   const before = readNamedStoreRevisionOrUndefined(targetName, 'Spala credential store');
   if (!before) return false;
   observe(before.store);
 
-  const guardName = `.mcp-credentials.restore-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  if (!transactionId) {
+    throw new Error('Spala credential recovery transaction is invalid or incomplete.');
+  }
+  const guardName = `${RESTORE_GUARD_PREFIX}${transactionId}-${sequenceOffset + guards.length + 1}`;
   const guardPath = path.join(location.directory, guardName);
   assertSafePath(guardPath, location.homePath, 'Spala credential store recovery path');
   if (lstatOrUndefined(guardName)) {
@@ -1017,6 +1129,7 @@ function createExclusiveStore(targetName, content, verifyDirectory) {
 }
 
 function cleanupGuards(guards) {
+  let removed = false;
   for (const guard of guards) {
     if (!guard.active) continue;
     removeOwnedEntry(
@@ -1025,7 +1138,49 @@ function cleanupGuards(guards) {
       'Spala credential store recovery file',
     );
     guard.active = false;
+    removed = true;
   }
+  if (removed) fsyncCurrentDirectory();
+}
+
+function discoverRestoreGuards(location, recovery, verifyDirectory) {
+  verifyDirectory();
+  const names = fs.readdirSync('.')
+    .filter(name => name.startsWith(RESTORE_GUARD_PREFIX));
+  if (!names.length) return [];
+  if (!recovery?.transactionId) {
+    throw new Error('Spala credential store recovery files are ambiguous.');
+  }
+
+  const guards = names.map(name => {
+    const match = RESTORE_GUARD_PATTERN.exec(name);
+    if (!match || match[1] !== recovery.transactionId) {
+      throw new Error('Spala credential store recovery file is malformed or ambiguous.');
+    }
+    return {
+      active: true,
+      name,
+      sequence: Number(match[2]),
+    };
+  }).sort((left, right) => left.sequence - right.sequence);
+
+  for (let index = 0; index < guards.length; index += 1) {
+    if (!Number.isSafeInteger(guards[index].sequence)) {
+      throw new Error('Spala credential store recovery files are ambiguous.');
+    }
+    const revision = readNamedStoreRevision(
+      guards[index].name,
+      'Spala credential store recovery file',
+    );
+    guards[index] = {
+      ...guards[index],
+      identity: revision.identity,
+      revision,
+      store: revision.store,
+    };
+  }
+  verifyDirectory();
+  return guards;
 }
 
 function recoverObservedStore(
@@ -1034,6 +1189,8 @@ function recoverObservedStore(
   initialStore,
   guards,
   directoryIdentity,
+  transactionId,
+  guardSequenceOffset = 0,
 ) {
   let observed = initialStore;
   const observe = store => {
@@ -1054,7 +1211,15 @@ function recoverObservedStore(
       return Boolean(final?.content.equals(content));
     }
     if (current) {
-      isolateNamedStore(location, targetName, guards, observe, verifyDirectory);
+      isolateNamedStore(
+        location,
+        targetName,
+        guards,
+        observe,
+        verifyDirectory,
+        transactionId,
+        guardSequenceOffset,
+      );
     }
 
     const published = createExclusiveStore(
@@ -1071,7 +1236,16 @@ function recoverObservedStore(
   return false;
 }
 
-function writeStore(location, baseStore, expectedState, update, initialResult, beforeCandidate) {
+function writeStore(
+  location,
+  baseStore,
+  expectedState,
+  update,
+  initialResult,
+  beforeCandidate,
+  transactionId,
+  guardSequenceOffset = 0,
+) {
   const pathState = assertCredentialPath(location, expectedState);
   const targetName = path.basename(location.filePath);
 
@@ -1111,7 +1285,15 @@ function writeStore(location, baseStore, expectedState, update, initialResult, b
         }
 
         if (!ownedCanonical) {
-          isolateNamedStore(location, targetName, guards, observe, verifyDirectory);
+          isolateNamedStore(
+            location,
+            targetName,
+            guards,
+            observe,
+            verifyDirectory,
+            transactionId,
+            guardSequenceOffset,
+          );
           candidateResult = update(observed);
           beforeCandidate?.(candidateResult.store, verifyDirectory);
           const prepared = prepareStoreRevision(
@@ -1179,6 +1361,8 @@ function writeStore(location, baseStore, expectedState, update, initialResult, b
           observed,
           guards,
           directoryIdentity,
+          transactionId,
+          guardSequenceOffset,
         );
       } catch (recoveryError) {
         if (error && typeof error === 'object') error.recoveryError = recoveryError;
@@ -1197,6 +1381,7 @@ function readRecoveredStoreAtLocation(location) {
     assertRecoveryPath(location);
   };
   const recovery = readRecoveryRevision(location);
+  const restoreGuards = discoverRestoreGuards(location, recovery, verifyDirectory);
   let canonical;
   let invalidCanonical;
   try {
@@ -1225,14 +1410,36 @@ function readRecoveredStoreAtLocation(location) {
 
   const targetName = path.basename(location.filePath);
   const rawCanonical = readNamedRevisionOrUndefined(targetName, 'Spala credential store');
-  const mergedStore = canonical
-    ? mergeStoreProjects(recovery.store, canonical.store)
-    : recovery.store;
-  let durableRecovery = publishRecoveryStore(location, mergedStore, verifyDirectory);
+  let mergedStore = recovery.store;
+  for (const guard of restoreGuards) {
+    mergedStore = mergeRecoveryStore(
+      { ...recovery, store: mergedStore },
+      guard.store,
+    );
+  }
+  if (canonical) {
+    mergedStore = mergeRecoveryStore(
+      { ...recovery, store: mergedStore },
+      canonical.store,
+    );
+  }
+  const metadata = recovery.transactionId
+    ? recoveryMetadata(recovery)
+    : {
+      authoritativeProjectIds: recovery.authoritativeProjectIds,
+      transactionId: randomBytes(16).toString('hex'),
+    };
+  let durableRecovery = publishRecoveryStore(
+    location,
+    mergedStore,
+    verifyDirectory,
+    metadata,
+  );
   const canonicalMatches = canonical
     && rawCanonical
     && rawCanonical.content.equals(storeContent(mergedStore));
   if (canonicalMatches) {
+    cleanupGuards(restoreGuards);
     return {
       ...canonical,
       store: mergedStore,
@@ -1250,7 +1457,10 @@ function readRecoveredStoreAtLocation(location) {
   const pathState = assertCredentialPath(location);
   const baseStore = canonical?.store || emptyStore();
   const repair = observed => {
-    const repaired = mergeStoreProjects(mergedStore, observed);
+    const repaired = mergeStoreWithAuthority(
+      { ...recovery, store: mergedStore },
+      observed,
+    );
     const changed = !storeContent(repaired).equals(storeContent(observed));
     return {
       changed,
@@ -1271,14 +1481,26 @@ function readRecoveredStoreAtLocation(location) {
           location,
           candidateStore,
           verifyDirectory,
+          metadata,
         );
       },
+      metadata.transactionId,
+      restoreGuards.at(-1)?.sequence || 0,
     );
   }
 
   const repairedCanonical = readStoreAtLocation(location);
-  const finalStore = mergeStoreProjects(durableRecovery.store, repairedCanonical.store);
-  durableRecovery = publishRecoveryStore(location, finalStore, verifyDirectory);
+  const finalStore = mergeRecoveryStore(
+    durableRecovery,
+    repairedCanonical.store,
+  );
+  durableRecovery = publishRecoveryStore(
+    location,
+    finalStore,
+    verifyDirectory,
+    metadata,
+  );
+  cleanupGuards(restoreGuards);
   return {
     ...repairedCanonical,
     store: finalStore,
@@ -1289,9 +1511,10 @@ function readRecoveredStoreAtLocation(location) {
 function updateStore(env, workspaceRoot, update) {
   const location = credentialStoreLocation(env, workspaceRoot);
   return withStoreLock(location, () => {
-    const { pathState, store } = readRecoveredStoreAtLocation(location);
+    const { pathState, recovery, store } = readRecoveredStoreAtLocation(location);
     const result = update(store);
     if (!result.changed) return result.value;
+    const transaction = createRecoveryTransaction(recovery, store, result.store);
     const directoryIdentity = identity(fs.statSync('.', { bigint: true }));
     const verifyDirectory = () => {
       verifyAnchoredDirectory(location, directoryIdentity);
@@ -1302,6 +1525,7 @@ function updateStore(env, workspaceRoot, update) {
       location,
       result.store,
       verifyDirectory,
+      transaction,
     );
     try {
       const value = writeStore(
@@ -1315,19 +1539,21 @@ function updateStore(env, workspaceRoot, update) {
             location,
             candidateStore,
             verifyDirectory,
+            transaction,
           );
         },
+        transaction.transactionId,
       );
       const finalCanonical = readStoreAtLocation(location);
-      const finalStore = mergeStoreProjects(
-        durableRecovery.store,
+      const finalStore = mergeStoreWithAuthority(
+        durableRecovery,
         finalCanonical.store,
       );
-      publishRecoveryStore(location, finalStore, verifyDirectory);
+      publishRecoveryStore(location, finalStore, verifyDirectory, transaction);
       return value;
     } catch (error) {
       try {
-        publishRecoveryStore(location, store, verifyDirectory);
+        publishRecoveryStore(location, store, verifyDirectory, transaction);
       } catch (recoveryError) {
         let removed = false;
         try {
@@ -1483,7 +1709,7 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
   const id = validateProjectId(revision.projectId);
   const location = credentialStoreLocation(env, workspaceRoot);
   return withStoreLock(location, () => {
-    const { pathState, store } = readRecoveredStoreAtLocation(location);
+    const { pathState, recovery, store } = readRecoveredStoreAtLocation(location);
     if (
       JSON.stringify(store.projects[id]) !== JSON.stringify(rollback.credential)
     ) {
@@ -1509,6 +1735,7 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
     };
     const result = update(store);
     if (!result.changed) return result.value;
+    const transaction = createRecoveryTransaction(recovery, store, result.store);
     const directoryIdentity = identity(fs.statSync('.', { bigint: true }));
     const verifyDirectory = () => {
       verifyAnchoredDirectory(location, directoryIdentity);
@@ -1519,6 +1746,7 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
       location,
       result.store,
       verifyDirectory,
+      transaction,
     );
     credentialRollbackStates.delete(revision);
     const value = writeStore(
@@ -1532,14 +1760,17 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
           location,
           candidateStore,
           verifyDirectory,
+          transaction,
         );
       },
+      transaction.transactionId,
     );
     const finalCanonical = readStoreAtLocation(location);
     publishRecoveryStore(
       location,
-      mergeStoreProjects(durableRecovery.store, finalCanonical.store),
+      mergeStoreWithAuthority(durableRecovery, finalCanonical.store),
       verifyDirectory,
+      transaction,
     );
     return value;
   });

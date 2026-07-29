@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import properLockfile from 'proper-lockfile';
@@ -11,6 +12,7 @@ import * as credentialStore from '../src/credentialStore.js';
 const {
   credentialStorePath,
   readProjectCredential,
+  rollbackProjectCredentialIfRevision,
   storeProjectCredential,
 } = credentialStore;
 const WORKER_FLAG = '--credential-store-worker';
@@ -319,12 +321,17 @@ function assertNoCredentialArtifacts(directory) {
   );
 }
 
-function storeFixtureCredential(credentialHome, projectId, bearerToken) {
+function storeFixtureCredential(
+  credentialHome,
+  projectId,
+  bearerToken,
+  expiresAt = new Date(Date.now() + 10 * 60_000).toISOString(),
+) {
   return storeProjectCredential({
     projectId,
     mcpUrl: `https://${projectId}.spala.test/mcp`,
     bearerToken,
-    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    expiresAt,
   }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
 }
 
@@ -1335,6 +1342,183 @@ if (process.argv[2] !== WORKER_FLAG) test('proper-lockfile recovers a stale lock
   assert.deepEqual(Object.keys(persisted).sort(), ['projects', 'schemaVersion']);
   assert.deepEqual(Object.keys(persisted.projects), ['stale-recovery-project']);
   assertCredentialPathKindsAndModes(storePath);
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('credential rollback restores the prior value while its exact project generation is current', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'owned-rollback-project';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  storeFixtureCredential(credentialHome, projectId, 'mcp_owned_rollback_original', expiresAt);
+  const publication = storeFixtureCredential(
+    credentialHome,
+    projectId,
+    'mcp_owned_rollback_current',
+    expiresAt,
+  );
+
+  assert.equal(publication.changed, true);
+  assert.ok(publication.revision);
+  assert.deepEqual(
+    rollbackProjectCredentialIfRevision(publication.revision, env),
+    { changed: true, projectId, superseded: false },
+  );
+  assert.equal(
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_owned_rollback_original',
+  );
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('credential rollback ownership is scoped to its project generation', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'project-scoped-rollback';
+  const otherProjectId = 'unrelated-project-publication';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  storeFixtureCredential(credentialHome, projectId, 'mcp_project_scoped_original', expiresAt);
+  const publication = storeFixtureCredential(
+    credentialHome,
+    projectId,
+    'mcp_project_scoped_current',
+    expiresAt,
+  );
+  const recoveryPath = `${credentialStorePath(env)}.recovery`;
+  const ownedGeneration = JSON.parse(
+    fs.readFileSync(recoveryPath, 'utf8'),
+  ).projectGenerations[projectId];
+
+  storeFixtureCredential(
+    credentialHome,
+    otherProjectId,
+    'mcp_unrelated_project_publication',
+    expiresAt,
+  );
+  const afterUnrelated = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
+  assert.equal(afterUnrelated.projectGenerations[projectId], ownedGeneration);
+  assert.notEqual(afterUnrelated.transactionId, ownedGeneration);
+
+  assert.deepEqual(
+    rollbackProjectCredentialIfRevision(publication.revision, env),
+    { changed: true, projectId, superseded: false },
+  );
+  assert.equal(
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_project_scoped_original',
+  );
+  assert.equal(
+    readProjectCredential(otherProjectId, env).bearerToken,
+    'mcp_unrelated_project_publication',
+  );
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('credential rollback fails closed when project generation proof is missing', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'missing-generation-proof';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  storeFixtureCredential(credentialHome, projectId, 'mcp_missing_proof_original', expiresAt);
+  const publication = storeFixtureCredential(
+    credentialHome,
+    projectId,
+    'mcp_missing_proof_current',
+    expiresAt,
+  );
+  const storePath = credentialStorePath(env);
+  const publishedBody = fs.readFileSync(storePath, 'utf8');
+  fs.unlinkSync(`${storePath}.recovery`);
+
+  assert.deepEqual(
+    rollbackProjectCredentialIfRevision(publication.revision, env),
+    { changed: false, projectId, superseded: true },
+  );
+  assert.equal(fs.readFileSync(storePath, 'utf8'), publishedBody);
+  assert.throws(
+    () => rollbackProjectCredentialIfRevision(publication.revision, env),
+    /valid publication revision/,
+  );
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('version 2 recovery journals migrate without claiming project generation ownership', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'version-two-recovery';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  const storePath = credentialStorePath(env);
+  const recoveryPath = `${storePath}.recovery`;
+  storeFixtureCredential(credentialHome, projectId, 'mcp_version_two_recovery', expiresAt);
+  const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  const metadata = {
+    authoritativeProjectIds: [projectId],
+    transactionId: '2'.repeat(32),
+  };
+  const checksum = createHash('sha256').update(JSON.stringify({
+    authoritativeProjectIds: metadata.authoritativeProjectIds,
+    store,
+    transactionId: metadata.transactionId,
+  })).digest('hex');
+  fs.writeFileSync(recoveryPath, `${JSON.stringify({
+    schemaVersion: 2,
+    transactionId: metadata.transactionId,
+    authoritativeProjectIds: metadata.authoritativeProjectIds,
+    store,
+    checksum,
+  }, null, 2)}\n`, { mode: 0o600 });
+  if (process.platform !== 'win32') fs.chmodSync(recoveryPath, 0o600);
+
+  assert.equal(
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_version_two_recovery',
+  );
+  const migrated = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
+  assert.equal(migrated.schemaVersion, 3);
+  assert.deepEqual(migrated.projectGenerations, {});
+
+  storeFixtureCredential(credentialHome, projectId, 'mcp_version_three_recovery', expiresAt);
+  const updated = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
+  assert.match(updated.projectGenerations[projectId], /^[a-f0-9]{32}$/);
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('credential rollback rejects an exact O to X to Y to byte-identical X ABA publication', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'credential-rollback-aba';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  const storePath = credentialStorePath(env);
+  const recoveryPath = `${storePath}.recovery`;
+  storeFixtureCredential(credentialHome, projectId, 'mcp_rollback_aba_original', expiresAt);
+
+  const publicationA = storeFixtureCredential(
+    credentialHome,
+    projectId,
+    'mcp_rollback_aba_x',
+    expiresAt,
+  );
+  const firstXBody = fs.readFileSync(storePath, 'utf8');
+  const firstXGeneration = JSON.parse(
+    fs.readFileSync(recoveryPath, 'utf8'),
+  ).projectGenerations[projectId];
+
+  storeFixtureCredential(credentialHome, projectId, 'mcp_rollback_aba_y', expiresAt);
+  const publicationC = storeFixtureCredential(
+    credentialHome,
+    projectId,
+    'mcp_rollback_aba_x',
+    expiresAt,
+  );
+  const secondXBody = fs.readFileSync(storePath, 'utf8');
+  const secondXGeneration = JSON.parse(
+    fs.readFileSync(recoveryPath, 'utf8'),
+  ).projectGenerations[projectId];
+  assert.equal(secondXBody, firstXBody);
+  assert.notEqual(secondXGeneration, firstXGeneration);
+  assert.notEqual(publicationC.revision, publicationA.revision);
+
+  assert.deepEqual(
+    rollbackProjectCredentialIfRevision(publicationA.revision, env),
+    { changed: false, projectId, superseded: true },
+  );
+  assert.equal(fs.readFileSync(storePath, 'utf8'), secondXBody);
+  assert.equal(readProjectCredential(projectId, env).bearerToken, 'mcp_rollback_aba_x');
 });
 
 if (process.argv[2] !== WORKER_FLAG) test('credential reads and updates preserve the exact 0.1.15 flat schema', () => {

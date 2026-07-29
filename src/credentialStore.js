@@ -11,7 +11,8 @@ const CREDENTIAL_STORE_LOCK_TIMEOUT_MS = 5_000;
 const CREDENTIAL_STORE_STALE_LOCK_MS = 30_000;
 const CREDENTIAL_STORE_LOCK_RETRY_MS = 10;
 const CREDENTIAL_STORE_PUBLICATION_ATTEMPTS = 8;
-const CREDENTIAL_RECOVERY_SCHEMA_VERSION = 2;
+const CREDENTIAL_RECOVERY_SCHEMA_VERSION = 3;
+const TRANSACTIONAL_CREDENTIAL_RECOVERY_SCHEMA_VERSION = 2;
 const LEGACY_CREDENTIAL_RECOVERY_SCHEMA_VERSION = 1;
 const RESTORE_GUARD_PREFIX = '.mcp-credentials.restore-';
 const RESTORE_GUARD_PATTERN = /^\.mcp-credentials\.restore-([a-f0-9]{32})-([1-9]\d*)$/;
@@ -629,17 +630,27 @@ function changedProjectIds(current, updated) {
 function recoveryMetadata(recovery) {
   return {
     authoritativeProjectIds: recovery?.authoritativeProjectIds || [],
+    projectGenerations: recovery?.projectGenerations || {},
     transactionId: recovery?.transactionId,
   };
 }
 
 function createRecoveryTransaction(recovery, current, updated) {
+  const transactionId = randomBytes(16).toString('hex');
+  const changed = changedProjectIds(current, updated);
+  const projectGenerations = new Map(
+    Object.entries(recovery?.projectGenerations || {}),
+  );
+  for (const projectId of changed) projectGenerations.set(projectId, transactionId);
   return {
     authoritativeProjectIds: [...new Set([
       ...(recovery?.authoritativeProjectIds || []),
-      ...changedProjectIds(current, updated),
+      ...changed,
     ])].sort(),
-    transactionId: randomBytes(16).toString('hex'),
+    projectGenerations: Object.fromEntries(
+      [...projectGenerations.entries()].sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    transactionId,
   };
 }
 
@@ -676,6 +687,9 @@ function recoveryChecksum(store, metadata) {
   const content = metadata?.transactionId
     ? Buffer.from(JSON.stringify({
       authoritativeProjectIds: metadata.authoritativeProjectIds,
+      ...(metadata.projectGenerations === undefined
+        ? {}
+        : { projectGenerations: metadata.projectGenerations }),
       store,
       transactionId: metadata.transactionId,
     }), 'utf8')
@@ -695,6 +709,7 @@ function recoveryContent(store, metadata) {
     schemaVersion: CREDENTIAL_RECOVERY_SCHEMA_VERSION,
     transactionId: metadata.transactionId,
     authoritativeProjectIds: metadata.authoritativeProjectIds,
+    projectGenerations: metadata.projectGenerations || {},
     store,
     checksum: recoveryChecksum(store, metadata),
   }, null, 2)}\n`, 'utf8');
@@ -711,17 +726,27 @@ function parseRecoveryRevision(content) {
     ? Object.keys(recovery).sort()
     : [];
   const legacy = recovery?.schemaVersion === LEGACY_CREDENTIAL_RECOVERY_SCHEMA_VERSION;
+  const transactional = recovery?.schemaVersion
+    === TRANSACTIONAL_CREDENTIAL_RECOVERY_SCHEMA_VERSION;
   const current = recovery?.schemaVersion === CREDENTIAL_RECOVERY_SCHEMA_VERSION;
   const expectedKeys = legacy
     ? 'checksum,schemaVersion,store'
-    : 'authoritativeProjectIds,checksum,schemaVersion,store,transactionId';
+    : current
+      ? 'authoritativeProjectIds,checksum,projectGenerations,schemaVersion,store,transactionId'
+      : 'authoritativeProjectIds,checksum,schemaVersion,store,transactionId';
+  const generationEntries = current
+    && recovery.projectGenerations
+    && typeof recovery.projectGenerations === 'object'
+    && !Array.isArray(recovery.projectGenerations)
+    ? Object.entries(recovery.projectGenerations)
+    : [];
   if (
-    (!legacy && !current)
+    (!legacy && !transactional && !current)
     || keys.join(',') !== expectedKeys
     || typeof recovery.checksum !== 'string'
     || !/^[a-f0-9]{64}$/.test(recovery.checksum)
     || (
-      current
+      (transactional || current)
       && (
         typeof recovery.transactionId !== 'string'
         || !/^[a-f0-9]{32}$/.test(recovery.transactionId)
@@ -737,6 +762,24 @@ function parseRecoveryRevision(content) {
           .join('\0') !== recovery.authoritativeProjectIds.join('\0')
       )
     )
+    || (
+      current
+      && (
+        !recovery.projectGenerations
+        || typeof recovery.projectGenerations !== 'object'
+        || Array.isArray(recovery.projectGenerations)
+        || generationEntries.some(([projectId, generation]) => (
+          typeof projectId !== 'string'
+          || !projectId
+          || projectId.trim() !== projectId
+          || projectId.length > 200
+          || /[\0\r\n/\\]/.test(projectId)
+          || !recovery.authoritativeProjectIds.includes(projectId)
+          || typeof generation !== 'string'
+          || !/^[a-f0-9]{32}$/.test(generation)
+        ))
+      )
+    )
   ) {
     throw new Error('Spala credential recovery state has an unsupported format.');
   }
@@ -744,9 +787,10 @@ function parseRecoveryRevision(content) {
     Buffer.from(JSON.stringify(recovery.store), 'utf8'),
     'Spala credential recovery state',
   );
-  const metadata = current
+  const metadata = transactional || current
     ? {
       authoritativeProjectIds: recovery.authoritativeProjectIds,
+      ...(current ? { projectGenerations: recovery.projectGenerations } : {}),
       transactionId: recovery.transactionId,
     }
     : undefined;
@@ -756,6 +800,7 @@ function parseRecoveryRevision(content) {
   return {
     authoritativeProjectIds: metadata?.authoritativeProjectIds || [],
     checksum: recovery.checksum,
+    projectGenerations: metadata?.projectGenerations || {},
     store,
     transactionId: metadata?.transactionId,
   };
@@ -1337,7 +1382,10 @@ function writeStore(
           && final.content.equals(candidate)
           && !update(final.store).changed
         ) {
-          return attachPublicationRevision(initialResult.value, final);
+          return attachPublicationRevision(initialResult.value, {
+            ...final,
+            transactionId,
+          });
         }
         if (final) observe(final.store);
         ownedCanonical = undefined;
@@ -1427,6 +1475,7 @@ function readRecoveredStoreAtLocation(location) {
     ? recoveryMetadata(recovery)
     : {
       authoritativeProjectIds: recovery.authoritativeProjectIds,
+      projectGenerations: recovery.projectGenerations,
       transactionId: randomBytes(16).toString('hex'),
     };
   let durableRecovery = publishRecoveryStore(
@@ -1656,6 +1705,7 @@ export function storeProjectCredential({ projectId, mcpUrl, bearerToken, expires
   const revision = Object.freeze({ projectId: id });
   credentialRollbackStates.set(revision, {
     credential: structuredClone(credential),
+    generation: publicationRevision.transactionId,
     previousCredential,
   });
   return { ...result, revision };
@@ -1710,9 +1760,16 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
   const location = credentialStoreLocation(env, workspaceRoot);
   return withStoreLock(location, () => {
     const { pathState, recovery, store } = readRecoveredStoreAtLocation(location);
+    const currentGeneration = recovery
+      && Object.hasOwn(recovery.projectGenerations, id)
+      ? recovery.projectGenerations[id]
+      : undefined;
     if (
+      currentGeneration !== rollback.generation
+      ||
       JSON.stringify(store.projects[id]) !== JSON.stringify(rollback.credential)
     ) {
+      credentialRollbackStates.delete(revision);
       return { changed: false, projectId: id, superseded: true };
     }
 

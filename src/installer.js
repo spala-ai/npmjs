@@ -47,7 +47,8 @@ export const PUBLIC_LEGACY_SERVER_NAMES = [
   'spala-mcp-spala-ai',
 ];
 export const MCP_REMOTE_VERSION = '0.1.38';
-export const INSTALLER_PACKAGE_SPEC = '@spala-ai/mcp-install@0.1.15';
+export { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
+import { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
 
 export const CLIENT_LABELS = {
   antigravity: 'Antigravity',
@@ -365,6 +366,65 @@ function urlsMatch(left, right) {
 
 export function mcpUrlsMatch(left, right) {
   return urlsMatch(left, right);
+}
+
+export function mcpAuthorizationMatches(left, right) {
+  const authorizationIdentity = value => {
+    let source;
+    try {
+      source = new URL(value || '');
+    } catch {
+      return undefined;
+    }
+    const scopeValues = source.searchParams.getAll('scope');
+    if (scopeValues.length > 1) return undefined;
+    const normalized = normalizeComparableMcpUrl(value || '');
+    if (!normalized) return undefined;
+    const parsed = new URL(normalized);
+    const scopes = scopeValues.length === 0
+      ? null
+      : scopeValues[0].split(',');
+    if (
+      scopes
+      && (
+        scopes.some(scope => !scope)
+        || new Set(scopes).size !== scopes.length
+      )
+    ) {
+      return undefined;
+    }
+    parsed.search = '';
+    return {
+      endpoint: parsed.toString(),
+      scopes: scopes ? new Set(scopes) : null,
+    };
+  };
+  const leftIdentity = authorizationIdentity(left);
+  const rightIdentity = authorizationIdentity(right);
+  if (!leftIdentity || !rightIdentity || leftIdentity.endpoint !== rightIdentity.endpoint) {
+    return false;
+  }
+  if (!leftIdentity.scopes || !rightIdentity.scopes) {
+    return leftIdentity.scopes === rightIdentity.scopes;
+  }
+  return leftIdentity.scopes.size === rightIdentity.scopes.size
+    && [...leftIdentity.scopes].every(scope => rightIdentity.scopes.has(scope));
+}
+
+// Endpoint identity ignores the scope query: origin + path only. The scope a
+// bootstrap response carries is authorization detail, not a different server,
+// so a bare requested URL must accept a scoped response (and vice versa).
+export function mcpEndpointsMatch(left, right) {
+  const stripScope = value => {
+    const normalized = normalizeComparableMcpUrl(value || '');
+    if (!normalized) return undefined;
+    const parsed = new URL(normalized);
+    parsed.search = '';
+    return parsed.toString();
+  };
+  const strippedLeft = stripScope(left);
+  const strippedRight = stripScope(right);
+  return Boolean(strippedLeft && strippedRight && strippedLeft === strippedRight);
 }
 
 function publicLegacyNamesForTarget(serverName, mcpUrl) {

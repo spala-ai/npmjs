@@ -1,6 +1,7 @@
 import readline from 'node:readline';
 import { readProjectCredential } from './credentialStore.js';
-import { findWorkspaceRoot } from './workspace.js';
+import { mcpAuthorizationMatches } from './installer.js';
+import { readProjectBinding } from './workspace.js';
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -150,7 +151,14 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   if (typeof fetchImpl !== 'function') throw new Error('MCP proxy is unavailable in this Node runtime.');
   const maxBodyBytes = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES, 65_536, 1_073_741_824);
   const requestTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 3_600_000);
-  const credential = readProjectCredential(projectId, env, findWorkspaceRoot(cwd));
+  const { binding, workspaceRoot } = readProjectBinding(cwd, { required: true });
+  if (binding.projectId !== projectId) {
+    throw new Error('MCP proxy project does not match the current workspace binding. Rebind this workspace before retrying.');
+  }
+  const credential = readProjectCredential(projectId, env, workspaceRoot);
+  if (!mcpAuthorizationMatches(binding.mcpUrl, credential.mcpUrl)) {
+    throw new Error('The stored MCP credential endpoint or scope does not match the current workspace binding. Rebind this workspace with a fresh bootstrap capability.');
+  }
   let sessionId;
   let protocolVersion = DEFAULT_PROTOCOL_VERSION;
   let eventStream;

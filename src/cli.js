@@ -48,6 +48,7 @@ import {
   planProjectBinding,
   readProjectBinding,
   removeProjectBinding,
+  rollbackProjectBinding,
   writeProjectBinding,
 } from './workspace.js';
 
@@ -1095,8 +1096,9 @@ function printUninstallPlan(plan, streams) {
   }
 }
 
-function preserveExistingCanonicalBinding(cwd, requestedBinding) {
+function preserveExistingCanonicalBinding(cwd, requestedBinding, { switchProject = false } = {}) {
   const requestedScopes = parseProjectScopeSet(requestedBinding.mcpUrl, 'The requested MCP URL');
+  if (switchProject) return requestedBinding;
   const existing = readProjectBinding(cwd).binding;
   if (!existing) return requestedBinding;
   const sameProject = existing.schemaVersion === requestedBinding.schemaVersion
@@ -1249,7 +1251,9 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       mcpUrl,
       serverName,
     };
-    const bindingInput = preserveExistingCanonicalBinding(cwd, requestedBinding);
+    const bindingInput = preserveExistingCanonicalBinding(cwd, requestedBinding, {
+      switchProject: args.switchProject,
+    });
     const bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
     const plan = agentic
       ? createProxyInstallPlan({
@@ -1350,8 +1354,11 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       const failures = [];
       if (bound.changed) {
         try {
-          if (bindingPlan.existing) writeProjectBinding(bindingPlan.workspaceRoot, bindingPlan.existing, { switchProject: true });
-          else removeProjectBinding(bindingPlan.workspaceRoot);
+          rollbackProjectBinding(
+            bindingPlan.workspaceRoot,
+            bound.revision,
+            bindingPlan.existing,
+          );
         } catch (rollbackError) {
           failures.push(`binding rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
         }

@@ -40,6 +40,7 @@ import {
   hasProjectCredential,
   preflightCredentialStore,
   removeProjectCredential,
+  rollbackProjectCredentialIfRevision,
   storeProjectCredential,
 } from './credentialStore.js';
 import { runProxy } from './proxy.js';
@@ -1319,6 +1320,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
     let bindingDirectory;
+    let credentialRevision;
     try {
       let bootstrapUrl;
       if (agentic) {
@@ -1371,12 +1373,13 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           },
         );
         const persistCredential = runtime.storeProjectCredential || storeProjectCredential;
-        persistCredential({
+        const persistedCredential = persistCredential({
           projectId: bindingPlan.binding.projectId,
           mcpUrl: exchanged.mcpUrl,
           bearerToken: exchanged.bearerToken,
           expiresAt: exchanged.expiresAt,
         }, env, bindingPlan.workspaceRoot);
+        credentialRevision = persistedCredential?.revision;
         assertProjectBindingRevision(
           bindingPlan.workspaceRoot,
           exchangedBinding,
@@ -1387,6 +1390,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
             rollbackOnFailure: bound.changed,
           },
         );
+        credentialRevision = undefined;
       }
     } catch (error) {
       const failures = [];
@@ -1395,6 +1399,17 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       }
       if (error && typeof error === 'object' && error.bindingRollbackCompleted) {
         bound.changed = false;
+      }
+      if (credentialRevision) {
+        try {
+          rollbackProjectCredentialIfRevision(
+            credentialRevision,
+            env,
+            bindingPlan.workspaceRoot,
+          );
+        } catch (rollbackError) {
+          failures.push(`credential rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
       }
       if (bound.changed) {
         try {

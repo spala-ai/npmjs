@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import lockfile from 'proper-lockfile';
 import { normalizeMcpUrl } from './installer.js';
 import { assertSafePath } from './pathSafety.js';
@@ -10,11 +11,14 @@ const CREDENTIAL_STORE_LOCK_TIMEOUT_MS = 5_000;
 const CREDENTIAL_STORE_STALE_LOCK_MS = 30_000;
 const CREDENTIAL_STORE_LOCK_RETRY_MS = 10;
 const CREDENTIAL_STORE_PUBLICATION_ATTEMPTS = 8;
+const CREDENTIAL_RECOVERY_SCHEMA_VERSION = 1;
 const LOCK_WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
 const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 const DIRECTORY_FLAGS = fs.constants.O_RDONLY
   | (fs.constants.O_DIRECTORY || 0)
   | NOFOLLOW;
+const CREDENTIAL_PUBLICATION_REVISION = Symbol('credentialPublicationRevision');
+const credentialRollbackStates = new WeakMap();
 
 function homeDir(env) {
   return env.SPALA_MCP_CREDENTIAL_HOME || env.HOME || env.USERPROFILE || os.homedir();
@@ -35,6 +39,7 @@ function credentialStoreLocation(env = process.env, workspaceRoot) {
     directory: path.dirname(filePath),
     filePath,
     lockPath: `${filePath}.lock`,
+    recoveryPath: `${filePath}.recovery`,
   };
 }
 
@@ -250,7 +255,39 @@ function assertLockPath(location) {
 }
 
 function ensureStoreDirectory(location, expectedState) {
-  const before = expectedState || assertCredentialPath(location);
+  let before;
+  try {
+    before = expectedState || assertCredentialPath(location);
+  } catch (error) {
+    const target = lstatOrUndefined(location.filePath);
+    const lock = lstatOrUndefined(location.lockPath);
+    const staleLockedPartial = error
+      && typeof error === 'object'
+      && error.code === 'EACCES'
+      && target
+      && target.isFile()
+      && target.nlink === 1n
+      && (Number(target.mode) & 0o777) === 0
+      && lock
+      && lock.isDirectory()
+      && Number(lock.mtimeMs) <= Date.now() - CREDENTIAL_STORE_STALE_LOCK_MS;
+    if (!staleLockedPartial) throw error;
+
+    assertPrivateRegularFile(target, 'Spala credential store');
+    const recovery = readRecoveryRevision(location);
+    if (!recovery) throw error;
+    const targetIdentity = identity(target);
+    fs.chmodSync(location.filePath, 0o600);
+    const readable = lstatOrUndefined(location.filePath);
+    if (
+      !readable
+      || !identitiesMatch(identity(readable), targetIdentity)
+      || (Number(readable.mode) & 0o777) !== 0o600
+    ) {
+      throw changedError('Spala credential store');
+    }
+    before = assertCredentialPath(location);
+  }
   fs.mkdirSync(location.directory, { recursive: true, mode: 0o700 });
   const created = assertCredentialPath(location, before, { allowMissingChange: true });
   const directoryStat = fs.lstatSync(location.directory);
@@ -258,6 +295,10 @@ function ensureStoreDirectory(location, expectedState) {
     throw new Error('Spala credential directory must be a directory.');
   }
   if (typeof process.getuid === 'function' && directoryStat.uid !== process.getuid()) {
+    const credentialStat = lstatOrUndefined(location.filePath);
+    if (credentialStat && Number(credentialStat.uid) !== process.getuid()) {
+      throw new Error('Spala credential store is owned by another user.');
+    }
     throw new Error('Spala credential directory is owned by another user.');
   }
   if (process.platform !== 'win32') {
@@ -398,7 +439,8 @@ function readStoreAtLocation(location) {
 }
 
 function readStore(env, workspaceRoot) {
-  return readStoreAtLocation(credentialStoreLocation(env, workspaceRoot));
+  const location = credentialStoreLocation(env, workspaceRoot);
+  return withStoreLock(location, () => readRecoveredStoreAtLocation(location));
 }
 
 function removeOwnedEntry(name, expectedIdentity, label, { ignoreMismatch = false } = {}) {
@@ -475,6 +517,31 @@ function statMatchesRevision(stat, revision) {
     && stat.gid.toString() === revision.gid;
 }
 
+function revisionsMatch(left, right) {
+  return Boolean(left && right)
+    && identitiesMatch(left.identity, right.identity)
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.content.equals(right.content);
+}
+
+function attachPublicationRevision(value, revision) {
+  if (value && typeof value === 'object') {
+    Object.defineProperty(value, CREDENTIAL_PUBLICATION_REVISION, {
+      configurable: false,
+      enumerable: false,
+      value: revision,
+      writable: false,
+    });
+  }
+  return value;
+}
+
 function parseStoreRevision(content, label) {
   let store;
   try {
@@ -494,7 +561,7 @@ function parseStoreRevision(content, label) {
   return store;
 }
 
-function readNamedStoreRevision(name, label) {
+function readNamedRevision(name, label) {
   let descriptor;
   try {
     descriptor = fs.openSync(name, fs.constants.O_RDONLY | NOFOLLOW);
@@ -502,7 +569,7 @@ function readNamedStoreRevision(name, label) {
     if (!statMatchesRevision(lstatOrUndefined(name), revision)) {
       throw changedError(label);
     }
-    return { ...revision, store: parseStoreRevision(revision.content, label) };
+    return revision;
   } catch (error) {
     if (error && typeof error === 'object' && ['ELOOP', 'EMLINK'].includes(error.code)) {
       throw new Error('Spala credential store path must not contain symbolic links.');
@@ -511,6 +578,20 @@ function readNamedStoreRevision(name, label) {
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
+}
+
+function readNamedRevisionOrUndefined(name, label) {
+  try {
+    return readNamedRevision(name, label);
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function readNamedStoreRevision(name, label) {
+  const revision = readNamedRevision(name, label);
+  return { ...revision, store: parseStoreRevision(revision.content, label) };
 }
 
 function readNamedStoreRevisionOrUndefined(name, label) {
@@ -531,6 +612,169 @@ function mergeStoreProjects(current, observed) {
 
 function storeContent(store) {
   return Buffer.from(`${JSON.stringify(store, null, 2)}\n`, 'utf8');
+}
+
+function recoveryChecksum(store) {
+  return createHash('sha256').update(storeContent(store)).digest('hex');
+}
+
+function recoveryContent(store) {
+  return Buffer.from(`${JSON.stringify({
+    schemaVersion: CREDENTIAL_RECOVERY_SCHEMA_VERSION,
+    store,
+    checksum: recoveryChecksum(store),
+  }, null, 2)}\n`, 'utf8');
+}
+
+function parseRecoveryRevision(content) {
+  let recovery;
+  try {
+    recovery = JSON.parse(content.toString('utf8'));
+  } catch {
+    throw new Error('Spala credential recovery state is invalid or incomplete.');
+  }
+  const keys = recovery && typeof recovery === 'object' && !Array.isArray(recovery)
+    ? Object.keys(recovery).sort()
+    : [];
+  if (
+    keys.join(',') !== 'checksum,schemaVersion,store'
+    || recovery.schemaVersion !== CREDENTIAL_RECOVERY_SCHEMA_VERSION
+    || typeof recovery.checksum !== 'string'
+    || !/^[a-f0-9]{64}$/.test(recovery.checksum)
+  ) {
+    throw new Error('Spala credential recovery state has an unsupported format.');
+  }
+  const store = parseStoreRevision(
+    Buffer.from(JSON.stringify(recovery.store), 'utf8'),
+    'Spala credential recovery state',
+  );
+  if (recoveryChecksum(store) !== recovery.checksum) {
+    throw new Error('Spala credential recovery state failed integrity validation.');
+  }
+  return { checksum: recovery.checksum, store };
+}
+
+function assertRecoveryPath(location, filePath = location.recoveryPath) {
+  return assertSafePath(
+    filePath,
+    location.homePath,
+    'Spala credential recovery path',
+  );
+}
+
+function readRecoveryRevision(location) {
+  assertRecoveryPath(location);
+  const revision = readNamedRevisionOrUndefined(
+    location.recoveryPath,
+    'Spala credential recovery state',
+  );
+  if (!revision) return undefined;
+  const recovery = parseRecoveryRevision(revision.content);
+  return { ...revision, ...recovery };
+}
+
+function fsyncCurrentDirectory() {
+  let descriptor;
+  try {
+    descriptor = fs.openSync('.', DIRECTORY_FLAGS);
+    fs.fsyncSync(descriptor);
+  } catch (error) {
+    const unsupported = error
+      && typeof error === 'object'
+      && ['EINVAL', 'ENOTSUP', 'EBADF'].includes(error.code);
+    if (!unsupported) throw error;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+function publishRecoveryStore(location, store, verifyDirectory) {
+  const existing = readRecoveryRevision(location);
+  const content = recoveryContent(store);
+  if (existing?.content.equals(content)) return existing;
+
+  const recoveryName = path.basename(location.recoveryPath);
+  const temporaryName = `${recoveryName}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const temporaryPath = path.join(location.directory, temporaryName);
+  let descriptor;
+  let temporaryIdentity;
+  try {
+    assertRecoveryPath(location, temporaryPath);
+    verifyDirectory();
+    descriptor = fs.openSync(
+      temporaryName,
+      fs.constants.O_CREAT
+        | fs.constants.O_EXCL
+        | fs.constants.O_WRONLY
+        | NOFOLLOW,
+      process.platform === 'win32' ? 0o600 : 0o000,
+    );
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    assertPrivateRegularFile(opened, 'Spala credential recovery temporary file');
+    temporaryIdentity = identity(opened);
+    if (!identitiesMatch(identity(lstatOrUndefined(temporaryName)), temporaryIdentity)) {
+      throw changedError('Spala credential recovery temporary file');
+    }
+    writeAll(descriptor, content);
+    fs.fsyncSync(descriptor);
+    if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
+    fs.chmodSync(temporaryName, 0o600);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+
+    const prepared = readNamedRevision(
+      temporaryName,
+      'Spala credential recovery temporary file',
+    );
+    if (
+      !identitiesMatch(prepared.identity, temporaryIdentity)
+      || !prepared.content.equals(content)
+    ) {
+      throw changedError('Spala credential recovery temporary file');
+    }
+
+    verifyDirectory();
+    const current = readNamedRevisionOrUndefined(
+      recoveryName,
+      'Spala credential recovery state',
+    );
+    if (
+      (existing && !revisionsMatch(current, existing))
+      || (!existing && current)
+    ) {
+      throw changedError('Spala credential recovery state');
+    }
+    fs.renameSync(temporaryName, recoveryName);
+    temporaryIdentity = undefined;
+    fsyncCurrentDirectory();
+    verifyDirectory();
+
+    const published = readRecoveryRevision(location);
+    if (!published?.content.equals(content)) {
+      throw changedError('Spala credential recovery state');
+    }
+    return published;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    removeOwnedEntry(
+      temporaryName,
+      temporaryIdentity,
+      'Spala credential recovery temporary file',
+      { ignoreMismatch: true },
+    );
+  }
+}
+
+function removeRecoveryRevisionIfCurrent(location, revision) {
+  if (!revision) return false;
+  const recoveryName = path.basename(location.recoveryPath);
+  const current = lstatOrUndefined(recoveryName);
+  if (!current) return true;
+  if (!statMatchesRevision(current, revision)) return false;
+  fs.unlinkSync(recoveryName);
+  fsyncCurrentDirectory();
+  return true;
 }
 
 function writeAll(descriptor, content) {
@@ -827,7 +1071,7 @@ function recoverObservedStore(
   return false;
 }
 
-function writeStore(location, baseStore, expectedState, update, initialResult) {
+function writeStore(location, baseStore, expectedState, update, initialResult, beforeCandidate) {
   const pathState = assertCredentialPath(location, expectedState);
   const targetName = path.basename(location.filePath);
 
@@ -869,6 +1113,7 @@ function writeStore(location, baseStore, expectedState, update, initialResult) {
         if (!ownedCanonical) {
           isolateNamedStore(location, targetName, guards, observe, verifyDirectory);
           candidateResult = update(observed);
+          beforeCandidate?.(candidateResult.store, verifyDirectory);
           const prepared = prepareStoreRevision(
             location,
             candidateResult.store,
@@ -910,7 +1155,7 @@ function writeStore(location, baseStore, expectedState, update, initialResult) {
           && final.content.equals(candidate)
           && !update(final.store).changed
         ) {
-          return initialResult.value;
+          return attachPublicationRevision(initialResult.value, final);
         }
         if (final) observe(final.store);
         ownedCanonical = undefined;
@@ -944,13 +1189,159 @@ function writeStore(location, baseStore, expectedState, update, initialResult) {
   });
 }
 
+function readRecoveredStoreAtLocation(location) {
+  const directoryIdentity = identity(fs.statSync('.', { bigint: true }));
+  const verifyDirectory = () => {
+    verifyAnchoredDirectory(location, directoryIdentity);
+    assertCredentialPath(location, undefined, { allowTargetChange: true });
+    assertRecoveryPath(location);
+  };
+  const recovery = readRecoveryRevision(location);
+  let canonical;
+  let invalidCanonical;
+  try {
+    canonical = readStoreAtLocation(location);
+  } catch (error) {
+    if (
+      error instanceof Error
+      && (
+        error.message === 'Spala credential store is invalid JSON.'
+        || error.message === 'Spala credential store has an unsupported format.'
+      )
+    ) {
+      invalidCanonical = error;
+    } else {
+      throw error;
+    }
+  }
+
+  if (!recovery) {
+    if (invalidCanonical) throw invalidCanonical;
+    return {
+      ...canonical,
+      recovery: undefined,
+    };
+  }
+
+  const targetName = path.basename(location.filePath);
+  const rawCanonical = readNamedRevisionOrUndefined(targetName, 'Spala credential store');
+  const mergedStore = canonical
+    ? mergeStoreProjects(recovery.store, canonical.store)
+    : recovery.store;
+  let durableRecovery = publishRecoveryStore(location, mergedStore, verifyDirectory);
+  const canonicalMatches = canonical
+    && rawCanonical
+    && rawCanonical.content.equals(storeContent(mergedStore));
+  if (canonicalMatches) {
+    return {
+      ...canonical,
+      store: mergedStore,
+      recovery: durableRecovery,
+    };
+  }
+
+  if (invalidCanonical && rawCanonical) {
+    removeOwnedEntry(
+      targetName,
+      rawCanonical.identity,
+      'Spala credential store',
+    );
+  }
+  const pathState = assertCredentialPath(location);
+  const baseStore = canonical?.store || emptyStore();
+  const repair = observed => {
+    const repaired = mergeStoreProjects(mergedStore, observed);
+    const changed = !storeContent(repaired).equals(storeContent(observed));
+    return {
+      changed,
+      store: repaired,
+      value: { changed },
+    };
+  };
+  const initialResult = repair(baseStore);
+  if (initialResult.changed || !rawCanonical) {
+    writeStore(
+      location,
+      baseStore,
+      pathState,
+      repair,
+      initialResult,
+      candidateStore => {
+        durableRecovery = publishRecoveryStore(
+          location,
+          candidateStore,
+          verifyDirectory,
+        );
+      },
+    );
+  }
+
+  const repairedCanonical = readStoreAtLocation(location);
+  const finalStore = mergeStoreProjects(durableRecovery.store, repairedCanonical.store);
+  durableRecovery = publishRecoveryStore(location, finalStore, verifyDirectory);
+  return {
+    ...repairedCanonical,
+    store: finalStore,
+    recovery: durableRecovery,
+  };
+}
+
 function updateStore(env, workspaceRoot, update) {
   const location = credentialStoreLocation(env, workspaceRoot);
   return withStoreLock(location, () => {
-    const { pathState, store } = readStoreAtLocation(location);
+    const { pathState, store } = readRecoveredStoreAtLocation(location);
     const result = update(store);
     if (!result.changed) return result.value;
-    return writeStore(location, store, pathState, update, result);
+    const directoryIdentity = identity(fs.statSync('.', { bigint: true }));
+    const verifyDirectory = () => {
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, undefined, { allowTargetChange: true });
+      assertRecoveryPath(location);
+    };
+    let durableRecovery = publishRecoveryStore(
+      location,
+      result.store,
+      verifyDirectory,
+    );
+    try {
+      const value = writeStore(
+        location,
+        store,
+        pathState,
+        update,
+        result,
+        candidateStore => {
+          durableRecovery = publishRecoveryStore(
+            location,
+            candidateStore,
+            verifyDirectory,
+          );
+        },
+      );
+      const finalCanonical = readStoreAtLocation(location);
+      const finalStore = mergeStoreProjects(
+        durableRecovery.store,
+        finalCanonical.store,
+      );
+      publishRecoveryStore(location, finalStore, verifyDirectory);
+      return value;
+    } catch (error) {
+      try {
+        publishRecoveryStore(location, store, verifyDirectory);
+      } catch (recoveryError) {
+        let removed = false;
+        try {
+          removed = removeRecoveryRevisionIfCurrent(location, durableRecovery);
+        } catch {
+          removed = false;
+        }
+        if (!removed && error && typeof error === 'object') {
+          error.recoveryError = recoveryError;
+          error.changed = true;
+        }
+      }
+      throw error;
+    }
   });
 }
 
@@ -1012,7 +1403,15 @@ export function storeProjectCredential({ projectId, mcpUrl, bearerToken, expires
   const expiry = validateExpiresAt(expiresAt);
   if (Date.parse(expiry) <= Date.now()) throw new Error('Bootstrap response did not include a valid future credential expiry.');
   const credential = { mcpUrl: url, bearerToken: bearer, expiresAt: expiry, status: 'active' };
-  return updateStore(env, workspaceRoot, store => {
+  let previousCredential;
+  let capturedPrevious = false;
+  const result = updateStore(env, workspaceRoot, store => {
+    if (!capturedPrevious) {
+      previousCredential = Object.hasOwn(store.projects, id)
+        ? structuredClone(store.projects[id])
+        : null;
+      capturedPrevious = true;
+    }
     const changed = JSON.stringify(store.projects[id]) !== JSON.stringify(credential);
     return {
       changed,
@@ -1025,6 +1424,15 @@ export function storeProjectCredential({ projectId, mcpUrl, bearerToken, expires
       value: { changed, projectId: id, expiresAt: expiry, status: 'active' },
     };
   });
+  const publicationRevision = result[CREDENTIAL_PUBLICATION_REVISION];
+  if (!result.changed || !publicationRevision) return result;
+
+  const revision = Object.freeze({ projectId: id });
+  credentialRollbackStates.set(revision, {
+    credential: structuredClone(credential),
+    previousCredential,
+  });
+  return { ...result, revision };
 }
 
 export function readProjectCredential(projectId, env = process.env, workspaceRoot) {
@@ -1065,6 +1473,76 @@ export function snapshotProjectCredential(projectId, env = process.env, workspac
   const id = validateProjectId(projectId);
   const { store } = readStore(env, workspaceRoot);
   return Object.hasOwn(store.projects, id) ? structuredClone(store.projects[id]) : null;
+}
+
+export function rollbackProjectCredentialIfRevision(revision, env = process.env, workspaceRoot) {
+  const rollback = credentialRollbackStates.get(revision);
+  if (!rollback || revision.projectId === undefined) {
+    throw new Error('Credential rollback requires a valid publication revision.');
+  }
+  const id = validateProjectId(revision.projectId);
+  const location = credentialStoreLocation(env, workspaceRoot);
+  return withStoreLock(location, () => {
+    const { pathState, store } = readRecoveredStoreAtLocation(location);
+    if (
+      JSON.stringify(store.projects[id]) !== JSON.stringify(rollback.credential)
+    ) {
+      return { changed: false, projectId: id, superseded: true };
+    }
+
+    const update = observed => {
+      if (JSON.stringify(observed.projects[id]) !== JSON.stringify(rollback.credential)) {
+        return {
+          changed: false,
+          store: observed,
+          value: { changed: false, projectId: id, superseded: true },
+        };
+      }
+      const projects = { ...observed.projects };
+      if (rollback.previousCredential === null) delete projects[id];
+      else projects[id] = structuredClone(rollback.previousCredential);
+      return {
+        changed: true,
+        store: { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects },
+        value: { changed: true, projectId: id, superseded: false },
+      };
+    };
+    const result = update(store);
+    if (!result.changed) return result.value;
+    const directoryIdentity = identity(fs.statSync('.', { bigint: true }));
+    const verifyDirectory = () => {
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, undefined, { allowTargetChange: true });
+      assertRecoveryPath(location);
+    };
+    let durableRecovery = publishRecoveryStore(
+      location,
+      result.store,
+      verifyDirectory,
+    );
+    credentialRollbackStates.delete(revision);
+    const value = writeStore(
+      location,
+      store,
+      pathState,
+      update,
+      result,
+      candidateStore => {
+        durableRecovery = publishRecoveryStore(
+          location,
+          candidateStore,
+          verifyDirectory,
+        );
+      },
+    );
+    const finalCanonical = readStoreAtLocation(location);
+    publishRecoveryStore(
+      location,
+      mergeStoreProjects(durableRecovery.store, finalCanonical.store),
+      verifyDirectory,
+    );
+    return value;
+  });
 }
 
 export function removeProjectCredential(projectId, env = process.env, workspaceRoot) {

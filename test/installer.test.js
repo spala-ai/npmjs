@@ -15,6 +15,7 @@ import {
   createUninstallPlan,
   installPlan,
   INSTALLER_PACKAGE_SPEC,
+  mcpAuthorizationMatches,
   mcpEndpointsMatch,
   normalizeMcpUrl,
   PUBLIC_LEGACY_SERVER_NAMES,
@@ -52,6 +53,19 @@ function writeCodexRegistration(root, serverName, mcpUrl) {
     '',
   ].join('\n'));
   return configPath;
+}
+
+function proxyWorkspace(projectId = 'project-123', mcpUrl = 'https://shared.spala.ai/p123/mcp') {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId,
+    projectUrl: new URL('./', mcpUrl).toString().replace(/mcp\/$/, ''),
+    mcpUrl,
+    serverName: serverNameFromUrl(mcpUrl),
+  });
+  return workspace;
 }
 
 function oauthAuthorizationUrl(extra = {}, mcpUrl = PUBLIC_MCP_URL) {
@@ -136,6 +150,37 @@ test('normalizes missing scope without replacing an existing scope', () => {
   assert.equal(
     normalizeMcpUrl('https://example.test/mcp?scope=api', 'builder,project,data'),
     'https://example.test/mcp?scope=api',
+  );
+});
+
+test('compares MCP authorization scope as an unordered exact set', () => {
+  assert.equal(
+    mcpAuthorizationMatches(
+      'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject',
+      'https://shared.spala.ai/p123/mcp/?scope=project%2Cbuilder',
+    ),
+    true,
+  );
+  assert.equal(
+    mcpAuthorizationMatches(
+      'https://shared.spala.ai/p123/mcp?scope=builder',
+      'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject',
+    ),
+    false,
+  );
+  assert.equal(
+    mcpAuthorizationMatches(
+      'https://shared.spala.ai/p123/mcp',
+      'https://shared.spala.ai/p123/mcp?scope=builder',
+    ),
+    false,
+  );
+  assert.equal(
+    mcpAuthorizationMatches(
+      'https://shared.spala.ai/p123/mcp?scope=builder&scope=project',
+      'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject',
+    ),
+    false,
   );
 });
 
@@ -4053,11 +4098,15 @@ test('workspace binding rejects credentials, secret parameters, extra fields, an
   assert.throws(() => writeProjectBinding(workspace, { ...base, mcpUrl: 'https://user:pass@shared.spala.ai/p123/mcp' }), /credentials/);
   assert.throws(() => writeProjectBinding(workspace, { ...base, mcpUrl: 'https://shared.spala.ai/p123/mcp?token=secret' }), /unsupported query/);
   assert.throws(() => writeProjectBinding(workspace, { ...base, accessToken: 'secret' }), /unsupported fields/);
-  assert.throws(() => writeProjectBinding(workspace, {
+  const customWorkspace = tempHome();
+  fs.mkdirSync(path.join(customWorkspace, '.git'));
+  const customBinding = {
     ...base,
     projectUrl: 'https://example.com/p123/',
     mcpUrl: 'https://example.com/p123/mcp',
-  }), /Spala project host/);
+  };
+  writeProjectBinding(customWorkspace, customBinding);
+  assert.deepEqual(readProjectBinding(customWorkspace).binding, customBinding);
   const target = path.join(workspace, 'outside');
   fs.mkdirSync(target);
   fs.symlinkSync(target, path.join(workspace, '.spala'));
@@ -4650,6 +4699,124 @@ test('credential persistence failure rolls back binding and client config withou
   assert.equal(stored.bearerToken, 'mcp_replacement_credential');
 });
 
+test('a bind that loses the workspace race restores only its credential revision', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const projectId = 'project-losing-bind';
+  const originalBinding = {
+    schemaVersion: 1,
+    projectId,
+    projectUrl: 'https://losing-bind.spala.ai/',
+    mcpUrl: 'https://losing-bind.spala.ai/mcp?scope=builder',
+    serverName: serverNameFromUrl('https://losing-bind.spala.ai/mcp'),
+  };
+  writeProjectBinding(workspace, originalBinding);
+  storeProjectCredential({
+    projectId,
+    mcpUrl: originalBinding.mcpUrl,
+    bearerToken: 'mcp_before_losing_bind',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, credentialEnv);
+
+  await assert.rejects(runCli([
+    'project', 'bind',
+    '--project-id', projectId,
+    '--project-url', originalBinding.projectUrl,
+    '--url', 'https://losing-bind.spala.ai/mcp?scope=builder%2Cproject',
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--switch',
+    '--client', 'claude-code',
+    '--yes',
+  ], credentialEnv, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://losing-bind.spala.ai/mcp/agent-instructions/opaque/consume\n']),
+  }, {
+    fetch: async () => new Response(JSON.stringify({
+      access_token: 'mcp_losing_bind_revision',
+      expires_at: new Date(Date.now() + 120_000).toISOString(),
+      mcp_url: 'https://losing-bind.spala.ai/mcp?scope=builder%2Cproject',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    storeProjectCredential: (input, currentEnv, workspaceRoot) => {
+      const persisted = storeProjectCredential(input, currentEnv, workspaceRoot);
+      storeProjectCredential({
+        projectId: 'unrelated-later-writer',
+        mcpUrl: 'https://unrelated-later-writer.spala.ai/mcp',
+        bearerToken: 'mcp_unrelated_later_writer',
+        expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      }, currentEnv, workspaceRoot);
+      writeProjectBinding(workspace, originalBinding, { switchProject: true });
+      return persisted;
+    },
+  }), /binding changed while the project bind was pending/i);
+
+  assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+  const restored = readProjectCredential(projectId, credentialEnv);
+  assert.equal(restored.mcpUrl, originalBinding.mcpUrl);
+  assert.equal(restored.bearerToken, 'mcp_before_losing_bind');
+  assert.equal(
+    readProjectCredential('unrelated-later-writer', credentialEnv).bearerToken,
+    'mcp_unrelated_later_writer',
+  );
+});
+
+test('losing-bind credential rollback preserves a later credential writer', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const projectId = 'project-losing-bind-later-writer';
+  const losingUrl = 'https://losing-bind-later.spala.ai/mcp?scope=builder';
+  const winnerUrl = 'https://losing-bind-later.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
+  const winnerBinding = {
+    schemaVersion: 1,
+    projectId,
+    projectUrl: 'https://losing-bind-later.spala.ai/',
+    mcpUrl: winnerUrl,
+    serverName: serverNameFromUrl(winnerUrl),
+  };
+
+  await assert.rejects(runCli([
+    'project', 'bind',
+    '--project-id', projectId,
+    '--project-url', winnerBinding.projectUrl,
+    '--url', losingUrl,
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'claude-code',
+    '--yes',
+  ], credentialEnv, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://losing-bind-later.spala.ai/mcp/agent-instructions/opaque/consume\n']),
+  }, {
+    fetch: async () => new Response(JSON.stringify({
+      access_token: 'mcp_losing_revision',
+      expires_at: new Date(Date.now() + 120_000).toISOString(),
+      mcp_url: losingUrl,
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    storeProjectCredential: (input, currentEnv, workspaceRoot) => {
+      const losingRevision = storeProjectCredential(input, currentEnv, workspaceRoot);
+      storeProjectCredential({
+        projectId,
+        mcpUrl: winnerUrl,
+        bearerToken: 'mcp_winner_revision',
+        expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      }, currentEnv, workspaceRoot);
+      writeProjectBinding(workspace, winnerBinding, { switchProject: true });
+      return losingRevision;
+    },
+  }), /binding changed while the project bind was pending/i);
+
+  assert.deepEqual(readProjectBinding(workspace).binding, winnerBinding);
+  const winner = readProjectCredential(projectId, credentialEnv);
+  assert.equal(winner.mcpUrl, winnerUrl);
+  assert.equal(winner.bearerToken, 'mcp_winner_revision');
+});
+
 test('credential temporary chmod failure precedes rename and rolls back binding and client config', async () => {
   const workspace = tempHome();
   const credentialHome = tempHome();
@@ -5232,6 +5399,7 @@ test('credential reads and writes preserve the 0.1.15 flat store format', () => 
 
 test('proxy reads its user credential and forwards bearer auth without printing it', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   const bearerToken = 'mcp_proxy_secret';
   storeProjectCredential({
     projectId: 'project-123',
@@ -5245,6 +5413,7 @@ test('proxy reads its user credential and forwards bearer auth without printing 
   let fetchCalls = 0;
   await runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
     stdin: Readable.from([`${JSON.stringify(request)}\n`]),
     stdout: { write: chunk => { output += chunk; } },
@@ -5265,8 +5434,94 @@ test('proxy reads its user credential and forwards bearer auth without printing 
   assert.doesNotMatch(output, new RegExp(bearerToken));
 });
 
+test('an older workspace proxy rejects a credential overwritten by a broader-scope bind', async () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'project-shared-scope';
+  const narrowUrl = 'https://shared.spala.ai/p123/mcp?scope=builder';
+  const broadUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const narrowWorkspace = proxyWorkspace(projectId, narrowUrl);
+  const broadWorkspace = proxyWorkspace(projectId, broadUrl);
+  storeProjectCredential({
+    projectId,
+    mcpUrl: broadUrl,
+    bearerToken: 'mcp_broad_scope_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, credentialEnv);
+
+  let fetchCalls = 0;
+  await assert.rejects(runProxy({
+    projectId,
+    cwd: narrowWorkspace,
+    env: credentialEnv,
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      throw new Error('must not forward');
+    },
+  }), /credential endpoint or scope does not match.*Rebind/i);
+  assert.equal(fetchCalls, 0);
+
+  await runProxy({
+    projectId,
+    cwd: broadWorkspace,
+    env: credentialEnv,
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 2, result: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  assert.equal(fetchCalls, 1);
+});
+
+test('two workspaces accept a shared credential only when endpoint and scope sets are identical', async () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'project-equivalent-scope';
+  const firstWorkspace = proxyWorkspace(
+    projectId,
+    'https://shared.spala.ai/p456/mcp?scope=project%2Cbuilder',
+  );
+  const secondWorkspace = proxyWorkspace(
+    projectId,
+    'https://shared.spala.ai/p456/mcp?scope=builder%2Cproject',
+  );
+  storeProjectCredential({
+    projectId,
+    mcpUrl: 'https://shared.spala.ai/p456/mcp?scope=builder%2Cproject',
+    bearerToken: 'mcp_equivalent_scope_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, credentialEnv);
+
+  let fetchCalls = 0;
+  for (const cwd of [firstWorkspace, secondWorkspace]) {
+    await runProxy({
+      projectId,
+      cwd,
+      env: credentialEnv,
+      stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: fetchCalls + 1, method: 'tools/list' })}\n`]),
+      stdout: { write: () => {} },
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: fetchCalls, result: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+  }
+  assert.equal(fetchCalls, 2);
+});
+
 test('proxy rejects oversized JSON responses instead of buffering them', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5276,6 +5531,7 @@ test('proxy rejects oversized JSON responses instead of buffering them', async (
   const oversized = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { blob: 'x'.repeat(70_000) } });
   await assert.rejects(runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout: { write: () => {} },
@@ -5285,6 +5541,7 @@ test('proxy rejects oversized JSON responses instead of buffering them', async (
 
 test('proxy rejects an unterminated oversized SSE buffer instead of growing it', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5294,6 +5551,7 @@ test('proxy rejects an unterminated oversized SSE buffer instead of growing it',
   const unterminated = `data: ${'x'.repeat(70_000)}`;
   await assert.rejects(runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout: { write: () => {} },
@@ -5303,6 +5561,7 @@ test('proxy rejects an unterminated oversized SSE buffer instead of growing it',
 
 test('proxy SSE limit counts raw bytes so multibyte payloads cannot bypass it', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5313,6 +5572,7 @@ test('proxy SSE limit counts raw bytes so multibyte payloads cannot bypass it', 
   const multibyte = `data: ${'€'.repeat(30_000)}`;
   await assert.rejects(runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout: { write: () => {} },
@@ -5322,6 +5582,7 @@ test('proxy SSE limit counts raw bytes so multibyte payloads cannot bypass it', 
 
 test('proxy SSE limit is cumulative across multiple delimited events', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5331,6 +5592,7 @@ test('proxy SSE limit is cumulative across multiple delimited events', async () 
   const event = `data: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { blob: 'x'.repeat(40_000) } })}\n\n`;
   await assert.rejects(runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout: { write: () => {} },
@@ -5340,6 +5602,7 @@ test('proxy SSE limit is cumulative across multiple delimited events', async () 
 
 test('proxy write waits never hang when stdout closes synchronously inside write()', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5360,6 +5623,7 @@ test('proxy write waits never hang when stdout closes synchronously inside write
   const response = { jsonrpc: '2.0', id: 1, result: { tools: [] } };
   await runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout,
@@ -5369,6 +5633,7 @@ test('proxy write waits never hang when stdout closes synchronously inside write
 
 test('persistent GET event channel enforces per-event limits only, not a cumulative cap', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5384,6 +5649,7 @@ test('persistent GET event channel enforces per-event limits only, not a cumulat
   const written = [];
   await runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout: { write: chunk => { written.push(chunk); return true; } },
@@ -5400,6 +5666,7 @@ test('persistent GET event channel enforces per-event limits only, not a cumulat
 
 test('proxy POST requests carry an abort timeout signal', async () => {
   const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
   storeProjectCredential({
     projectId: 'project-123',
     mcpUrl: 'https://shared.spala.ai/p123/mcp',
@@ -5410,6 +5677,7 @@ test('proxy POST requests carry an abort timeout signal', async () => {
   let sawSignal = false;
   await runProxy({
     projectId: 'project-123',
+    cwd: workspace,
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_TIMEOUT_MS: '5000' },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout: { write: () => {} },

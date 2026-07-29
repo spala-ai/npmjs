@@ -14,6 +14,7 @@ import {
   createProxyInstallPlan,
   createUninstallPlan,
   installPlan,
+  mcpEndpointsMatch,
   normalizeMcpUrl,
   PUBLIC_LEGACY_SERVER_NAMES,
   PUBLIC_MCP_URL,
@@ -4267,6 +4268,65 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   const stored = readProjectCredential('project-123', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.bearerToken, bearerToken);
   assert.equal(stored.mcpUrl, 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('exact-url project bind accepts a scoped bootstrap response for a bare requested URL', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const bootstrapUrl = 'https://activity-stream.spala.ai/mcp/agent-instructions/one-time-id/consume';
+  let output = '';
+
+  await runCli([
+    'project', 'bind',
+    '--project-id', 'project-777',
+    '--project-url', 'https://activity-stream.spala.ai/',
+    '--url', 'https://activity-stream.spala.ai/mcp',
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'codex',
+    '--yes',
+    '--json',
+  ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+    stdin: Readable.from([`${bootstrapUrl}\n`]),
+  }, {
+    fetch: async () => new Response(JSON.stringify({
+      access_token: 'mcp_scoped_response_secret',
+      token_type: 'Bearer',
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      mcp_url: 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }),
+  });
+
+  const payload = JSON.parse(output);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.outcome, 'bound');
+  const stored = readProjectCredential('project-777', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  assert.equal(stored.mcpUrl, 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('bootstrap endpoint identity ignores scope but rejects other origins and paths', () => {
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp',
+    'https://activity.spala.test/mcp?scope=builder%2Cproject%2Cdata',
+  ), true);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp?scope=data',
+    'https://activity.spala.test/mcp?scope=builder%2Cproject%2Cdata',
+  ), true);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp',
+    'https://other.spala.test/mcp?scope=builder%2Cproject%2Cdata',
+  ), false);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp',
+    'https://activity.spala.test/other?scope=builder%2Cproject%2Cdata',
+  ), false);
 });
 
 test('agentic project bind reads a bootstrap URL from a TTY without echoing it and restores raw mode', async () => {

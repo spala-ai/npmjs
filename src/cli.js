@@ -1305,9 +1305,20 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           mcpUrl: bindingPlan.binding.mcpUrl,
           fetchImpl: runtime.fetch || globalThis.fetch,
         });
+        // The consume response is the authority on the endpoint (it may carry
+        // the scope query even when the requested URL was bare). Store and
+        // bind the exchanged URL so proxy credentials and the workspace
+        // binding agree with the server.
+        if (exchanged.mcpUrl !== bindingPlan.binding.mcpUrl) {
+          bound = writeProjectBinding(
+            bindingPlan.workspaceRoot,
+            { ...bindingPlan.binding, mcpUrl: exchanged.mcpUrl },
+            { switchProject: true },
+          );
+        }
         storeProjectCredential({
           projectId: bindingPlan.binding.projectId,
-          mcpUrl: bindingPlan.binding.mcpUrl,
+          mcpUrl: exchanged.mcpUrl,
           bearerToken: exchanged.bearerToken,
           expiresAt: exchanged.expiresAt,
         }, env, bindingPlan.workspaceRoot);

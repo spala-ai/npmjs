@@ -23,6 +23,8 @@ import {
   rollbackInstallPlan,
   serverNameFromUrl,
 } from '../src/installer.js';
+import { CODEX_SPALA_SKILL } from '../src/codexSkill.js';
+import { consumeBootstrap } from '../src/bootstrap.js';
 import { credentialStorePath, projectCredentialStatus, readProjectCredential, storeProjectCredential } from '../src/credentialStore.js';
 import { runProxy } from '../src/proxy.js';
 import { Readable } from 'node:stream';
@@ -112,6 +114,19 @@ function ttyInput(chunks, initialRawMode = false) {
   stdin.pause = () => {};
   return stdin;
 }
+
+test('release package references stay synchronized with package.json', () => {
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(INSTALLER_PACKAGE_SPEC, `@spala-ai/mcp-install@${packageJson.version}`);
+  assert.match(
+    fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8'),
+    new RegExp(`@spala-ai/mcp-install@${packageJson.version.replaceAll('.', '\\.')}`),
+  );
+  assert.match(
+    CODEX_SPALA_SKILL,
+    new RegExp(`@spala-ai/mcp-install@${packageJson.version.replaceAll('.', '\\.')}`),
+  );
+});
 
 test('normalizes missing scope without replacing an existing scope', () => {
   assert.equal(
@@ -4311,6 +4326,68 @@ test('exact-url project bind accepts a scoped bootstrap response for a bare requ
   assert.equal(stored.mcpUrl, 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
 });
 
+test('repeated exact-url Claude Code binds adopt and reuse the canonical scoped endpoint', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const bootstrapUrl = 'https://activity-stream.spala.ai/mcp/agent-instructions/one-time-id/consume';
+  const canonicalMcpUrl = 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
+  let calls = 0;
+  const bind = async () => {
+    let output = '';
+    await runCli([
+      'project', 'bind',
+      '--project-id', 'project-777',
+      '--project-url', 'https://activity-stream.spala.ai/',
+      '--url', 'https://activity-stream.spala.ai/mcp',
+      '--exact-url',
+      '--bootstrap-stdin',
+      '--client', 'claude-code',
+      '--yes',
+      '--json',
+    ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+      stdout: { write: chunk => { output += chunk; } },
+      stderr: { write: () => {} },
+      stdin: Readable.from([`${bootstrapUrl}\n`]),
+    }, {
+      fetch: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({
+          access_token: `mcp_scoped_response_secret_${calls}`,
+          token_type: 'Bearer',
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          mcp_url: canonicalMcpUrl,
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    return JSON.parse(output);
+  };
+
+  const first = await bind();
+  const second = await bind();
+
+  assert.equal(calls, 2);
+  for (const payload of [first, second]) {
+    assert.equal(payload.ok, true);
+    assert.equal(payload.outcome, 'bound');
+    assert.equal(payload.binding.mcpUrl, canonicalMcpUrl);
+  }
+  assert.deepEqual(readProjectBinding(workspace).binding, second.binding);
+  const stored = readProjectCredential('project-777', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  assert.equal(stored.mcpUrl, canonicalMcpUrl);
+  assert.equal(stored.bearerToken, 'mcp_scoped_response_secret_2');
+
+  const claudeConfig = JSON.parse(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'));
+  assert.deepEqual(claudeConfig.mcpServers[second.binding.serverName], {
+    type: 'stdio',
+    command: 'npx',
+    args: ['--yes', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-777'],
+  });
+});
+
 test('bootstrap endpoint identity ignores scope but rejects other origins and paths', () => {
   assert.equal(mcpEndpointsMatch(
     'https://activity.spala.test/mcp',
@@ -4328,6 +4405,460 @@ test('bootstrap endpoint identity ignores scope but rejects other origins and pa
     'https://activity.spala.test/mcp',
     'https://activity.spala.test/other?scope=builder%2Cproject%2Cdata',
   ), false);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp?tenant=other',
+    'https://activity.spala.test/mcp?scope=builder%2Cproject%2Cdata',
+  ), false);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp?tenant=one',
+    'https://activity.spala.test/mcp?tenant=one',
+  ), false);
+});
+
+test('bootstrap consumption preserves requested scopes and rejects widening, narrowing, unknown, and duplicate scopes', async () => {
+  const projectUrl = 'https://scope-check.spala.ai/';
+  const bootstrapUrl = 'https://scope-check.spala.ai/mcp/bootstrap/opaque/consume';
+  const response = mcpUrl => new Response(JSON.stringify({
+    access_token: 'mcp_scope_test_credential',
+    expires_at: new Date(Date.now() + 120_000).toISOString(),
+    mcp_url: mcpUrl,
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const exact = await consumeBootstrap({
+    bootstrapUrl,
+    projectUrl,
+    mcpUrl: 'https://scope-check.spala.ai/mcp?scope=builder%2Cproject',
+    fetchImpl: async () => response('https://scope-check.spala.ai/mcp?scope=project%2Cbuilder'),
+  });
+  assert.equal(exact.mcpUrl, 'https://scope-check.spala.ai/mcp?scope=project%2Cbuilder');
+
+  for (const [requested, returned] of [
+    ['builder', 'builder,project'],
+    ['builder,project', 'builder'],
+  ]) {
+    await assert.rejects(consumeBootstrap({
+      bootstrapUrl,
+      projectUrl,
+      mcpUrl: `https://scope-check.spala.ai/mcp?scope=${encodeURIComponent(requested)}`,
+      fetchImpl: async () => response(`https://scope-check.spala.ai/mcp?scope=${encodeURIComponent(returned)}`),
+    }), /changed the requested MCP authorization scope/);
+  }
+
+  for (const requested of ['builder,telemetry', 'builder,builder']) {
+    await assert.rejects(consumeBootstrap({
+      bootstrapUrl,
+      projectUrl,
+      mcpUrl: `https://scope-check.spala.ai/mcp?scope=${encodeURIComponent(requested)}`,
+      fetchImpl: async () => {
+        assert.fail('invalid requested scopes must fail before bootstrap consumption');
+      },
+    }), /unknown project MCP scope|duplicate project MCP scopes/);
+  }
+
+  await assert.rejects(consumeBootstrap({
+    bootstrapUrl,
+    projectUrl,
+    mcpUrl: 'https://scope-check.spala.ai/mcp?scope=builder&scope=project',
+    fetchImpl: async () => {
+      assert.fail('duplicate requested scope parameters must fail before bootstrap consumption');
+    },
+  }), /duplicate project MCP scope parameters/);
+
+  for (const returned of ['builder,telemetry', 'builder,builder']) {
+    await assert.rejects(consumeBootstrap({
+      bootstrapUrl,
+      projectUrl,
+      mcpUrl: 'https://scope-check.spala.ai/mcp?scope=builder',
+      fetchImpl: async () => response(`https://scope-check.spala.ai/mcp?scope=${encodeURIComponent(returned)}`),
+    }), /unknown project MCP scope|duplicate project MCP scopes/);
+  }
+
+  await assert.rejects(consumeBootstrap({
+    bootstrapUrl,
+    projectUrl,
+    mcpUrl: 'https://scope-check.spala.ai/mcp?scope=builder%2Cproject',
+    fetchImpl: async () => response('https://scope-check.spala.ai/mcp?scope=builder&scope=project'),
+  }), /duplicate project MCP scope parameters/);
+});
+
+test('bare bootstrap requests adopt only the canonical default project scope', async () => {
+  const projectUrl = 'https://bare-scope.spala.ai/';
+  const bootstrapUrl = 'https://bare-scope.spala.ai/mcp/bootstrap/opaque/consume';
+  const response = mcpUrl => new Response(JSON.stringify({
+    access_token: 'mcp_bare_scope_test_credential',
+    expires_at: new Date(Date.now() + 120_000).toISOString(),
+    mcp_url: mcpUrl,
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const canonical = await consumeBootstrap({
+    bootstrapUrl,
+    projectUrl,
+    mcpUrl: 'https://bare-scope.spala.ai/mcp',
+    fetchImpl: async () => response('https://bare-scope.spala.ai/mcp?scope=data%2Cbuilder%2Cproject'),
+  });
+  assert.equal(canonical.mcpUrl, 'https://bare-scope.spala.ai/mcp?scope=data%2Cbuilder%2Cproject');
+
+  await assert.rejects(consumeBootstrap({
+    bootstrapUrl,
+    projectUrl,
+    mcpUrl: 'https://bare-scope.spala.ai/mcp',
+    fetchImpl: async () => response('https://bare-scope.spala.ai/mcp?scope=builder%2Cproject'),
+  }), /only adopt the canonical default project scope/);
+});
+
+test('credential persistence failure rolls back binding and client config without rewinding credentials', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const originalBinding = {
+    schemaVersion: 1,
+    projectId: 'project-rollback',
+    projectUrl: 'https://rollback.spala.ai/',
+    mcpUrl: 'https://rollback.spala.ai/mcp',
+    serverName: serverNameFromUrl('https://rollback.spala.ai/mcp'),
+  };
+  writeProjectBinding(workspace, originalBinding);
+  const originalClaudeConfig = `${JSON.stringify({
+    mcpServers: {
+      unrelated: { command: 'node', args: ['server.js'] },
+    },
+  }, null, 2)}\n`;
+  fs.writeFileSync(path.join(workspace, '.mcp.json'), originalClaudeConfig);
+  storeProjectCredential({
+    projectId: originalBinding.projectId,
+    mcpUrl: originalBinding.mcpUrl,
+    bearerToken: 'mcp_original_credential',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+
+  let persistenceAttempts = 0;
+  await assert.rejects(runCli([
+    'project', 'bind',
+    '--project-id', originalBinding.projectId,
+    '--project-url', originalBinding.projectUrl,
+    '--url', originalBinding.mcpUrl,
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://rollback.spala.ai/mcp/bootstrap/opaque/consume\n']),
+  }, {
+    fetch: async () => new Response(JSON.stringify({
+      access_token: 'mcp_replacement_credential',
+      expires_at: new Date(Date.now() + 120_000).toISOString(),
+      mcp_url: 'https://rollback.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    storeProjectCredential: (input, credentialEnv, workspaceRoot) => {
+      persistenceAttempts += 1;
+      assert.equal(input.mcpUrl, 'https://rollback.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+      storeProjectCredential(input, credentialEnv, workspaceRoot);
+      throw new Error('simulated credential persistence failure');
+    },
+  }), /simulated credential persistence failure/);
+
+  assert.equal(persistenceAttempts, 1);
+  assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+  assert.equal(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'), originalClaudeConfig);
+  const stored = readProjectCredential(originalBinding.projectId, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  assert.equal(stored.mcpUrl, 'https://rollback.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+  assert.equal(stored.bearerToken, 'mcp_replacement_credential');
+});
+
+test('credential temporary chmod failure precedes rename and rolls back binding and client config', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const originalBinding = {
+    schemaVersion: 1,
+    projectId: 'project-chmod-failure',
+    projectUrl: 'https://chmod-failure.spala.ai/',
+    mcpUrl: 'https://chmod-failure.spala.ai/mcp',
+    serverName: serverNameFromUrl('https://chmod-failure.spala.ai/mcp'),
+  };
+  writeProjectBinding(workspace, originalBinding);
+  const originalClaudeConfig = `${JSON.stringify({
+    mcpServers: {
+      unrelated: { command: 'node', args: ['server.js'] },
+    },
+  }, null, 2)}\n`;
+  fs.writeFileSync(path.join(workspace, '.mcp.json'), originalClaudeConfig);
+  storeProjectCredential({
+    projectId: originalBinding.projectId,
+    mcpUrl: originalBinding.mcpUrl,
+    bearerToken: 'mcp_original_chmod_credential',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, credentialEnv);
+  const storePath = credentialStorePath(credentialEnv);
+  const originalStore = fs.readFileSync(storePath, 'utf8');
+
+  const chmodSync = fs.chmodSync;
+  let failedTemporary;
+  fs.chmodSync = (filePath, mode) => {
+    if (path.basename(String(filePath)).startsWith('.mcp-credentials.tmp-')) {
+      failedTemporary = filePath;
+      throw new Error('simulated credential temporary chmod failure');
+    }
+    return chmodSync(filePath, mode);
+  };
+  try {
+    await assert.rejects(runCli([
+      'project', 'bind',
+      '--project-id', originalBinding.projectId,
+      '--project-url', originalBinding.projectUrl,
+      '--url', originalBinding.mcpUrl,
+      '--exact-url',
+      '--bootstrap-stdin',
+      '--client', 'claude-code',
+      '--yes',
+      '--json',
+    ], credentialEnv, workspace, {
+      stdout: { write: () => {} },
+      stderr: { write: () => {} },
+      stdin: Readable.from(['https://chmod-failure.spala.ai/mcp/bootstrap/opaque/consume\n']),
+    }, {
+      fetch: async () => new Response(JSON.stringify({
+        access_token: 'mcp_replacement_chmod_credential',
+        expires_at: new Date(Date.now() + 120_000).toISOString(),
+        mcp_url: 'https://chmod-failure.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    }), /simulated credential temporary chmod failure/);
+  } finally {
+    fs.chmodSync = chmodSync;
+  }
+
+  assert.ok(failedTemporary);
+  assert.equal(fs.existsSync(failedTemporary), false);
+  assert.equal(fs.readFileSync(storePath, 'utf8'), originalStore);
+  assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+  assert.equal(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'), originalClaudeConfig);
+  assert.equal(
+    readProjectCredential(originalBinding.projectId, credentialEnv).bearerToken,
+    'mcp_original_chmod_credential',
+  );
+});
+
+test('failed bootstrap replay cannot overwrite a successful later credential', async () => {
+  const credentialHome = tempHome();
+  const firstWorkspace = tempHome();
+  const secondWorkspace = tempHome();
+  fs.mkdirSync(path.join(firstWorkspace, '.git'));
+  fs.mkdirSync(path.join(secondWorkspace, '.git'));
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'project-concurrent-renewal';
+  const projectUrl = 'https://concurrent-renewal.spala.ai/';
+  const mcpUrl = 'https://concurrent-renewal.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
+  const bootstrapUrl = 'https://concurrent-renewal.spala.ai/mcp/bootstrap/shared-capability/consume';
+  storeProjectCredential({
+    projectId,
+    mcpUrl,
+    bearerToken: 'mcp_old_credential',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, credentialEnv);
+
+  const args = [
+    'project', 'bind',
+    '--project-id', projectId,
+    '--project-url', projectUrl,
+    '--url', mcpUrl,
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ];
+  let releaseFailedReplay;
+  let firstFetchStarted;
+  const firstStarted = new Promise(resolve => { firstFetchStarted = resolve; });
+  const failedReplayResponse = new Promise(resolve => { releaseFailedReplay = resolve; });
+  const first = runCli(args, credentialEnv, firstWorkspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from([`${bootstrapUrl}\n`]),
+  }, {
+    fetch: async () => {
+      firstFetchStarted();
+      return failedReplayResponse;
+    },
+  });
+
+  await firstStarted;
+  await runCli(args, credentialEnv, secondWorkspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from([`${bootstrapUrl}\n`]),
+  }, {
+    fetch: async () => new Response(JSON.stringify({
+      access_token: 'mcp_successful_renewal',
+      expires_at: new Date(Date.now() + 120_000).toISOString(),
+      mcp_url: mcpUrl,
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  });
+
+  releaseFailedReplay(new Response('', { status: 410 }));
+  await assert.rejects(first, /HTTP 410/);
+  assert.equal(readProjectCredential(projectId, credentialEnv).bearerToken, 'mcp_successful_renewal');
+});
+
+test('explicit exact builder scope replaces an old bare binding only with switch', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const projectId = 'project-explicit-builder';
+  const projectUrl = 'https://explicit-builder.spala.ai/';
+  const bareMcpUrl = 'https://explicit-builder.spala.ai/mcp';
+  const builderMcpUrl = `${bareMcpUrl}?scope=builder`;
+  writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId,
+    projectUrl,
+    mcpUrl: bareMcpUrl,
+    serverName: serverNameFromUrl(bareMcpUrl),
+  });
+
+  const bindArgs = [
+    'project', 'bind',
+    '--project-id', projectId,
+    '--project-url', projectUrl,
+    '--url', builderMcpUrl,
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ];
+  let calls = 0;
+  const runtime = {
+    fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        access_token: 'mcp_builder_only_credential',
+        expires_at: new Date(Date.now() + 120_000).toISOString(),
+        mcp_url: builderMcpUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  };
+
+  await assert.rejects(runCli(bindArgs, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from([`${projectUrl}mcp/bootstrap/opaque/consume\n`]),
+  }, runtime), /already bound.*--switch/);
+  assert.equal(calls, 0);
+
+  await runCli([...bindArgs, '--switch'], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from([`${projectUrl}mcp/bootstrap/opaque/consume\n`]),
+  }, runtime);
+
+  assert.equal(calls, 1);
+  assert.equal(readProjectBinding(workspace).binding.mcpUrl, builderMcpUrl);
+  assert.equal(readProjectCredential(projectId, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }).mcpUrl, builderMcpUrl);
+});
+
+test('ordinary exact-url bind reuses an old canonical scoped binding for a new bare request', async () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const canonicalBinding = {
+    schemaVersion: 1,
+    projectId: 'project-ordinary-rebind',
+    projectUrl: 'https://ordinary-rebind.spala.ai/',
+    mcpUrl: 'https://ordinary-rebind.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    serverName: serverNameFromUrl('https://ordinary-rebind.spala.ai/mcp'),
+  };
+  writeProjectBinding(workspace, canonicalBinding);
+
+  let output = '';
+  await runCli([
+    'project', 'bind',
+    '--project-id', canonicalBinding.projectId,
+    '--project-url', canonicalBinding.projectUrl,
+    '--url', 'https://ordinary-rebind.spala.ai/mcp',
+    '--exact-url',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], {}, workspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+  });
+
+  assert.deepEqual(JSON.parse(output).binding, canonicalBinding);
+  assert.deepEqual(readProjectBinding(workspace).binding, canonicalBinding);
+  const claudeConfig = JSON.parse(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'));
+  assert.equal(claudeConfig.mcpServers[canonicalBinding.serverName].url, canonicalBinding.mcpUrl);
+});
+
+test('binding reuse rejects noncanonical bare upgrades and accepts equivalent explicit scope sets', async () => {
+  const noncanonicalWorkspace = tempHome();
+  fs.mkdirSync(path.join(noncanonicalWorkspace, '.git'));
+  const noncanonicalBinding = {
+    schemaVersion: 1,
+    projectId: 'project-noncanonical-rebind',
+    projectUrl: 'https://noncanonical-rebind.spala.ai/',
+    mcpUrl: 'https://noncanonical-rebind.spala.ai/mcp?scope=builder',
+    serverName: serverNameFromUrl('https://noncanonical-rebind.spala.ai/mcp'),
+  };
+  writeProjectBinding(noncanonicalWorkspace, noncanonicalBinding);
+
+  await assert.rejects(runCli([
+    'project', 'bind',
+    '--project-id', noncanonicalBinding.projectId,
+    '--project-url', noncanonicalBinding.projectUrl,
+    '--url', 'https://noncanonical-rebind.spala.ai/mcp',
+    '--exact-url',
+    '--client', 'claude-code',
+    '--yes',
+  ], {}, noncanonicalWorkspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  }), /already bound.*--switch/);
+
+  const equivalentWorkspace = tempHome();
+  fs.mkdirSync(path.join(equivalentWorkspace, '.git'));
+  const equivalentBinding = {
+    schemaVersion: 1,
+    projectId: 'project-equivalent-rebind',
+    projectUrl: 'https://equivalent-rebind.spala.ai/',
+    mcpUrl: 'https://equivalent-rebind.spala.ai/mcp?scope=project%2Cbuilder',
+    serverName: serverNameFromUrl('https://equivalent-rebind.spala.ai/mcp'),
+  };
+  writeProjectBinding(equivalentWorkspace, equivalentBinding);
+  let output = '';
+  await runCli([
+    'project', 'bind',
+    '--project-id', equivalentBinding.projectId,
+    '--project-url', equivalentBinding.projectUrl,
+    '--url', 'https://equivalent-rebind.spala.ai/mcp?scope=builder%2Cproject',
+    '--exact-url',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], {}, equivalentWorkspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+  });
+  assert.deepEqual(JSON.parse(output).binding, equivalentBinding);
+
+  const duplicateWorkspace = tempHome();
+  fs.mkdirSync(path.join(duplicateWorkspace, '.git'));
+  await assert.rejects(runCli([
+    'project', 'bind',
+    '--project-id', 'project-duplicate-scope',
+    '--project-url', 'https://duplicate-scope.spala.ai/',
+    '--url', 'https://duplicate-scope.spala.ai/mcp?scope=builder&scope=project',
+    '--exact-url',
+    '--client', 'claude-code',
+    '--yes',
+  ], {}, duplicateWorkspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  }), /duplicate project MCP scope parameters/);
 });
 
 test('agentic project bind reads a bootstrap URL from a TTY without echoing it and restores raw mode', async () => {
@@ -4521,6 +5052,47 @@ test('agentic bind rejects credential storage inside the workspace before consum
   assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
 });
 
+test('agentic bind preflight rejects invalid flat credential stores before bootstrap consumption', async () => {
+  for (const fixture of [
+    { body: '{invalid-json\n', pattern: /invalid JSON/ },
+    { body: '{"schemaVersion":2,"projects":{}}\n', pattern: /unsupported format/ },
+  ]) {
+    const workspace = tempHome();
+    const credentialHome = tempHome();
+    const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+    const storePath = credentialStorePath(credentialEnv);
+    fs.mkdirSync(path.join(workspace, '.git'));
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, fixture.body, { mode: 0o600 });
+    let calls = 0;
+
+    await assert.rejects(runCli([
+      'project', 'bind',
+      '--project-id', 'project-invalid-preflight',
+      '--project-url', 'https://invalid-preflight.spala.ai/',
+      '--url', 'https://invalid-preflight.spala.ai/mcp',
+      '--exact-url',
+      '--bootstrap-stdin',
+      '--client', 'claude-code',
+      '--yes',
+    ], credentialEnv, workspace, {
+      stdout: { write: () => {} },
+      stderr: { write: () => {} },
+      stdin: Readable.from(['https://invalid-preflight.spala.ai/mcp/bootstrap/opaque/consume\n']),
+    }, {
+      fetch: async () => {
+        calls += 1;
+        throw new Error('must not consume');
+      },
+    }), fixture.pattern);
+
+    assert.equal(calls, 0);
+    assert.equal(fs.readFileSync(storePath, 'utf8'), fixture.body);
+    assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
+    assert.equal(fs.existsSync(path.join(workspace, '.mcp.json')), false);
+  }
+});
+
 test('expired stored credentials are reported as unavailable', () => {
   const credentialHome = tempHome();
   const filePath = credentialStorePath({ SPALA_MCP_CREDENTIAL_HOME: credentialHome });
@@ -4540,6 +5112,40 @@ test('expired stored credentials are reported as unavailable', () => {
   assert.equal(status.configured, false);
   assert.equal(status.status, 'expired');
   assert.match(status.expiresAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('credential reads and writes preserve the 0.1.15 flat store format', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const filePath = credentialStorePath(credentialEnv);
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  const legacyCredential = {
+    mcpUrl: 'https://flat-store.spala.ai/mcp?scope=builder',
+    bearerToken: 'mcp_flat_store_credential',
+    expiresAt,
+    status: 'active',
+  };
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify({
+    schemaVersion: 1,
+    projects: {
+      'flat-store-project': legacyCredential,
+    },
+  }, null, 2)}\n`, { mode: 0o600 });
+
+  assert.equal(readProjectCredential('flat-store-project', credentialEnv).bearerToken, legacyCredential.bearerToken);
+  storeProjectCredential({
+    projectId: 'new-flat-store-project',
+    mcpUrl: 'https://new-flat-store.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    bearerToken: 'mcp_new_flat_store_credential',
+    expiresAt,
+  }, credentialEnv);
+
+  const persisted = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  assert.deepEqual(Object.keys(persisted).sort(), ['projects', 'schemaVersion']);
+  assert.deepEqual(Object.keys(persisted.projects).sort(), ['flat-store-project', 'new-flat-store-project']);
+  assert.deepEqual(persisted.projects['flat-store-project'], legacyCredential);
+  assert.equal(persisted.projects['new-flat-store-project'].bearerToken, 'mcp_new_flat_store_credential');
 });
 
 test('proxy reads its user credential and forwards bearer auth without printing it', async () => {

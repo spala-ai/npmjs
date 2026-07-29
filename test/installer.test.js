@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { runBoundedCommand, runCli } from '../src/cli.js';
 import {
@@ -25,7 +25,14 @@ import {
 } from '../src/installer.js';
 import { CODEX_SPALA_SKILL } from '../src/codexSkill.js';
 import { consumeBootstrap } from '../src/bootstrap.js';
-import { credentialStorePath, projectCredentialStatus, readProjectCredential, storeProjectCredential } from '../src/credentialStore.js';
+import {
+  credentialStorePath,
+  preflightCredentialStore,
+  projectCredentialStatus,
+  readProjectCredential,
+  removeProjectCredential,
+  storeProjectCredential,
+} from '../src/credentialStore.js';
 import { runProxy } from '../src/proxy.js';
 import { Readable } from 'node:stream';
 import {
@@ -36,6 +43,92 @@ import {
 
 function tempHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spala-mcp-install-'));
+}
+
+function credentialStoreWorker(options, { expectedExitCode = 0 } = {}) {
+  const child = spawn(process.execPath, [
+    path.resolve('fixtures/credential-store-worker.js'),
+    JSON.stringify(options),
+  ], {
+    cwd: path.resolve('.'),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  let readySettled = false;
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    stdout += chunk;
+    if (!readySettled && stdout.includes('ready\n')) {
+      readySettled = true;
+      resolveReady();
+    }
+  });
+  child.stderr.on('data', chunk => {
+    stderr += chunk;
+  });
+  const completion = new Promise((resolve, reject) => {
+    child.once('error', error => {
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(error);
+      }
+      reject(error);
+    });
+    child.once('close', code => {
+      if (code !== expectedExitCode) {
+        const error = new Error(`Credential worker exited with code ${String(code)}: ${stderr}`);
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(error);
+        }
+        reject(error);
+        return;
+      }
+      if (expectedExitCode !== 0) {
+        resolve({ code, stdout, stderr });
+        return;
+      }
+      if (!readySettled) {
+        const error = new Error('Credential worker exited before reporting readiness.');
+        readySettled = true;
+        rejectReady(error);
+        reject(error);
+        return;
+      }
+      resolve(JSON.parse(stdout.trim().split('\n').at(-1)));
+    });
+  });
+  return { child, completion, ready };
+}
+
+async function waitForFile(filePath, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(filePath)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${path.basename(filePath)}.`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+function releaseCredentialWorker(filePath) {
+  fs.writeFileSync(filePath, 'continue\n', { flag: 'wx', mode: 0o600 });
+}
+
+function credentialJournalPath(credentialHome) {
+  return `${credentialStorePath({ SPALA_MCP_CREDENTIAL_HOME: credentialHome })}.journal`;
+}
+
+function credentialJournalVersions(credentialHome) {
+  return fs.readdirSync(credentialJournalPath(credentialHome))
+    .filter(name => /^\d+$/.test(name))
+    .sort((left, right) => Number(left) - Number(right));
 }
 
 function trustedChildCwd() {
@@ -4287,8 +4380,12 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   assert.match(codexBody, /"proxy","--project-id","project-123"/);
 
   const storePath = credentialStorePath({ SPALA_MCP_CREDENTIAL_HOME: credentialHome });
-  assert.equal((fs.statSync(storePath).mode & 0o777), 0o600);
+  const journalPath = credentialJournalPath(credentialHome);
+  assert.equal(fs.existsSync(storePath), false);
   assert.equal((fs.statSync(path.dirname(storePath)).mode & 0o777), 0o700);
+  assert.equal((fs.statSync(journalPath).mode & 0o777), 0o700);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1']);
+  assert.equal((fs.statSync(path.join(journalPath, '1')).mode & 0o777), 0o600);
   const stored = readProjectCredential('project-123', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.bearerToken, bearerToken);
   assert.equal(stored.mcpUrl, 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata');
@@ -4449,7 +4546,7 @@ test('bare bootstrap requests only adopt the explicit default project scope cont
   }), /only adopt the canonical default project scope/);
 });
 
-test('credential persistence failure after canonicalization rolls back binding, client config, and credential', async () => {
+test('credential persistence failure before commit rolls back binding and client config without changing credentials', async () => {
   const workspace = tempHome();
   const credentialHome = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
@@ -4498,13 +4595,6 @@ test('credential persistence failure after canonicalization rolls back binding, 
     storeProjectCredential: (input, credentialEnv, workspaceRoot) => {
       persistenceAttempts += 1;
       assert.equal(input.mcpUrl, 'https://rollback.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
-      storeProjectCredential(input, credentialEnv, workspaceRoot);
-      storeProjectCredential({
-        projectId: 'unrelated-project',
-        mcpUrl: 'https://unrelated.spala.ai/mcp?scope=builder',
-        bearerToken: 'mcp_unrelated_concurrent_credential',
-        expiresAt: new Date(Date.now() + 120_000).toISOString(),
-      }, credentialEnv, workspaceRoot);
       throw new Error('simulated credential persistence failure');
     },
   }), /simulated credential persistence failure/);
@@ -4515,10 +4605,6 @@ test('credential persistence failure after canonicalization rolls back binding, 
   const stored = readProjectCredential(originalBinding.projectId, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.mcpUrl, originalBinding.mcpUrl);
   assert.equal(stored.bearerToken, 'mcp_original_credential');
-  assert.equal(
-    readProjectCredential('unrelated-project', { SPALA_MCP_CREDENTIAL_HOME: credentialHome }).bearerToken,
-    'mcp_unrelated_concurrent_credential',
-  );
 });
 
 test('failed concurrent bootstrap replay cannot overwrite a successful credential renewal', async () => {
@@ -4581,6 +4667,827 @@ test('failed concurrent bootstrap replay cannot overwrite a successful credentia
   releaseFailedReplay(new Response('', { status: 410 }));
   await assert.rejects(first, /HTTP 410/);
   assert.equal(readProjectCredential(projectId, credentialEnv).bearerToken, 'mcp_successful_renewal');
+});
+
+test('failed replayed bind never restores an older credential over a successful concurrent renewal', async () => {
+  const credentialHome = tempHome();
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'project-replayed-renewal';
+  const projectUrl = 'https://replayed-renewal.spala.ai/';
+  const mcpUrl = 'https://replayed-renewal.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  storeProjectCredential({
+    projectId,
+    mcpUrl,
+    bearerToken: 'mcp_older_credential',
+    expiresAt,
+  }, credentialEnv);
+
+  let releaseReplay;
+  let fetchStarted;
+  const started = new Promise(resolve => { fetchStarted = resolve; });
+  const replayResponse = new Promise(resolve => { releaseReplay = resolve; });
+  const bind = runCli([
+    'project', 'bind',
+    '--project-id', projectId,
+    '--project-url', projectUrl,
+    '--url', mcpUrl,
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], credentialEnv, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://replayed-renewal.spala.ai/mcp/bootstrap/shared-capability/consume\n']),
+  }, {
+    fetch: async () => {
+      fetchStarted();
+      return replayResponse;
+    },
+    storeProjectCredential: (input, env, workspaceRoot) => {
+      storeProjectCredential(input, env, workspaceRoot);
+      throw new Error('simulated failure after replayed credential persistence');
+    },
+  });
+
+  await started;
+  storeProjectCredential({
+    projectId,
+    mcpUrl,
+    bearerToken: 'mcp_successful_concurrent_renewal',
+    expiresAt,
+  }, credentialEnv);
+  releaseReplay(new Response(JSON.stringify({
+    access_token: 'mcp_successful_concurrent_renewal',
+    expires_at: expiresAt,
+    mcp_url: mcpUrl,
+  }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+  await assert.rejects(bind, /simulated failure after replayed credential persistence/);
+  assert.equal(
+    readProjectCredential(projectId, credentialEnv).bearerToken,
+    'mcp_successful_concurrent_renewal',
+  );
+});
+
+test('credential journal loser retries and merges concurrent different-project process updates', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const firstMarker = path.join(coordination, 'first-ready');
+  const firstRelease = path.join(coordination, 'first-release');
+  const secondMarker = path.join(coordination, 'second-ready');
+  const secondRelease = path.join(coordination, 'second-release');
+  const first = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'concurrent-project-a',
+    bearerToken: 'mcp_concurrent_a',
+    hook: 'pause-before-first-claim',
+    markerPath: firstMarker,
+    releasePath: firstRelease,
+  });
+  const second = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'concurrent-project-b',
+    bearerToken: 'mcp_concurrent_b',
+    hook: 'pause-before-first-claim',
+    markerPath: secondMarker,
+    releasePath: secondRelease,
+  });
+
+  await Promise.all([waitForFile(firstMarker), waitForFile(secondMarker)]);
+  releaseCredentialWorker(firstRelease);
+  await first.completion;
+  releaseCredentialWorker(secondRelease);
+  await second.completion;
+
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  assert.equal(readProjectCredential('concurrent-project-a', credentialEnv).bearerToken, 'mcp_concurrent_a');
+  assert.equal(readProjectCredential('concurrent-project-b', credentialEnv).bearerToken, 'mcp_concurrent_b');
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+});
+
+test('credential journal serializes concurrent same-project process updates by claim order', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const firstMarker = path.join(coordination, 'first-ready');
+  const firstRelease = path.join(coordination, 'first-release');
+  const secondMarker = path.join(coordination, 'second-ready');
+  const secondRelease = path.join(coordination, 'second-release');
+  const first = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'same-project',
+    bearerToken: 'mcp_same_project_first',
+    hook: 'pause-before-first-claim',
+    markerPath: firstMarker,
+    releasePath: firstRelease,
+  });
+  const second = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'same-project',
+    bearerToken: 'mcp_same_project_second',
+    hook: 'pause-before-first-claim',
+    markerPath: secondMarker,
+    releasePath: secondRelease,
+  });
+
+  await Promise.all([waitForFile(firstMarker), waitForFile(secondMarker)]);
+  releaseCredentialWorker(firstRelease);
+  await first.completion;
+  releaseCredentialWorker(secondRelease);
+  await second.completion;
+
+  assert.equal(
+    readProjectCredential('same-project', { SPALA_MCP_CREDENTIAL_HOME: credentialHome }).bearerToken,
+    'mcp_same_project_second',
+  );
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+});
+
+test('credential journal permanent claims prevent ABA across interleaved writers and removers', async () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  storeProjectCredential({
+    projectId: 'aba-baseline-project',
+    mcpUrl: 'https://aba-baseline-project.spala.test/mcp',
+    bearerToken: 'mcp_aba_baseline',
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+  }, credentialEnv);
+
+  const coordination = tempHome();
+  const markerPath = path.join(coordination, 'stale-writer-ready');
+  const releasePath = path.join(coordination, 'stale-writer-release');
+  const staleWriter = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'aba-stale-writer-project',
+    bearerToken: 'mcp_aba_stale_writer',
+    hook: 'pause-before-first-claim',
+    markerPath,
+    releasePath,
+  });
+  await waitForFile(markerPath);
+
+  await credentialStoreWorker({
+    credentialHome,
+    operation: 'remove',
+    projectId: 'aba-baseline-project',
+  }).completion;
+  await credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'aba-transient-project',
+    bearerToken: 'mcp_aba_transient',
+  }).completion;
+  await credentialStoreWorker({
+    credentialHome,
+    operation: 'remove',
+    projectId: 'aba-transient-project',
+  }).completion;
+
+  releaseCredentialWorker(releasePath);
+  await staleWriter.completion;
+
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2', '3', '4', '5']);
+  assert.equal(projectCredentialStatus('aba-baseline-project', credentialEnv).status, 'missing');
+  assert.equal(projectCredentialStatus('aba-transient-project', credentialEnv).status, 'missing');
+  assert.equal(
+    readProjectCredential('aba-stale-writer-project', credentialEnv).bearerToken,
+    'mcp_aba_stale_writer',
+  );
+  const journalPath = credentialJournalPath(credentialHome);
+  for (const version of ['1', '2', '3', '4']) {
+    assert.equal(fs.readFileSync(path.join(journalPath, version), 'utf8'), '{"retired":true}\n');
+  }
+});
+
+test('credential removal retires every lower claim without leaving bearer material in numeric files', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const journalPath = credentialJournalPath(credentialHome);
+  const firstBearer = 'mcp_removed_bearer_first';
+  const secondBearer = 'mcp_removed_bearer_second';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+
+  storeProjectCredential({
+    projectId: 'scrubbed-project',
+    mcpUrl: 'https://scrubbed-project.spala.test/mcp',
+    bearerToken: firstBearer,
+    expiresAt,
+  }, credentialEnv);
+  storeProjectCredential({
+    projectId: 'scrubbed-project',
+    mcpUrl: 'https://scrubbed-project.spala.test/mcp',
+    bearerToken: secondBearer,
+    expiresAt,
+  }, credentialEnv);
+  removeProjectCredential('scrubbed-project', credentialEnv);
+
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2', '3']);
+  for (const version of ['1', '2', '3']) {
+    const versionPath = path.join(journalPath, version);
+    const body = fs.readFileSync(versionPath, 'utf8');
+    assert.doesNotMatch(body, new RegExp(`${firstBearer}|${secondBearer}`));
+    assert.equal(fs.statSync(versionPath).mode & 0o777, 0o600);
+  }
+  assert.equal(fs.readFileSync(path.join(journalPath, '1'), 'utf8'), '{"retired":true}\n');
+  assert.equal(fs.readFileSync(path.join(journalPath, '2'), 'utf8'), '{"retired":true}\n');
+  assert.equal(projectCredentialStatus('scrubbed-project', credentialEnv).status, 'missing');
+});
+
+test('credential reader retries when its selected old head is retired by a concurrent writer', async () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  storeProjectCredential({
+    projectId: 'retired-reader-project',
+    mcpUrl: 'https://retired-reader-project.spala.test/mcp',
+    bearerToken: 'mcp_reader_before_retirement',
+    expiresAt,
+  }, credentialEnv);
+
+  const coordination = tempHome();
+  const markerPath = path.join(coordination, 'reader-selected-old-head');
+  const releasePath = path.join(coordination, 'reader-release');
+  const reader = credentialStoreWorker({
+    credentialHome,
+    operation: 'read',
+    projectId: 'retired-reader-project',
+    hook: 'pause-after-version-scan',
+    markerPath,
+    releasePath,
+  });
+  await waitForFile(markerPath);
+
+  storeProjectCredential({
+    projectId: 'retired-reader-project',
+    mcpUrl: 'https://retired-reader-project.spala.test/mcp',
+    bearerToken: 'mcp_reader_after_retirement',
+    expiresAt,
+  }, credentialEnv);
+  assert.equal(
+    fs.readFileSync(path.join(credentialJournalPath(credentialHome), '1'), 'utf8'),
+    '{"retired":true}\n',
+  );
+
+  releaseCredentialWorker(releasePath);
+  const result = await reader.completion;
+  assert.equal(result.bearerToken, 'mcp_reader_after_retirement');
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+});
+
+test('credential reader fails closed when the current journal head is corrupt or retired', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  storeProjectCredential({
+    projectId: 'corrupt-head-project',
+    mcpUrl: 'https://corrupt-head-project.spala.test/mcp',
+    bearerToken: 'mcp_corrupt_head',
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+  }, credentialEnv);
+
+  const headPath = path.join(credentialJournalPath(credentialHome), '1');
+  fs.writeFileSync(headPath, '{"retired":true}\n');
+  assert.throws(
+    () => readProjectCredential('corrupt-head-project', credentialEnv),
+    /current version is unexpectedly retired/,
+  );
+
+  fs.writeFileSync(headPath, '{invalid json\n');
+  assert.throws(
+    () => readProjectCredential('corrupt-head-project', credentialEnv),
+    /credential store is invalid JSON/,
+  );
+});
+
+test('credential journal fsyncs its parent, mode 0600 data, and claimed directory entry in order', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  const journalPath = credentialJournalPath(credentialHome);
+  const originalFchmodSync = fs.fchmodSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const originalLinkSync = fs.linkSync;
+  const originalRenameSync = fs.renameSync;
+  let permissionsSet = false;
+  let fileSynced = false;
+  let committed = false;
+  let parentSyncedBeforeClaim = false;
+  let journalSyncedAfterClaim = false;
+
+  fs.fchmodSync = (fd, mode) => {
+    assert.equal(committed, false);
+    assert.equal(mode, 0o600);
+    permissionsSet = true;
+    return originalFchmodSync(fd, mode);
+  };
+  fs.fsyncSync = fd => {
+    const stat = fs.fstatSync(fd);
+    const result = originalFsyncSync(fd);
+    if (stat.isDirectory()) {
+      if (committed) journalSyncedAfterClaim = true;
+      else parentSyncedBeforeClaim = true;
+    } else {
+      assert.equal(committed, false);
+      fileSynced = true;
+    }
+    return result;
+  };
+  fs.linkSync = (source, destination) => {
+    assert.equal(permissionsSet, true);
+    assert.equal(fileSynced, true);
+    assert.equal(parentSyncedBeforeClaim, true);
+    assert.equal(path.dirname(source), journalPath);
+    assert.equal(destination, path.join(journalPath, '1'));
+    const result = originalLinkSync(source, destination);
+    committed = true;
+    return result;
+  };
+  fs.renameSync = () => {
+    throw new Error('credential journal must never commit with rename');
+  };
+
+  try {
+    storeProjectCredential({
+      projectId: 'atomic-commit-project',
+      mcpUrl: 'https://atomic-commit-project.spala.test/mcp',
+      bearerToken: 'mcp_atomic_commit',
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    }, credentialEnv);
+  } finally {
+    fs.fchmodSync = originalFchmodSync;
+    fs.fsyncSync = originalFsyncSync;
+    fs.linkSync = originalLinkSync;
+    fs.renameSync = originalRenameSync;
+  }
+
+  assert.equal(committed, true);
+  assert.equal(journalSyncedAfterClaim, true);
+  assert.equal(fs.existsSync(storePath), false);
+  assert.equal(fs.statSync(journalPath).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(journalPath, '1')).mode & 0o777, 0o600);
+});
+
+test('credential journal ignores a crashed process temp and never deletes another writer temp', async () => {
+  const credentialHome = tempHome();
+  const crashed = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'crashed-project',
+    bearerToken: 'mcp_crashed_temp',
+    hook: 'crash-before-first-claim',
+  }, { expectedExitCode: 86 });
+
+  await crashed.completion;
+  const journalPath = credentialJournalPath(credentialHome);
+  const crashedTemps = fs.readdirSync(journalPath).filter(name => name.startsWith('.tmp-'));
+  assert.equal(crashedTemps.length, 1);
+  assert.deepEqual(credentialJournalVersions(credentialHome), []);
+  assert.deepEqual(
+    projectCredentialStatus('crashed-project', { SPALA_MCP_CREDENTIAL_HOME: credentialHome }),
+    { configured: false, status: 'missing', expiresAt: null },
+  );
+
+  const succeeding = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'surviving-project',
+    bearerToken: 'mcp_surviving_project',
+  });
+  await succeeding.completion;
+
+  assert.equal(
+    readProjectCredential('surviving-project', { SPALA_MCP_CREDENTIAL_HOME: credentialHome }).bearerToken,
+    'mcp_surviving_project',
+  );
+  assert.deepEqual(fs.readdirSync(journalPath).filter(name => name.startsWith('.tmp-')), crashedTemps);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1']);
+});
+
+test('credential journal migrates and merges an existing legacy store through a child process', async () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(storePath, `${JSON.stringify({
+    schemaVersion: 1,
+    projects: {
+      'legacy-project': {
+        mcpUrl: 'https://legacy-project.spala.test/mcp',
+        bearerToken: 'mcp_legacy_project',
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+        status: 'active',
+      },
+    },
+  })}\n`, { mode: 0o600 });
+
+  const worker = credentialStoreWorker({
+    credentialHome,
+    operation: 'store',
+    projectId: 'migrated-project',
+    bearerToken: 'mcp_migrated_project',
+  });
+  await worker.completion;
+
+  assert.equal(fs.existsSync(storePath), false);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1']);
+  assert.equal(readProjectCredential('legacy-project', credentialEnv).bearerToken, 'mcp_legacy_project');
+  assert.equal(readProjectCredential('migrated-project', credentialEnv).bearerToken, 'mcp_migrated_project');
+});
+
+test('empty journal fallback retries across concurrent first migration, read, and remove', async () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(storePath, `${JSON.stringify({
+    schemaVersion: 1,
+    projects: {
+      'migration-race-legacy': {
+        mcpUrl: 'https://migration-race-legacy.spala.test/mcp',
+        bearerToken: 'mcp_migration_race_legacy',
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+        status: 'active',
+      },
+    },
+  })}\n`, { mode: 0o600 });
+  preflightCredentialStore(credentialEnv);
+
+  const coordination = tempHome();
+  const readerMarker = path.join(coordination, 'reader-scanned-empty');
+  const readerRelease = path.join(coordination, 'reader-release');
+  const removerMarker = path.join(coordination, 'remover-scanned-empty');
+  const removerRelease = path.join(coordination, 'remover-release');
+  const reader = credentialStoreWorker({
+    credentialHome,
+    operation: 'read',
+    projectId: 'migration-race-legacy',
+    hook: 'pause-after-empty-version-scan',
+    markerPath: readerMarker,
+    releasePath: readerRelease,
+  });
+  const remover = credentialStoreWorker({
+    credentialHome,
+    operation: 'remove',
+    projectId: 'migration-race-legacy',
+    hook: 'pause-after-empty-version-scan',
+    markerPath: removerMarker,
+    releasePath: removerRelease,
+  });
+  await Promise.all([waitForFile(readerMarker), waitForFile(removerMarker)]);
+
+  storeProjectCredential({
+    projectId: 'migration-race-new',
+    mcpUrl: 'https://migration-race-new.spala.test/mcp',
+    bearerToken: 'mcp_migration_race_new',
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+  }, credentialEnv);
+  assert.equal(fs.existsSync(storePath), false);
+
+  releaseCredentialWorker(readerRelease);
+  const readResult = await reader.completion;
+  assert.equal(readResult.bearerToken, 'mcp_migration_race_legacy');
+
+  releaseCredentialWorker(removerRelease);
+  const removeResult = await remover.completion;
+  assert.equal(removeResult.changed, true);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+  assert.equal(projectCredentialStatus('migration-race-legacy', credentialEnv).status, 'missing');
+  assert.equal(
+    readProjectCredential('migration-race-new', credentialEnv).bearerToken,
+    'mcp_migration_race_new',
+  );
+});
+
+test('post-claim journal fsync failure preserves prior versions, legacy state, and temp', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  const journalPath = credentialJournalPath(credentialHome);
+  storeProjectCredential({
+    projectId: 'durability-project',
+    mcpUrl: 'https://durability-project.spala.test/mcp',
+    bearerToken: 'mcp_before_durability_failure',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, credentialEnv);
+  fs.writeFileSync(storePath, `${JSON.stringify({
+    schemaVersion: 1,
+    projects: {},
+  })}\n`, { mode: 0o600 });
+
+  const originalFsyncSync = fs.fsyncSync;
+  const originalLinkSync = fs.linkSync;
+  const replacementExpiresAt = new Date(Date.now() + 120_000).toISOString();
+  let claimSucceeded = false;
+  let durabilityFailureInjected = false;
+  fs.linkSync = (source, destination) => {
+    const result = originalLinkSync(source, destination);
+    if (destination === path.join(journalPath, '2')) claimSucceeded = true;
+    return result;
+  };
+  fs.fsyncSync = fd => {
+    if (claimSucceeded && fs.fstatSync(fd).isDirectory() && !durabilityFailureInjected) {
+      durabilityFailureInjected = true;
+      const error = new Error('simulated journal fsync failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync(fd);
+  };
+
+  try {
+    assert.throws(() => storeProjectCredential({
+      projectId: 'durability-project',
+      mcpUrl: 'https://durability-project.spala.test/mcp',
+      bearerToken: 'mcp_after_durability_failure',
+      expiresAt: replacementExpiresAt,
+    }, credentialEnv), error => {
+      assert.equal(error.code, 'SPALA_CREDENTIAL_DURABILITY');
+      assert.match(error.message, /no durable journal barrier/);
+      return true;
+    });
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+    fs.linkSync = originalLinkSync;
+  }
+
+  assert.equal(claimSucceeded, true);
+  assert.equal(durabilityFailureInjected, true);
+  assert.equal(fs.existsSync(storePath), true);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+  assert.equal(fs.readdirSync(journalPath).filter(name => name.startsWith('.tmp-')).length, 1);
+  assert.equal(
+    readProjectCredential('durability-project', credentialEnv).bearerToken,
+    'mcp_after_durability_failure',
+  );
+  const retry = storeProjectCredential({
+    projectId: 'durability-project',
+    mcpUrl: 'https://durability-project.spala.test/mcp',
+    bearerToken: 'mcp_after_durability_failure',
+    expiresAt: replacementExpiresAt,
+  }, credentialEnv);
+  assert.equal(retry.changed, false);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+});
+
+test('successful post-claim fsync is not misreported when closing its directory descriptor fails', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const journalPath = credentialJournalPath(credentialHome);
+  const originalCloseSync = fs.closeSync;
+  const originalLinkSync = fs.linkSync;
+  let claimSucceeded = false;
+  let closeFailureInjected = false;
+
+  fs.linkSync = (source, destination) => {
+    const result = originalLinkSync(source, destination);
+    if (destination === path.join(journalPath, '1')) claimSucceeded = true;
+    return result;
+  };
+  fs.closeSync = fd => {
+    if (claimSucceeded && fs.fstatSync(fd).isDirectory() && !closeFailureInjected) {
+      closeFailureInjected = true;
+      originalCloseSync(fd);
+      const error = new Error('simulated close failure after successful journal fsync');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalCloseSync(fd);
+  };
+
+  let result;
+  try {
+    result = storeProjectCredential({
+      projectId: 'durable-close-project',
+      mcpUrl: 'https://durable-close-project.spala.test/mcp',
+      bearerToken: 'mcp_durable_close',
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    }, credentialEnv);
+  } finally {
+    fs.closeSync = originalCloseSync;
+    fs.linkSync = originalLinkSync;
+  }
+
+  assert.equal(result.changed, true);
+  assert.equal(closeFailureInjected, true);
+  assert.equal(
+    readProjectCredential('durable-close-project', credentialEnv).bearerToken,
+    'mcp_durable_close',
+  );
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1']);
+  assert.deepEqual(fs.readdirSync(journalPath).filter(name => name.startsWith('.tmp-')), []);
+});
+
+test('legacy parent fsync failure after a durable claim warns without failing the update', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(storePath, `${JSON.stringify({
+    schemaVersion: 1,
+    projects: {},
+  })}\n`, { mode: 0o600 });
+
+  const originalEmitWarning = process.emitWarning;
+  const originalFsyncSync = fs.fsyncSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let legacyUnlinked = false;
+  let cleanupFailureInjected = false;
+  let warning;
+  fs.unlinkSync = filePath => {
+    const result = originalUnlinkSync(filePath);
+    if (filePath === storePath) legacyUnlinked = true;
+    return result;
+  };
+  fs.fsyncSync = fd => {
+    if (legacyUnlinked && fs.fstatSync(fd).isDirectory() && !cleanupFailureInjected) {
+      cleanupFailureInjected = true;
+      const error = new Error('simulated legacy parent fsync failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync(fd);
+  };
+  process.emitWarning = (message, options) => {
+    warning = { message, options };
+  };
+
+  let result;
+  try {
+    result = storeProjectCredential({
+      projectId: 'legacy-cleanup-project',
+      mcpUrl: 'https://legacy-cleanup-project.spala.test/mcp',
+      bearerToken: 'mcp_legacy_cleanup',
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    }, credentialEnv);
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+    fs.fsyncSync = originalFsyncSync;
+    process.emitWarning = originalEmitWarning;
+  }
+
+  assert.equal(result.changed, true);
+  assert.equal(legacyUnlinked, true);
+  assert.equal(cleanupFailureInjected, true);
+  assert.equal(fs.existsSync(storePath), false);
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1']);
+  assert.equal(warning.options.code, 'SPALA_CREDENTIAL_CLEANUP');
+  assert.match(warning.message, /committed.*legacy credential file/i);
+});
+
+test('historical version retirement failure warns without failing the durable update', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const journalPath = credentialJournalPath(credentialHome);
+  storeProjectCredential({
+    projectId: 'retirement-warning-project',
+    mcpUrl: 'https://retirement-warning-project.spala.test/mcp',
+    bearerToken: 'mcp_before_retirement_warning',
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+  }, credentialEnv);
+  const firstVersionStat = fs.statSync(path.join(journalPath, '1'));
+
+  const originalEmitWarning = process.emitWarning;
+  const originalFtruncateSync = fs.ftruncateSync;
+  let retirementFailureInjected = false;
+  let warning;
+  fs.ftruncateSync = (fd, length) => {
+    const stat = fs.fstatSync(fd);
+    if (!retirementFailureInjected
+      && stat.dev === firstVersionStat.dev
+      && stat.ino === firstVersionStat.ino) {
+      retirementFailureInjected = true;
+      const error = new Error('simulated historical retirement failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFtruncateSync(fd, length);
+  };
+  process.emitWarning = (message, options) => {
+    warning = { message, options };
+  };
+
+  let result;
+  try {
+    result = storeProjectCredential({
+      projectId: 'retirement-warning-project',
+      mcpUrl: 'https://retirement-warning-project.spala.test/mcp',
+      bearerToken: 'mcp_after_retirement_warning',
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    }, credentialEnv);
+  } finally {
+    fs.ftruncateSync = originalFtruncateSync;
+    process.emitWarning = originalEmitWarning;
+  }
+
+  assert.equal(result.changed, true);
+  assert.equal(retirementFailureInjected, true);
+  assert.equal(warning.options.code, 'SPALA_CREDENTIAL_CLEANUP');
+  assert.match(warning.message, /historical version/);
+  assert.equal(
+    readProjectCredential('retirement-warning-project', credentialEnv).bearerToken,
+    'mcp_after_retirement_warning',
+  );
+  assert.deepEqual(credentialJournalVersions(credentialHome), ['1', '2']);
+});
+
+test('credential store refuses a symbolic-link journal without touching its target', () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  const journalPath = credentialJournalPath(credentialHome);
+  const journalTarget = path.join(tempHome(), 'external-journal-target');
+  fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(journalTarget);
+  fs.symlinkSync(journalTarget, journalPath);
+
+  assert.throws(() => storeProjectCredential({
+    projectId: 'symlink-journal-project',
+    mcpUrl: 'https://symlink-journal-project.spala.test/mcp',
+    bearerToken: 'mcp_symlink_journal',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, credentialEnv), /journal must be a directory and not a symbolic link/);
+
+  assert.equal(fs.lstatSync(journalPath).isSymbolicLink(), true);
+  assert.deepEqual(fs.readdirSync(journalTarget), []);
+  assert.equal(fs.existsSync(storePath), false);
+});
+
+test('credential store rejects canonical homes inside real or symlinked workspaces', () => {
+  const workspace = tempHome();
+  const external = tempHome();
+  const linkedHome = path.join(external, 'linked-home');
+  fs.symlinkSync(workspace, linkedHome, 'dir');
+
+  assert.throws(() => preflightCredentialStore(
+    { SPALA_MCP_CREDENTIAL_HOME: linkedHome },
+    workspace,
+  ), /outside the project workspace/);
+  assert.equal(fs.existsSync(path.join(workspace, '.config')), false);
+
+  const danglingLinkedHome = path.join(external, 'dangling-linked-home');
+  fs.symlinkSync(path.join(workspace, 'not-created-home'), danglingLinkedHome, 'dir');
+  assert.throws(() => preflightCredentialStore(
+    { SPALA_MCP_CREDENTIAL_HOME: danglingLinkedHome },
+    workspace,
+  ), /outside the project workspace/);
+
+  const realWorkspace = tempHome();
+  const aliasParent = tempHome();
+  const workspaceAlias = path.join(aliasParent, 'workspace-alias');
+  fs.symlinkSync(realWorkspace, workspaceAlias, 'dir');
+  assert.throws(() => preflightCredentialStore(
+    { SPALA_MCP_CREDENTIAL_HOME: path.join(realWorkspace, 'credential-home') },
+    workspaceAlias,
+  ), /outside the project workspace/);
+});
+
+test('credential store rejects permissive POSIX legacy and journal version modes', {
+  skip: process.platform === 'win32',
+}, () => {
+  const credentialHome = tempHome();
+  const credentialEnv = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const storePath = credentialStorePath(credentialEnv);
+  fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(storePath, `${JSON.stringify({
+    schemaVersion: 1,
+    projects: {
+      'mode-project': {
+        mcpUrl: 'https://mode-project.spala.test/mcp',
+        bearerToken: 'mcp_mode_project',
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+        status: 'active',
+      },
+    },
+  })}\n`, { mode: 0o600 });
+  fs.chmodSync(storePath, 0o644);
+
+  assert.throws(
+    () => readProjectCredential('mode-project', credentialEnv),
+    /must not be accessible by group or other users/,
+  );
+
+  fs.chmodSync(storePath, 0o600);
+  storeProjectCredential({
+    projectId: 'journal-mode-project',
+    mcpUrl: 'https://journal-mode-project.spala.test/mcp',
+    bearerToken: 'mcp_journal_mode_project',
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+  }, credentialEnv);
+  const versionPath = path.join(credentialJournalPath(credentialHome), '1');
+  fs.chmodSync(versionPath, 0o644);
+
+  assert.throws(
+    () => readProjectCredential('journal-mode-project', credentialEnv),
+    /must not be accessible by group or other users/,
+  );
 });
 
 test('ordinary exact-url bind reuses a canonical scoped binding for the same project only', async () => {
@@ -4801,6 +5708,60 @@ test('agentic bind rejects command-only clients before reading or consuming the 
   }, { fetch: async () => { calls += 1; throw new Error('must not run'); } }), /No verified workspace-scoped target|does not support workspace/);
   assert.equal(reads, 0);
   assert.equal(calls, 0);
+});
+
+test('agentic bind preflights journal hard links before consuming the bootstrap capability', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const journalPath = credentialJournalPath(credentialHome);
+  const originalLinkSync = fs.linkSync;
+  let linkProbeAttempted = false;
+  let calls = 0;
+  fs.linkSync = (source, destination) => {
+    if (path.dirname(source) === journalPath
+      && path.basename(source).startsWith('.link-probe-source-')
+      && path.basename(destination).startsWith('.link-probe-target-')) {
+      linkProbeAttempted = true;
+      const error = new Error('simulated unsupported credential hard links');
+      error.code = 'EOPNOTSUPP';
+      throw error;
+    }
+    return originalLinkSync(source, destination);
+  };
+
+  try {
+    await assert.rejects(runCli([
+      'project', 'bind',
+      '--project-id', 'preflight-link-project',
+      '--project-url', 'https://preflight-link-project.spala.ai/',
+      '--url', 'https://preflight-link-project.spala.ai/mcp',
+      '--bootstrap-stdin',
+      '--client', 'codex',
+      '--yes',
+    ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+      stdout: { write: () => {} },
+      stderr: { write: () => {} },
+      stdin: Readable.from(['https://preflight-link-project.spala.ai/mcp/bootstrap/opaque/consume\n']),
+    }, {
+      fetch: async () => {
+        calls += 1;
+        throw new Error('must not consume');
+      },
+    }), error => {
+      assert.match(error.message, /could not verify required atomic hard-link support/);
+      assert.equal(error.message.includes(credentialHome), false);
+      return true;
+    });
+  } finally {
+    fs.linkSync = originalLinkSync;
+  }
+
+  assert.equal(linkProbeAttempted, true);
+  assert.equal(calls, 0);
+  assert.deepEqual(fs.readdirSync(journalPath), []);
+  assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
+  assert.equal(fs.existsSync(path.join(workspace, '.codex', 'config.toml')), false);
 });
 
 test('agentic bind rejects credential storage inside the workspace before consumption', async () => {

@@ -147,8 +147,19 @@ agent's process API. Do not interpolate it into a shell command. The installer
 validates that the consume URL belongs to the exact project and
 POSTs to it once without redirects. It never prints or persists that URL. The
 returned MCP bearer and exact remote MCP URL are stored outside the workspace
-in the current user's protected Spala credential store. Its directory is mode
-`0700` and its file is mode `0600`.
+in the current user's protected Spala credential journal. On POSIX systems,
+credential directories it creates or updates are mode `0700`, committed
+version files are mode `0600`, and legacy or current version files accessible
+by group or other users are rejected. On Windows, protection relies on the
+current user's operating system ACLs because POSIX mode bits are not
+authoritative.
+
+Committed numeric claim paths are retained permanently so a version number can
+never be reused by a stale concurrent writer. After a newer claim is durable,
+lower numeric files are rewritten and fsynced as non-secret retired markers;
+among committed claims, only the current snapshot retains active credentials.
+Nonnumeric temporary files left by an interrupted process are ignored; each
+process removes only the temporary and probe files it created itself.
 
 The workspace MCP registration is a local stdio command equivalent to:
 

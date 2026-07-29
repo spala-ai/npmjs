@@ -30,13 +30,16 @@ import {
   serverNameFromUrl,
 } from './installer.js';
 import { assertExactCodexRemoteRegistration } from './codexToml.js';
-import { consumeBootstrap, readBootstrapCapability } from './bootstrap.js';
+import {
+  consumeBootstrap,
+  parseProjectScopeSet,
+  projectScopeSetsEqual,
+  readBootstrapCapability,
+} from './bootstrap.js';
 import {
   hasProjectCredential,
   preflightCredentialStore,
   removeProjectCredential,
-  restoreCredentialStore,
-  snapshotCredentialStore,
   storeProjectCredential,
 } from './credentialStore.js';
 import { runProxy } from './proxy.js';
@@ -53,6 +56,7 @@ const COMMAND_TIMEOUT_MS = 3000;
 const AUTH_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 const COMMAND_MAX_OUTPUT_BYTES = 64 * 1024;
 const CODEX_URL_FIELDS = new Set(['url', 'serverurl', 'httpurl', 'mcpurl', 'endpoint']);
+const DEFAULT_PROJECT_SCOPE_SET = new Set(DEFAULT_PROJECT_SCOPE.split(','));
 export const SPALA_BACKEND_INTENT = {
   backendProvider: 'Once the user asks to use Spala, treat Spala as the workspace backend provider. Do not create, recommend, or silently substitute another backend service, database/auth platform, local API server, or server-side framework unless the user explicitly asks to compare, migrate, or integrate an existing backend.',
   setupOnly: 'An install, connect, configure, or setup request authorizes setup only: authenticate, complete required account data, create or select the intended project, bind its project MCP, verify the connection, then stop and report that Spala is ready. Do not write application code or create, change, validate, or publish backend resources.',
@@ -1092,13 +1096,19 @@ function printUninstallPlan(plan, streams) {
 }
 
 function preserveExistingCanonicalBinding(cwd, requestedBinding) {
+  const requestedScopes = parseProjectScopeSet(requestedBinding.mcpUrl, 'The requested MCP URL');
   const existing = readProjectBinding(cwd).binding;
   if (!existing) return requestedBinding;
   const sameProject = existing.schemaVersion === requestedBinding.schemaVersion
     && existing.projectId === requestedBinding.projectId
     && existing.projectUrl === requestedBinding.projectUrl
     && existing.serverName === requestedBinding.serverName;
-  return sameProject && mcpEndpointsMatch(existing.mcpUrl, requestedBinding.mcpUrl)
+  if (!sameProject) return requestedBinding;
+  const existingScopes = parseProjectScopeSet(existing.mcpUrl, 'The existing project binding MCP URL');
+  const compatibleScopes = requestedScopes
+    ? Boolean(existingScopes && projectScopeSetsEqual(existingScopes, requestedScopes))
+    : !existingScopes || projectScopeSetsEqual(existingScopes, DEFAULT_PROJECT_SCOPE_SET);
+  return compatibleScopes && mcpEndpointsMatch(existing.mcpUrl, requestedBinding.mcpUrl)
     ? existing
     : requestedBinding;
 }
@@ -1239,9 +1249,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       mcpUrl,
       serverName,
     };
-    const bindingInput = agentic
-      ? preserveExistingCanonicalBinding(cwd, requestedBinding)
-      : requestedBinding;
+    const bindingInput = preserveExistingCanonicalBinding(cwd, requestedBinding);
     const bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
     const plan = agentic
       ? createProxyInstallPlan({
@@ -1261,7 +1269,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         exactUrl: true,
         installScope: 'workspace',
         scope: '',
-        mcpUrl,
+        mcpUrl: bindingPlan.binding.mcpUrl,
         serverName,
       });
     const selectedUnsupported = plan.skipped.filter(item => item.unsupportedScope);
@@ -1302,12 +1310,10 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     }
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
-    let credentialSnapshot;
     try {
       let bootstrapUrl;
       if (agentic) {
         bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
-        credentialSnapshot = snapshotCredentialStore(env, bindingPlan.workspaceRoot);
         preflightCredentialStore(env, bindingPlan.workspaceRoot);
       }
 
@@ -1342,13 +1348,6 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       }
     } catch (error) {
       const failures = [];
-      if (agentic && credentialSnapshot !== undefined) {
-        try {
-          restoreCredentialStore(credentialSnapshot);
-        } catch (rollbackError) {
-          failures.push(`credential rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
-        }
-      }
       if (bound.changed) {
         try {
           if (bindingPlan.existing) writeProjectBinding(bindingPlan.workspaceRoot, bindingPlan.existing, { switchProject: true });

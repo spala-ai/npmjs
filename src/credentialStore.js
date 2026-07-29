@@ -76,10 +76,11 @@ function writeStore(filePath, store) {
   const temporary = path.join(directory, `.mcp-credentials.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(store, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    fs.chmodSync(temporary, 0o600);
     fs.renameSync(temporary, filePath);
-    fs.chmodSync(filePath, 0o600);
-  } finally {
+  } catch (error) {
     if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    throw error;
   }
 }
 
@@ -103,7 +104,7 @@ function credentialStatus(credential) {
 }
 
 export function preflightCredentialStore(env = process.env, workspaceRoot) {
-  const filePath = credentialStorePath(env, workspaceRoot);
+  const { filePath } = readStore(env, workspaceRoot);
   const directory = path.dirname(filePath);
   assertNotSymlink(directory, 'Spala credential directory');
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });

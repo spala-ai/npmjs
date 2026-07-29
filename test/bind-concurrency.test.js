@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +8,7 @@ import { Readable } from 'node:stream';
 import test from 'node:test';
 import { runCli } from '../src/cli.js';
 import {
+  planProjectBinding,
   readProjectBinding,
   rollbackProjectBinding,
   writeProjectBinding,
@@ -65,6 +68,356 @@ function binding(name) {
     serverName: `spala-${name}-spala-ai`,
   };
 }
+
+function crashReplacement(workspace, stage, {
+  attemptedBinding = binding(`crash-${stage}-attempt`),
+  originalBinding = binding(`crash-${stage}-original`),
+} = {}) {
+  fs.mkdirSync(path.join(workspace, '.git'));
+  if (originalBinding) writeProjectBinding(workspace, originalBinding);
+  const workspaceModuleUrl = new URL('../src/workspace.js', import.meta.url).href;
+  const worker = `
+    import fs from 'node:fs';
+    import path from 'node:path';
+    import { writeProjectBinding } from ${JSON.stringify(workspaceModuleUrl)};
+
+    const [workspace, stage, attemptedJson, hasOriginal] = process.argv.slice(1);
+    const attempted = JSON.parse(attemptedJson);
+    const originalRenameSync = fs.renameSync;
+    const originalOpenSync = fs.openSync;
+    const originalWriteSync = fs.writeSync;
+    const originalFsyncSync = fs.fsyncSync;
+    let publicationDescriptor;
+    let publicationSyncs = 0;
+
+    fs.renameSync = (sourcePath, destinationPath) => {
+      const result = originalRenameSync(sourcePath, destinationPath);
+      if (
+        stage === 'after-guard'
+        && path.basename(String(sourcePath)) === 'project.json'
+        && path.basename(String(destinationPath)).startsWith('.project.json.revision-guard-')
+      ) {
+        process.exit(86);
+      }
+      return result;
+    };
+    fs.openSync = (filePath, flags, mode) => {
+      const descriptor = originalOpenSync(filePath, flags, mode);
+      if (
+        path.basename(String(filePath)) === 'project.json'
+        && (flags & fs.constants.O_EXCL) !== 0
+      ) {
+        publicationDescriptor = descriptor;
+      }
+      return descriptor;
+    };
+    fs.writeSync = (descriptor, buffer, offset, length, position) => {
+      if (stage.startsWith('partial-') && descriptor === publicationDescriptor) {
+        originalWriteSync(descriptor, buffer, offset, Math.min(length, 17), position);
+        process.exit(86);
+      }
+      return originalWriteSync(descriptor, buffer, offset, length, position);
+    };
+    fs.fsyncSync = descriptor => {
+      const result = originalFsyncSync(descriptor);
+      if (stage === 'after-complete-publication' && descriptor === publicationDescriptor) {
+        publicationSyncs += 1;
+        if (publicationSyncs === 2) process.exit(86);
+      }
+      return result;
+    };
+
+    writeProjectBinding(
+      workspace,
+      attempted,
+      { switchProject: hasOriginal === 'true' },
+    );
+    process.exit(87);
+  `;
+  const crashed = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      worker,
+      workspace,
+      stage,
+      JSON.stringify(attemptedBinding),
+      String(Boolean(originalBinding)),
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    },
+  );
+  assert.equal(crashed.status, 86, `${stage}: ${crashed.stderr}`);
+  return { attemptedBinding, originalBinding };
+}
+
+function recoveryArtifacts(workspace) {
+  return fs.readdirSync(path.join(workspace, '.spala'))
+    .filter(name => (
+      name.startsWith('.project.json.revision-guard-')
+      || name.startsWith('.project.json.rollback-guard-')
+      || name.startsWith('.project.json.failed-publication-')
+    ));
+}
+
+test('dead replacement processes recover the prior binding for later read, plan, and bind', async t => {
+  for (const recoveryAction of ['read', 'plan', 'bind']) {
+    await t.test(recoveryAction, async () => {
+      const workspace = tempDirectory();
+      const { attemptedBinding, originalBinding } = crashReplacement(workspace, 'after-guard', {
+        attemptedBinding: binding(`dead-guard-${recoveryAction}-attempt`),
+        originalBinding: binding(`dead-guard-${recoveryAction}-original`),
+      });
+      assert.equal(
+        fs.existsSync(path.join(workspace, '.spala', 'project.json')),
+        false,
+      );
+      assert.equal(recoveryArtifacts(workspace).length, 1);
+
+      if (recoveryAction === 'read') {
+        const nested = path.join(workspace, 'packages', 'nested');
+        fs.mkdirSync(nested, { recursive: true });
+        fs.rmdirSync(path.join(workspace, '.git'));
+        assert.deepEqual(readProjectBinding(nested).binding, originalBinding);
+      } else if (recoveryAction === 'plan') {
+        assert.throws(
+          () => planProjectBinding(workspace, attemptedBinding),
+          /already bound.*--switch/,
+        );
+      } else {
+        await assert.rejects(
+          runCli(bindArgs({
+            projectId: attemptedBinding.projectId,
+            projectUrl: attemptedBinding.projectUrl,
+            mcpUrl: attemptedBinding.mcpUrl,
+          }), {}, workspace, quietStreams()),
+          /already bound.*--switch/,
+        );
+      }
+
+      assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+      assert.deepEqual(recoveryArtifacts(workspace), []);
+    });
+  }
+});
+
+test('dead partial exclusive publication restores a guard and never becomes an unbound workspace', async t => {
+  await t.test('replacement restores the prior binding before a later bind', () => {
+    const workspace = tempDirectory();
+    const { attemptedBinding, originalBinding } = crashReplacement(workspace, 'partial-replacement');
+    const canonicalPath = path.join(workspace, '.spala', 'project.json');
+    assert.equal(fs.statSync(canonicalPath).mode & 0o777, 0);
+    assert.equal(recoveryArtifacts(workspace).length, 1);
+
+    assert.throws(
+      () => writeProjectBinding(workspace, attemptedBinding),
+      /already bound.*--switch/,
+    );
+    assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+    assert.equal(fs.statSync(canonicalPath).mode & 0o777, 0o600);
+    assert.deepEqual(recoveryArtifacts(workspace), []);
+  });
+
+  await t.test('initial partial publication with no guard fails closed', () => {
+    const workspace = tempDirectory();
+    const { attemptedBinding } = crashReplacement(workspace, 'partial-initial', {
+      originalBinding: null,
+    });
+    const canonicalPath = path.join(workspace, '.spala', 'project.json');
+    assert.equal(fs.statSync(canonicalPath).mode & 0o777, 0);
+
+    assert.throws(
+      () => writeProjectBinding(workspace, attemptedBinding),
+      /Incomplete .* publication has no valid recovery guard/,
+    );
+    assert.equal(fs.existsSync(canonicalPath), true);
+    assert.equal(fs.statSync(canonicalPath).mode & 0o777, 0);
+  });
+});
+
+test('recovery preserves a complete or concurrent canonical winner', async t => {
+  await t.test('completed publication from the dead owner', () => {
+    const workspace = tempDirectory();
+    const { attemptedBinding } = crashReplacement(workspace, 'after-complete-publication');
+    assert.equal(recoveryArtifacts(workspace).length, 1);
+
+    assert.deepEqual(readProjectBinding(workspace).binding, attemptedBinding);
+    assert.deepEqual(recoveryArtifacts(workspace), []);
+  });
+
+  await t.test('independent concurrent winner', () => {
+    const workspace = tempDirectory();
+    crashReplacement(workspace, 'after-guard');
+    const winnerBinding = binding('dead-guard-concurrent-winner');
+    fs.writeFileSync(
+      path.join(workspace, '.spala', 'project.json'),
+      `${JSON.stringify(winnerBinding, null, 2)}\n`,
+      { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+    );
+
+    assert.deepEqual(readProjectBinding(workspace).binding, winnerBinding);
+    assert.deepEqual(recoveryArtifacts(workspace), []);
+  });
+});
+
+test('stale recovery rejects linked, tampered, and ambiguous guards without data loss', {
+  skip: process.platform === 'win32',
+}, async t => {
+  for (const artifactKind of ['symbolic link', 'hard link', 'tampered', 'ambiguous']) {
+    await t.test(artifactKind, () => {
+      const workspace = tempDirectory();
+      const { originalBinding } = crashReplacement(workspace, 'after-guard', {
+        originalBinding: binding(`recovery-${artifactKind.replaceAll(' ', '-')}`),
+      });
+      const spalaDirectory = path.join(workspace, '.spala');
+      const guardPath = path.join(spalaDirectory, recoveryArtifacts(workspace)[0]);
+      let preservedPath = guardPath;
+
+      if (artifactKind === 'symbolic link') {
+        preservedPath = path.join(workspace, 'preserved-recovery-guard.json');
+        fs.renameSync(guardPath, preservedPath);
+        fs.symlinkSync(preservedPath, guardPath);
+      } else if (artifactKind === 'hard link') {
+        preservedPath = path.join(workspace, 'recovery-guard-alias.json');
+        fs.linkSync(guardPath, preservedPath);
+      } else if (artifactKind === 'tampered') {
+        fs.writeFileSync(
+          guardPath,
+          `${JSON.stringify(binding('tampered-recovery-substitute'), null, 2)}\n`,
+          { mode: 0o600 },
+        );
+      } else {
+        const secondName = recoveryArtifacts(workspace)[0]
+          .replace(/[0-9a-f]{8}-[0-9a-f-]{27}$/i, randomUUID());
+        fs.copyFileSync(guardPath, path.join(spalaDirectory, secondName));
+      }
+
+      assert.throws(
+        () => readProjectBinding(workspace),
+        /symbolic link|hard-linked|tampered|Ambiguous/,
+      );
+      assert.equal(
+        fs.existsSync(path.join(spalaDirectory, 'project.json')),
+        false,
+      );
+      assert.equal(fs.existsSync(preservedPath), true);
+      if (artifactKind !== 'tampered') {
+        assert.deepEqual(
+          JSON.parse(fs.readFileSync(preservedPath, 'utf8')),
+          originalBinding,
+        );
+      }
+    });
+  }
+});
+
+test('stale recovery stays anchored when the named .spala directory is replaced', {
+  skip: process.platform === 'win32',
+}, () => {
+  const workspace = tempDirectory();
+  crashReplacement(workspace, 'after-guard');
+  const spalaDirectory = path.join(workspace, '.spala');
+  const displacedDirectory = path.join(workspace, '.spala-displaced-recovery');
+  const winnerBinding = binding('recovery-directory-winner');
+  const originalOpenSync = fs.openSync;
+  let swapped = false;
+
+  fs.openSync = (filePath, flags, mode) => {
+    const descriptor = originalOpenSync(filePath, flags, mode);
+    if (!swapped && path.resolve(String(filePath)) === spalaDirectory) {
+      swapped = true;
+      fs.renameSync(spalaDirectory, displacedDirectory);
+      fs.mkdirSync(spalaDirectory, { mode: 0o700 });
+      fs.writeFileSync(
+        path.join(spalaDirectory, 'project.json'),
+        `${JSON.stringify(winnerBinding, null, 2)}\n`,
+        { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+      );
+    }
+    return descriptor;
+  };
+  try {
+    assert.throws(
+      () => readProjectBinding(workspace),
+      /\.spala changed after it was inspected/,
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+
+  assert.equal(swapped, true);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(spalaDirectory, 'project.json'), 'utf8')),
+    winnerBinding,
+  );
+  assert.equal(
+    fs.readdirSync(displacedDirectory)
+      .filter(name => name.startsWith('.project.json.revision-guard-'))
+      .length,
+    1,
+  );
+});
+
+test('CLI dry-run and bind accept distinct custom presentation and MCP runtime URLs', async () => {
+  const workspace = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const projectUrl = 'https://console.customer-example.test/projects/project-custom/';
+  const mcpUrl = 'https://edge.shared-runtime.test/v2/tenants/project-custom/mcp?scope=builder%2Cproject%2Cdata';
+  const args = bindArgs({
+    projectId: 'project-custom-runtime',
+    projectUrl,
+    mcpUrl,
+  });
+  let dryRunOutput = '';
+
+  await runCli([...args, '--dry-run'], {}, workspace, {
+    stdin: { isTTY: false },
+    stdout: { write: value => { dryRunOutput += value; } },
+    stderr: { write: () => {} },
+  });
+  const dryRun = JSON.parse(dryRunOutput);
+  assert.equal(dryRun.outcome, 'planned');
+  assert.equal(dryRun.binding.projectUrl, projectUrl);
+  assert.equal(dryRun.binding.mcpUrl, mcpUrl);
+  assert.equal(fs.existsSync(path.join(workspace, '.spala')), false);
+
+  await runCli(args, {}, workspace, quietStreams());
+  const stored = readProjectBinding(workspace).binding;
+  assert.equal(stored.projectUrl, projectUrl);
+  assert.equal(stored.mcpUrl, mcpUrl);
+  assert.match(
+    fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8'),
+    /edge\.shared-runtime\.test\/v2\/tenants\/project-custom\/mcp/,
+  );
+});
+
+test('independent project and MCP URL validation rejects unsafe and ambiguous forms', () => {
+  const workspace = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const base = {
+    ...binding('independent-url-validation'),
+    projectUrl: 'https://console.custom-domain.test/project/',
+    mcpUrl: 'https://runtime.other-domain.test/shared/project/mcp',
+  };
+  for (const [field, value, pattern] of [
+    ['projectUrl', 'http://console.custom-domain.test/project/', /HTTPS/],
+    ['mcpUrl', 'ftp://runtime.other-domain.test/shared/project/mcp', /HTTPS/],
+    ['projectUrl', 'https://@console.custom-domain.test/project/', /credentials/],
+    ['mcpUrl', 'https://runtime.other-domain.test/shared/project/mcp#', /ambiguous|fragment/],
+    ['mcpUrl', 'https:\\\\runtime.other-domain.test\\shared\\project\\mcp', /ambiguous|unsafe/],
+    ['mcpUrl', 'https://runtime.other-domain.test/shared/project/mcp?scope=builder&scope=project', /duplicate scope/],
+    ['projectUrl', 'https://console.custom-domain.test/project/?', /empty query/],
+  ]) {
+    assert.throws(
+      () => writeProjectBinding(workspace, { ...base, [field]: value }),
+      pattern,
+    );
+  }
+  assert.equal(fs.existsSync(path.join(workspace, '.spala')), false);
+});
 
 test('failed pending bind does not roll back a later successful concurrent bind', async () => {
   const workspace = tempDirectory();

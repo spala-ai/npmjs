@@ -109,6 +109,26 @@ async function runWorker(options) {
 
   installLockHooks(options);
 
+  if (options.pauseAfterRecoveryPublication) {
+    const renameSync = fs.renameSync;
+    let paused = false;
+    const recoveryName = `${path.basename(storePath)}.recovery`;
+    fs.renameSync = (source, destination, ...args) => {
+      const result = renameSync(source, destination, ...args);
+      if (
+        !paused
+        && typeof source === 'string'
+        && source.startsWith(`${recoveryName}.tmp-`)
+        && destination === recoveryName
+      ) {
+        paused = true;
+        writeMarker(options.markerPath);
+        waitForRelease(options.releasePath);
+      }
+      return result;
+    };
+  }
+
   if (options.pauseBeforeExclusiveCreation) {
     const openSync = fs.openSync;
     let paused = false;
@@ -124,6 +144,40 @@ async function runWorker(options) {
         waitForRelease(options.releasePath);
       }
       return openSync(file, flags, ...args);
+    };
+  }
+
+  if (options.pauseDuringCanonicalWrite) {
+    const openSync = fs.openSync;
+    const writeSync = fs.writeSync;
+    let canonicalDescriptor;
+    let paused = false;
+    fs.openSync = (file, flags, ...args) => {
+      const descriptor = openSync(file, flags, ...args);
+      if (
+        file === path.basename(storePath)
+        && (flags & fs.constants.O_CREAT) !== 0
+        && (flags & fs.constants.O_EXCL) !== 0
+      ) {
+        canonicalDescriptor = descriptor;
+      }
+      return descriptor;
+    };
+    fs.writeSync = (descriptor, data, offset, length, ...args) => {
+      if (!paused && descriptor === canonicalDescriptor && Buffer.isBuffer(data)) {
+        paused = true;
+        const written = writeSync(
+          descriptor,
+          data,
+          offset,
+          Math.max(1, Math.floor(length / 2)),
+          ...args,
+        );
+        writeMarker(options.markerPath);
+        waitForRelease(options.releasePath);
+        return written;
+      }
+      return writeSync(descriptor, data, offset, length, ...args);
     };
   }
 
@@ -722,6 +776,152 @@ if (process.argv[2] !== WORKER_FLAG) test('publication recovers an actual 0.1.15
     'mcp_legacy_cleanup_intended',
   );
   assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('a prepared 0.1.15 rename landing after 0.1.16 returns is recovered on read', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const existingProject = 'legacy-late-existing-project';
+  const legacyProject = 'legacy-late-concurrent-project';
+  const currentProject = 'legacy-late-current-project';
+  const markerPath = path.join(coordination, 'legacy-ready');
+  const releasePath = path.join(coordination, 'release-legacy');
+  const landedPath = path.join(coordination, 'legacy-landed');
+  storeFixtureCredential(credentialHome, existingProject, 'mcp_legacy_late_existing');
+  const storePath = credentialStorePath(env);
+  const legacy = startWorker({
+    credentialHome,
+    writerVersion: '0.1.15',
+    version015ModulePath: prepareVersion015Module(),
+    projectId: legacyProject,
+    bearerToken: 'mcp_legacy_late_concurrent',
+    pauseBeforeLegacyRename: true,
+    markerPath,
+    releasePath,
+    landedPath,
+  });
+  await waitForPath(markerPath, legacy);
+
+  const current = storeFixtureCredential(
+    credentialHome,
+    currentProject,
+    'mcp_legacy_late_current',
+  );
+  assert.equal(current.changed, true);
+  writeMarker(releasePath);
+  await waitForPath(landedPath, legacy);
+  assertSuccessfulWorker(await legacy.exited);
+  const landed = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  assert.equal(Object.hasOwn(landed.projects, currentProject), false);
+
+  assert.equal(
+    readProjectCredential(currentProject, env).bearerToken,
+    'mcp_legacy_late_current',
+  );
+  assert.equal(
+    readProjectCredential(legacyProject, env).bearerToken,
+    'mcp_legacy_late_concurrent',
+  );
+  assert.equal(
+    readProjectCredential(existingProject, env).bearerToken,
+    'mcp_legacy_late_existing',
+  );
+  const recovered = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  assert.deepEqual(Object.keys(recovered.projects).sort(), [
+    currentProject,
+    existingProject,
+    legacyProject,
+  ].sort());
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('process death after recovery publication repairs a missing canonical store', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'crashed-before-canonical-project';
+  const markerPath = path.join(coordination, 'recovery-published');
+  const worker = startWorker({
+    credentialHome,
+    projectId,
+    bearerToken: 'mcp_crashed_before_canonical',
+    pauseAfterRecoveryPublication: true,
+    markerPath,
+    releasePath: path.join(coordination, 'never-release'),
+  });
+  await waitForPath(markerPath, worker);
+  worker.child.kill('SIGKILL');
+  const crashed = await worker.exited;
+  assert.notEqual(crashed.code, 0);
+
+  const storePath = credentialStorePath(env);
+  assert.equal(fs.existsSync(storePath), false);
+  assert.equal(fs.existsSync(`${storePath}.recovery`), true);
+  const staleTime = new Date(Date.now() - 60_000);
+  fs.utimesSync(`${storePath}.lock`, staleTime, staleTime);
+
+  assert.equal(
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_crashed_before_canonical',
+  );
+  assertCredentialPathKindsAndModes(storePath);
+  assert.equal((fs.statSync(`${storePath}.recovery`).mode & 0o777), 0o600);
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('process death during canonical write repairs a partial file from recovery state', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'crashed-partial-canonical-project';
+  const markerPath = path.join(coordination, 'canonical-partial');
+  const worker = startWorker({
+    credentialHome,
+    projectId,
+    bearerToken: 'mcp_crashed_partial_canonical',
+    pauseDuringCanonicalWrite: true,
+    markerPath,
+    releasePath: path.join(coordination, 'never-release'),
+  });
+  await waitForPath(markerPath, worker);
+  worker.child.kill('SIGKILL');
+  const crashed = await worker.exited;
+  assert.notEqual(crashed.code, 0);
+
+  const storePath = credentialStorePath(env);
+  assert.equal(fs.existsSync(storePath), true);
+  assert.throws(() => JSON.parse(fs.readFileSync(storePath, 'utf8')));
+  const staleTime = new Date(Date.now() - 60_000);
+  fs.utimesSync(`${storePath}.lock`, staleTime, staleTime);
+
+  assert.equal(
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_crashed_partial_canonical',
+  );
+  const recovered = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  assert.equal(recovered.projects[projectId].bearerToken, 'mcp_crashed_partial_canonical');
+  assertCredentialPathKindsAndModes(storePath);
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('tampered credential recovery state fails closed without exposing secrets', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'tampered-recovery-project';
+  const bearerToken = 'mcp_tampered_recovery_secret';
+  storeFixtureCredential(credentialHome, projectId, bearerToken);
+  const recoveryPath = `${credentialStorePath(env)}.recovery`;
+  const recovery = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
+  recovery.checksum = '0'.repeat(64);
+  fs.writeFileSync(recoveryPath, `${JSON.stringify(recovery, null, 2)}\n`, { mode: 0o600 });
+
+  let error;
+  try {
+    readProjectCredential(projectId, env);
+  } catch (caught) {
+    error = caught;
+  }
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /integrity validation/);
+  assert.doesNotMatch(error.message, new RegExp(bearerToken));
 });
 
 if (process.argv[2] !== WORKER_FLAG) test('same-project conflict is resolved in favor of the verified current operation', async () => {

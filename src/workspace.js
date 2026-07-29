@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export const PROJECT_BINDING_SCHEMA_VERSION = 1;
 export const PROJECT_BINDING_RELATIVE_PATH = path.join('.spala', 'project.json');
@@ -15,6 +15,14 @@ const EXCLUSIVE_WRITE_FLAGS = fs.constants.O_CREAT
   | fs.constants.O_WRONLY
   | NOFOLLOW;
 const DIRECTORY_HANDLE_MARKER = Symbol('projectBindingDirectoryHandle');
+const RECOVERY_ARTIFACT_PREFIXES = [
+  '.project.json.revision-guard-',
+  '.project.json.rollback-guard-',
+  '.project.json.failed-publication-',
+];
+const RECOVERY_ARTIFACT_PATTERN = /^\.project\.json\.(?:revision-guard|rollback-guard|failed-publication)-([0-9a-f]{64})-([1-9]\d*)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_RECOVERY_ATTEMPTS = 8;
+const ACTIVE_RECOVERY_ARTIFACTS = new Set();
 
 const BINDING_KEYS = new Set([
   'schemaVersion',
@@ -32,9 +40,25 @@ function isDirectory(filePath) {
   }
 }
 
+function hasWorkspaceBindingState(directory) {
+  const directoryPath = path.join(directory, '.spala');
+  const stat = lstatOrUndefined(directoryPath);
+  if (!stat) return false;
+  if (stat.isSymbolicLink() || !stat.isDirectory()) return true;
+  try {
+    return fs.readdirSync(directoryPath).some(name => (
+      name === PROJECT_BINDING_FILE_NAME
+      || RECOVERY_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix))
+    ));
+  } catch {
+    return true;
+  }
+}
+
 function isWorkspaceMarker(directory) {
   return fs.existsSync(path.join(directory, '.git'))
-    || fs.existsSync(path.join(directory, 'pnpm-workspace.yaml'));
+    || fs.existsSync(path.join(directory, 'pnpm-workspace.yaml'))
+    || hasWorkspaceBindingState(directory);
 }
 
 export function findWorkspaceRoot(cwd = process.cwd()) {
@@ -62,7 +86,29 @@ function validateIdentifier(value, label) {
 
 function validateHttpsUrl(rawValue, label, { allowScope = false } = {}) {
   if (typeof rawValue !== 'string' || !rawValue.trim()) throw new Error(`${label} is required.`);
-  const parsed = new URL(rawValue.trim());
+  const value = rawValue.trim();
+  if (
+    value !== rawValue
+    || /[\u0000-\u0020\u007f\\]/.test(value)
+    || value.includes('#')
+    || !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+  ) {
+    throw new Error(`${label} contains ambiguous or unsafe URL syntax.`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid absolute URL.`);
+  }
+  const authorityStart = value.indexOf('://') + 3;
+  const authorityEndCandidate = value.slice(authorityStart).search(/[/?#]/);
+  const authorityEnd = authorityEndCandidate === -1
+    ? value.length
+    : authorityStart + authorityEndCandidate;
+  if (authorityStart < 3 || value.slice(authorityStart, authorityEnd).includes('@')) {
+    throw new Error(`${label} must not contain credentials.`);
+  }
   const localHttp = parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '::1', '[::1]'].includes(parsed.hostname);
   if (parsed.protocol !== 'https:' && !localHttp) {
     throw new Error(`${label} must use HTTPS, except localhost development URLs.`);
@@ -75,7 +121,13 @@ function validateHttpsUrl(rawValue, label, { allowScope = false } = {}) {
   if (unsupported.length) {
     throw new Error(`${label} contains unsupported query parameters: ${unsupported.join(', ')}.`);
   }
-  return rawValue.trim();
+  if (allowScope && parsed.searchParams.getAll('scope').length > 1) {
+    throw new Error(`${label} contains an ambiguous duplicate scope parameter.`);
+  }
+  if (value.includes('?') && !parsed.search) {
+    throw new Error(`${label} contains an ambiguous empty query.`);
+  }
+  return value;
 }
 
 export function validateProjectBinding(input) {
@@ -95,16 +147,7 @@ export function validateProjectBinding(input) {
   }
   const projectUrl = validateHttpsUrl(input.projectUrl, 'projectUrl');
   const mcpUrl = validateHttpsUrl(input.mcpUrl, 'mcpUrl', { allowScope: true });
-  const project = new URL(projectUrl);
   const mcp = new URL(mcpUrl);
-  const projectHost = project.hostname.toLowerCase();
-  const isSpalaHost = projectHost === 'spala.ai' || projectHost.endsWith('.spala.ai');
-  const isLocalHost = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(projectHost);
-  if (!isSpalaHost && !isLocalHost) throw new Error('projectUrl must identify a Spala project host.');
-  const projectPath = `${project.pathname.replace(/\/+$/, '')}/`;
-  if (project.origin !== mcp.origin || !`${mcp.pathname.replace(/\/+$/, '')}/`.startsWith(projectPath)) {
-    throw new Error('mcpUrl must belong to the same project URL.');
-  }
   if (!/\/mcp\/?$/i.test(mcp.pathname)) {
     throw new Error('mcpUrl must end in /mcp.');
   }
@@ -190,11 +233,13 @@ function chdirToDescriptor(descriptor, fallbackPath, expectedIdentity, label) {
   }
 }
 
-export function openProjectBindingDirectory(cwd = process.cwd()) {
-  const workspaceRoot = findWorkspaceRoot(cwd);
+function openBindingDirectory(workspaceRoot, { create }) {
   const directoryPath = path.join(workspaceRoot, '.spala');
-  assertNotSymlink(directoryPath, '.spala');
-  fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
+  const initial = lstatOrUndefined(directoryPath);
+  if (!initial && !create) return null;
+  if (initial?.isSymbolicLink()) throw new Error('.spala must not be a symbolic link.');
+  if (initial && !initial.isDirectory()) throw new Error('.spala must be a directory.');
+  if (!initial) fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
 
   const descriptor = fs.openSync(directoryPath, DIRECTORY_FLAGS);
   try {
@@ -222,6 +267,10 @@ export function openProjectBindingDirectory(cwd = process.cwd()) {
     fs.closeSync(descriptor);
     throw error;
   }
+}
+
+export function openProjectBindingDirectory(cwd = process.cwd()) {
+  return openBindingDirectory(findWorkspaceRoot(cwd), { create: true });
 }
 
 export function closeProjectBindingDirectory(handle) {
@@ -345,22 +394,25 @@ function assertNotSymlink(filePath, label) {
 
 export function readProjectBinding(cwd = process.cwd(), { required = false } = {}) {
   const workspaceRoot = findWorkspaceRoot(cwd);
-  const filePath = bindingPath(workspaceRoot);
-  if (!fs.existsSync(filePath)) {
+  const handle = openBindingDirectory(workspaceRoot, { create: false });
+  if (!handle) {
     if (required) throw new Error('This workspace is not bound to a Spala project.');
     return { binding: null, workspaceRoot };
   }
-  assertNotSymlink(path.dirname(filePath), '.spala');
-  assertNotSymlink(filePath, '.spala/project.json');
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile()) throw new Error('.spala/project.json must be a regular file.');
-  let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (error) {
-    throw new Error(`Invalid .spala/project.json: ${error instanceof Error ? error.message : String(error)}`);
+    return withAnchoredBindingDirectory(handle, () => {
+      assertBindingDirectoryCurrent(handle);
+      const current = recoverInterruptedProjectBinding();
+      assertBindingDirectoryCurrent(handle);
+      if (current.kind === 'absent') {
+        if (required) throw new Error('This workspace is not bound to a Spala project.');
+        return { binding: null, workspaceRoot };
+      }
+      return { binding: current.binding, workspaceRoot };
+    });
+  } finally {
+    closeProjectBindingDirectory(handle);
   }
-  return { binding: validateProjectBinding(parsed), workspaceRoot };
 }
 
 function sameBinding(left, right) {
@@ -430,6 +482,7 @@ function discardBindingName(filePath, expectedRevision, label) {
   }
   if (stat.nlink !== 1n) throw new Error(`${label} must not be a hard-linked file.`);
   fs.unlinkSync(filePath);
+  ACTIVE_RECOVERY_ARTIFACTS.delete(filePath);
 }
 
 function readStableBindingFile(filePath, label) {
@@ -467,7 +520,11 @@ function readStableBindingFile(filePath, label) {
     ) {
       return null;
     }
-    return { content, revision };
+    return {
+      changedNs: String(after.ctimeNs),
+      content,
+      revision,
+    };
   } finally {
     fs.closeSync(descriptor);
   }
@@ -528,6 +585,176 @@ function verifyPublishedBinding(filePath, expectedRevision, expectedContent) {
     throw new Error('.spala/project.json changed while it was being published; refusing to continue.');
   }
   return published.revision;
+}
+
+function parseBindingContent(content, label) {
+  let parsed;
+  try {
+    parsed = JSON.parse(content.toString('utf8'));
+  } catch (error) {
+    throw new Error(`Invalid ${label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return validateProjectBinding(parsed);
+}
+
+function bindingContentDigest(content) {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+function inspectCanonicalBinding() {
+  const stat = lstatOrUndefined(PROJECT_BINDING_FILE_NAME);
+  if (!stat) return { kind: 'absent' };
+  if (stat.isSymbolicLink()) {
+    throw new Error('.spala/project.json must not be a symbolic link.');
+  }
+  if (!stat.isFile()) throw new Error('.spala/project.json must be a regular file.');
+  if (stat.nlink !== 1n) throw new Error('.spala/project.json must not be a hard-linked file.');
+
+  if ((stat.mode & 0o777n) === 0n) {
+    return {
+      changedNs: String(stat.ctimeNs),
+      kind: 'partial',
+      revision: bindingRevisionFromStat(stat),
+    };
+  }
+
+  const stable = readStableBindingFile(PROJECT_BINDING_FILE_NAME, '.spala/project.json');
+  if (!stable) {
+    throw new Error('.spala/project.json changed while it was being inspected; refusing to continue.');
+  }
+  return {
+    ...stable,
+    binding: parseBindingContent(stable.content, '.spala/project.json'),
+    kind: 'valid',
+  };
+}
+
+function recoveryArtifactNames() {
+  const names = fs.readdirSync('.').filter(name => (
+    RECOVERY_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix))
+  ));
+  const malformed = names.find(name => !RECOVERY_ARTIFACT_PATTERN.test(name));
+  if (malformed) {
+    throw new Error('Unrecognized .spala project binding recovery artifact; refusing to continue.');
+  }
+  if (names.length > 1) {
+    throw new Error('Ambiguous .spala project binding recovery artifacts; refusing to continue.');
+  }
+  return names;
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ESRCH') return false;
+    return true;
+  }
+}
+
+function inspectRecoveryArtifact(filePath) {
+  const label = '.spala project binding recovery artifact';
+  const match = RECOVERY_ARTIFACT_PATTERN.exec(filePath);
+  const stat = inspectBindingFile(filePath, label);
+  if (stat.nlink !== 1n) throw new Error(`${label} must not be a hard-linked file.`);
+  const stable = readStableBindingFile(filePath, label);
+  if (!stable) throw new Error(`${label} changed while it was being inspected; refusing to continue.`);
+  if (bindingContentDigest(stable.content) !== match?.[1]?.toLowerCase()) {
+    throw new Error(`${label} was tampered with; refusing to continue.`);
+  }
+  return {
+    ...stable,
+    binding: parseBindingContent(stable.content, label),
+    filePath,
+  };
+}
+
+function discardStableRecoveryArtifact(artifact) {
+  let stat;
+  try {
+    stat = inspectBindingFile(
+      artifact.filePath,
+      '.spala project binding recovery artifact',
+    );
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (
+    stat.nlink !== 1n
+    || !sameBindingRevision(bindingRevisionFromStat(stat), artifact.revision)
+    || String(stat.ctimeNs) !== artifact.changedNs
+  ) {
+    throw new Error('.spala project binding recovery artifact changed after it was inspected; refusing to remove it.');
+  }
+  fs.unlinkSync(artifact.filePath);
+  syncCurrentDirectory();
+  return true;
+}
+
+function discardIncompleteCanonical(current) {
+  const stat = lstatOrUndefined(PROJECT_BINDING_FILE_NAME);
+  if (!stat) return false;
+  if (
+    stat.isSymbolicLink()
+    || !stat.isFile()
+    || stat.nlink !== 1n
+    || (stat.mode & 0o777n) !== 0n
+    || !sameBindingRevision(bindingRevisionFromStat(stat), current.revision)
+    || String(stat.ctimeNs) !== current.changedNs
+  ) {
+    throw new Error('.spala/project.json changed after its incomplete publication was inspected; refusing to remove it.');
+  }
+  fs.unlinkSync(PROJECT_BINDING_FILE_NAME);
+  syncCurrentDirectory();
+  return true;
+}
+
+function recoverInterruptedProjectBinding() {
+  for (let attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; attempt += 1) {
+    const names = recoveryArtifactNames();
+    if (names.length && ACTIVE_RECOVERY_ARTIFACTS.has(names[0])) {
+      const activeCurrent = inspectCanonicalBinding();
+      if (activeCurrent.kind === 'partial') {
+        throw new Error('A project binding publication is still active; refusing to continue.');
+      }
+      return activeCurrent;
+    }
+    if (names.length) {
+      const ownerPid = Number(RECOVERY_ARTIFACT_PATTERN.exec(names[0])?.[2]);
+      if (ownerPid !== process.pid && processIsAlive(ownerPid)) {
+        throw new Error('Another process is changing the workspace binding; refusing to continue.');
+      }
+    }
+    const artifact = names.length ? inspectRecoveryArtifact(names[0]) : null;
+    const current = inspectCanonicalBinding();
+
+    if (!artifact) {
+      if (current.kind === 'partial') {
+        throw new Error('Incomplete .spala/project.json publication has no valid recovery guard; refusing to treat the workspace as unbound.');
+      }
+      return current;
+    }
+
+    if (current.kind === 'partial') {
+      discardIncompleteCanonical(current);
+      continue;
+    }
+
+    if (current.kind === 'absent') {
+      publishBindingNoReplace(
+        artifact.filePath,
+        PROJECT_BINDING_FILE_NAME,
+        artifact.revision,
+        '.spala project binding recovery artifact',
+      );
+      continue;
+    }
+
+    discardStableRecoveryArtifact(artifact);
+  }
+  throw new Error('Project binding recovery did not reach a stable state; refusing to continue.');
 }
 
 function assertValidConcurrentBinding() {
@@ -630,7 +857,12 @@ function restoreIsolatedBinding(isolatedPath, isolatedRevision, label) {
 }
 
 function isolateProjectBinding(purpose, label) {
-  const isolatedPath = `.project.json.${purpose}-${process.pid}-${randomUUID()}`;
+  const source = readStableBindingFile(PROJECT_BINDING_FILE_NAME, label);
+  if (!source) {
+    if (!lstatOrUndefined(PROJECT_BINDING_FILE_NAME)) return null;
+    throw new Error(`${label} changed before it could be isolated; refusing to continue.`);
+  }
+  const isolatedPath = `.project.json.${purpose}-${bindingContentDigest(source.content)}-${process.pid}-${randomUUID()}`;
   try {
     fs.renameSync(PROJECT_BINDING_FILE_NAME, isolatedPath);
   } catch (error) {
@@ -639,12 +871,25 @@ function isolateProjectBinding(purpose, label) {
     }
     throw error;
   }
-  const isolatedStat = inspectBindingFile(isolatedPath, label);
-  if (isolatedStat.nlink !== 1n) throw new Error(`${label} must not be a hard-linked file.`);
-  return {
-    filePath: isolatedPath,
-    revision: bindingRevisionFromStat(isolatedStat),
-  };
+  ACTIVE_RECOVERY_ARTIFACTS.add(isolatedPath);
+  try {
+    const isolated = readStableBindingFile(isolatedPath, label);
+    if (
+      !isolated
+      || !sameBindingRevision(isolated.revision, source.revision)
+      || !isolated.content.equals(source.content)
+    ) {
+      throw new Error(`${label} changed while it was being isolated; refusing to continue.`);
+    }
+    syncCurrentDirectory();
+    return {
+      filePath: isolatedPath,
+      revision: isolated.revision,
+    };
+  } catch (error) {
+    ACTIVE_RECOVERY_ARTIFACTS.delete(isolatedPath);
+    throw error;
+  }
 }
 
 function recoverFailedReplacement(publishedRevision, previous) {

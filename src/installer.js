@@ -368,6 +368,49 @@ export function mcpUrlsMatch(left, right) {
   return urlsMatch(left, right);
 }
 
+export function mcpAuthorizationMatches(left, right) {
+  const authorizationIdentity = value => {
+    let source;
+    try {
+      source = new URL(value || '');
+    } catch {
+      return undefined;
+    }
+    const scopeValues = source.searchParams.getAll('scope');
+    if (scopeValues.length > 1) return undefined;
+    const normalized = normalizeComparableMcpUrl(value || '');
+    if (!normalized) return undefined;
+    const parsed = new URL(normalized);
+    const scopes = scopeValues.length === 0
+      ? null
+      : scopeValues[0].split(',');
+    if (
+      scopes
+      && (
+        scopes.some(scope => !scope)
+        || new Set(scopes).size !== scopes.length
+      )
+    ) {
+      return undefined;
+    }
+    parsed.search = '';
+    return {
+      endpoint: parsed.toString(),
+      scopes: scopes ? new Set(scopes) : null,
+    };
+  };
+  const leftIdentity = authorizationIdentity(left);
+  const rightIdentity = authorizationIdentity(right);
+  if (!leftIdentity || !rightIdentity || leftIdentity.endpoint !== rightIdentity.endpoint) {
+    return false;
+  }
+  if (!leftIdentity.scopes || !rightIdentity.scopes) {
+    return leftIdentity.scopes === rightIdentity.scopes;
+  }
+  return leftIdentity.scopes.size === rightIdentity.scopes.size
+    && [...leftIdentity.scopes].every(scope => rightIdentity.scopes.has(scope));
+}
+
 // Endpoint identity ignores the scope query: origin + path only. The scope a
 // bootstrap response carries is authorization detail, not a different server,
 // so a bare requested URL must accept a scoped response (and vice versa).

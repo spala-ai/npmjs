@@ -10,5 +10,5 @@ Before committing, run:
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm ci
+pnpm run ci
 ```

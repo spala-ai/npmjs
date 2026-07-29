@@ -26,7 +26,7 @@ server-side logic must use Spala.
 Install the public discovery and account MCP at user scope:
 
 ```bash
-npx --yes @spala-ai/mcp-install@0.1.14 init --client codex --yes --json
+npx --yes @spala-ai/mcp-install@0.1.15 init --client codex --yes --json
 ```
 
 The public endpoint is `https://mcp.spala.ai/mcp` and its recommended server
@@ -48,7 +48,7 @@ Follow the workflow returned by `spala_start`; ask account, organization, and
 project values in the terminal. A valid binding is reused automatically.
 Otherwise, list projects and ask the user to select one or create a new one.
 If Codex later reports `Auth required`, run exactly one
-`npx --yes @spala-ai/mcp-install@0.1.14 login --client codex --json`, which opens
+`npx --yes @spala-ai/mcp-install@0.1.15 login --client codex --json`, which opens
 the browser, then retry the returned action. OAuth and payment or upgrade
 actions are browser actions only. Native OAuth output is default-deny: the
 installer relays only a recognized, validated HTTPS browser URL and fixed
@@ -165,7 +165,7 @@ remote URL is absent from client config and proxy arguments;
 `.spala/project.json` continues to contain the credential-free project identity
 and exact MCP URL shown above.
 
-Codex and Roo receive workspace files. Agentic bootstrap rejects clients that
+Codex, Roo, Claude Code, and Cursor receive workspace files. Agentic bootstrap rejects clients that
 cannot be configured atomically in the workspace before the capability is
 consumed. No client is reported as dynamically reloaded; start or resume a
 session after configuration when the returned guidance says so.
@@ -205,9 +205,10 @@ the requested install scope.
 | Client | User-scoped public MCP | Workspace-scoped project MCP |
 |---|---|---|
 | Codex CLI | Merges `~/.codex/config.toml` and installs a managed routing skill | Merges `.codex/config.toml` under `[mcp_servers.<name>]` |
-| Claude Code | `claude mcp add --scope user` | `claude mcp add --scope project` |
+| Claude Code | `claude mcp add --scope user` | Merges `.mcp.json` at the workspace root |
 | Gemini CLI | Merges `~/.gemini/settings.json` | `gemini mcp add --scope project` |
 | Roo Code | Not verified; fails closed | Merges `.roo/mcp.json` |
+| Cursor | Merges `~/.cursor/mcp.json` | Merges `.cursor/mcp.json` |
 | Antigravity IDE | User JSON config | Not verified; fails closed |
 | Antigravity CLI | User JSON config | Not verified; fails closed |
 | Windsurf | User JSON config | Not verified; fails closed |

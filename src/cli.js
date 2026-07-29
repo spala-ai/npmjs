@@ -48,6 +48,7 @@ import {
   planProjectBinding,
   readProjectBinding,
   removeProjectBinding,
+  replaceProjectBindingIfRevision,
   rollbackProjectBinding,
   writeProjectBinding,
 } from './workspace.js';
@@ -1336,10 +1337,10 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         // bind the exchanged URL so proxy credentials and the workspace
         // binding agree with the server.
         if (exchanged.mcpUrl !== bindingPlan.binding.mcpUrl) {
-          bound = writeProjectBinding(
+          bound = replaceProjectBindingIfRevision(
             bindingPlan.workspaceRoot,
             { ...bindingPlan.binding, mcpUrl: exchanged.mcpUrl },
-            { switchProject: true },
+            bound.revision,
           );
         }
         const persistCredential = runtime.storeProjectCredential || storeProjectCredential;

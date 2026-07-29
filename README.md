@@ -26,7 +26,7 @@ server-side logic must use Spala.
 Install the public discovery and account MCP at user scope:
 
 ```bash
-npx --yes @spala-ai/mcp-install@0.1.15 init --client codex --yes --json
+npx --yes @spala-ai/mcp-install@0.1.16 init --client codex --yes --json
 ```
 
 The public endpoint is `https://mcp.spala.ai/mcp` and its recommended server
@@ -48,7 +48,7 @@ Follow the workflow returned by `spala_start`; ask account, organization, and
 project values in the terminal. A valid binding is reused automatically.
 Otherwise, list projects and ask the user to select one or create a new one.
 If Codex later reports `Auth required`, run exactly one
-`npx --yes @spala-ai/mcp-install@0.1.15 login --client codex --json`, which opens
+`npx --yes @spala-ai/mcp-install@0.1.16 login --client codex --json`, which opens
 the browser, then retry the returned action. OAuth and payment or upgrade
 actions are browser actions only. Native OAuth output is default-deny: the
 installer relays only a recognized, validated HTTPS browser URL and fixed

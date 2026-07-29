@@ -23,6 +23,7 @@ import {
   createUninstallPlan,
   formatClientList,
   installPlan,
+  mcpEndpointsMatch,
   mcpUrlsMatch,
   rollbackInstallPlan,
   normalizeMcpUrl,
@@ -1090,6 +1091,18 @@ function printUninstallPlan(plan, streams) {
   }
 }
 
+function preserveExistingCanonicalBinding(cwd, requestedBinding) {
+  const existing = readProjectBinding(cwd).binding;
+  if (!existing) return requestedBinding;
+  const sameProject = existing.schemaVersion === requestedBinding.schemaVersion
+    && existing.projectId === requestedBinding.projectId
+    && existing.projectUrl === requestedBinding.projectUrl
+    && existing.serverName === requestedBinding.serverName;
+  return sameProject && mcpEndpointsMatch(existing.mcpUrl, requestedBinding.mcpUrl)
+    ? existing
+    : requestedBinding;
+}
+
 export async function runCli(argv, env = process.env, cwd = process.cwd(), streams = {}, runtime = {}) {
   const io = {
     stdin: streams.stdin || defaultStdin,
@@ -1219,13 +1232,16 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
 
   if (args.command === 'project-bind') {
     const agentic = args.bootstrapStdin || args.bootstrapFd !== undefined;
-    const bindingInput = {
+    const requestedBinding = {
       schemaVersion: PROJECT_BINDING_SCHEMA_VERSION,
       projectId: args.projectId,
       projectUrl: args.projectUrl,
       mcpUrl,
       serverName,
     };
+    const bindingInput = agentic
+      ? preserveExistingCanonicalBinding(cwd, requestedBinding)
+      : requestedBinding;
     const bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
     const plan = agentic
       ? createProxyInstallPlan({
@@ -1316,7 +1332,8 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
             { switchProject: true },
           );
         }
-        storeProjectCredential({
+        const persistCredential = runtime.storeProjectCredential || storeProjectCredential;
+        persistCredential({
           projectId: bindingPlan.binding.projectId,
           mcpUrl: exchanged.mcpUrl,
           bearerToken: exchanged.bearerToken,
@@ -1351,6 +1368,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       ...basePayload,
       outcome: 'bound',
       changed: agentic || bound.changed || installed.writes.length > 0,
+      binding: bound.binding,
       agenticCredentialConfigured: agentic,
       plan: summarizeAppliedPlan(plan, installed),
     };

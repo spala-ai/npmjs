@@ -14,6 +14,7 @@ import {
   createProxyInstallPlan,
   createUninstallPlan,
   installPlan,
+  INSTALLER_PACKAGE_SPEC,
   mcpEndpointsMatch,
   normalizeMcpUrl,
   PUBLIC_LEGACY_SERVER_NAMES,
@@ -182,7 +183,7 @@ test('shell command hints safely quote command substitution characters', () => {
 
 test('public MCP command hints match the live manifest scope contract', () => {
   const hints = buildCommandHints(PUBLIC_SERVER_NAME, PUBLIC_MCP_URL);
-  assert.match(hints.codexAdd, /npx.*--yes.*@spala-ai\/mcp-install@0\.1\.15/);
+  assert.ok(hints.codexAdd.includes(INSTALLER_PACKAGE_SPEC), 'codexAdd pins the current package spec');
   assert.equal(hints.codexLogin, null);
   assert.deepEqual(hints.argv.codexLogin, null);
 });
@@ -2973,7 +2974,7 @@ test('command-style init writes public Codex config and managed skill for user s
 
 test('failed init authentication reports changed and explicit init safely retries authentication', async () => {
   const home = tempHome();
-  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json';
+  const retryCommand = `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`;
   const secret = 'oauth-failure-code-must-not-leak';
   let errorOutput = '';
   const error = await captureAsyncError(() => runCli(
@@ -3028,7 +3029,7 @@ test('failed init authentication reports changed and explicit init safely retrie
 });
 
 test('unchanged canonical --public --yes retries missing or expired native OAuth without inspecting credentials', async () => {
-  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json';
+  const retryCommand = `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`;
 
   for (const authState of ['missing', 'expired']) {
     const home = tempHome();
@@ -3173,7 +3174,7 @@ test('native failed init JSON reports one exact retry command without child outp
   assert.equal(payload.changed, true);
   assert.deepEqual(payload.nextSteps, [{
     action: 'run_command',
-    command: 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json',
+    command: `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`,
   }]);
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(secret));
 });
@@ -4745,7 +4746,7 @@ test('agentic proxy plans are workspace-only and command hints contain no creden
   assert.equal(plan.writes[0].path, path.join(workspace, '.roo', 'mcp.json'));
   assert.deepEqual(JSON.parse(plan.writes[0].content).mcpServers['spala-project'], {
     command: 'pnpm',
-    args: ['dlx', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+    args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123'],
   });
   const commands = buildProxyCommandHints('spala-project', 'project-123');
   const serialized = JSON.stringify(commands);
@@ -4776,7 +4777,7 @@ test('agentic proxy plans support claude-code and cursor as writable workspace c
   assert.deepEqual(JSON.parse(claudePlan.writes[0].content).mcpServers['spala-project'], {
     type: 'stdio',
     command: 'npx',
-    args: ['--yes', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+    args: ['--yes', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123'],
   });
 
   const cursorPlan = createProxyInstallPlan({
@@ -4789,7 +4790,7 @@ test('agentic proxy plans support claude-code and cursor as writable workspace c
   assert.equal(cursorPlan.writes[0].path, path.join(workspace, '.cursor', 'mcp.json'));
   assert.deepEqual(JSON.parse(cursorPlan.writes[0].content).mcpServers['spala-project'], {
     command: 'npx',
-    args: ['--yes', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+    args: ['--yes', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123'],
   });
 
   const serialized = JSON.stringify([claudePlan, cursorPlan]);

@@ -47,7 +47,8 @@ export const PUBLIC_LEGACY_SERVER_NAMES = [
   'spala-mcp-spala-ai',
 ];
 export const MCP_REMOTE_VERSION = '0.1.38';
-export const INSTALLER_PACKAGE_SPEC = '@spala-ai/mcp-install@0.1.15';
+export { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
+import { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
 
 export const CLIENT_LABELS = {
   antigravity: 'Antigravity',

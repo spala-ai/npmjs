@@ -181,7 +181,7 @@ test('shell command hints safely quote command substitution characters', () => {
 
 test('public MCP command hints match the live manifest scope contract', () => {
   const hints = buildCommandHints(PUBLIC_SERVER_NAME, PUBLIC_MCP_URL);
-  assert.match(hints.codexAdd, /npx.*--yes.*@spala-ai\/mcp-install@0\.1\.14/);
+  assert.match(hints.codexAdd, /npx.*--yes.*@spala-ai\/mcp-install@0\.1\.15/);
   assert.equal(hints.codexLogin, null);
   assert.deepEqual(hints.argv.codexLogin, null);
 });
@@ -2972,7 +2972,7 @@ test('command-style init writes public Codex config and managed skill for user s
 
 test('failed init authentication reports changed and explicit init safely retries authentication', async () => {
   const home = tempHome();
-  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.14 login --client codex --json';
+  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json';
   const secret = 'oauth-failure-code-must-not-leak';
   let errorOutput = '';
   const error = await captureAsyncError(() => runCli(
@@ -3027,7 +3027,7 @@ test('failed init authentication reports changed and explicit init safely retrie
 });
 
 test('unchanged canonical --public --yes retries missing or expired native OAuth without inspecting credentials', async () => {
-  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.14 login --client codex --json';
+  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json';
 
   for (const authState of ['missing', 'expired']) {
     const home = tempHome();
@@ -3172,7 +3172,7 @@ test('native failed init JSON reports one exact retry command without child outp
   assert.equal(payload.changed, true);
   assert.deepEqual(payload.nextSteps, [{
     action: 'run_command',
-    command: 'pnpm dlx @spala-ai/mcp-install@0.1.14 login --client codex --json',
+    command: 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json',
   }]);
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(secret));
 });
@@ -4430,7 +4430,7 @@ test('agentic bind rejects command-only clients before reading or consuming the 
     '--project-url', 'https://shared.spala.ai/p123/',
     '--url', 'https://shared.spala.ai/p123/mcp',
     '--bootstrap-stdin',
-    '--client', 'claude-code',
+    '--client', 'gemini',
     '--yes',
   ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
     stdout: { write: () => {} }, stderr: { write: () => {} }, stdin,
@@ -4516,6 +4516,162 @@ test('proxy reads its user credential and forwards bearer auth without printing 
   assert.doesNotMatch(output, new RegExp(bearerToken));
 });
 
+test('proxy rejects oversized JSON responses instead of buffering them', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const oversized = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { blob: 'x'.repeat(70_000) } });
+  await assert.rejects(runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async () => new Response(oversized, { status: 200, headers: { 'content-type': 'application/json' } }),
+  }), /size limit/);
+});
+
+test('proxy rejects an unterminated oversized SSE buffer instead of growing it', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const unterminated = `data: ${'x'.repeat(70_000)}`;
+  await assert.rejects(runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async () => new Response(unterminated, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+  }), /size limit/);
+});
+
+test('proxy SSE limit counts raw bytes so multibyte payloads cannot bypass it', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  // 30,000 characters but ~90,000 UTF-8 bytes: passes a character count, must fail a byte count.
+  const multibyte = `data: ${'€'.repeat(30_000)}`;
+  await assert.rejects(runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async () => new Response(multibyte, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+  }), /size limit/);
+});
+
+test('proxy SSE limit is cumulative across multiple delimited events', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const event = `data: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { blob: 'x'.repeat(40_000) } })}\n\n`;
+  await assert.rejects(runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async () => new Response(event + event, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+  }), /size limit/);
+});
+
+test('proxy write waits never hang when stdout closes synchronously inside write()', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const listeners = {};
+  const stdout = {
+    // close fires SYNCHRONOUSLY during write(): listeners registered only
+    // after a false return would miss it forever.
+    write: () => {
+      listeners.close?.();
+      return false;
+    },
+    once: (event, handler) => { listeners[event] = handler; },
+    removeListener: (event, handler) => { if (listeners[event] === handler) delete listeners[event]; },
+  };
+  const response = { jsonrpc: '2.0', id: 1, result: { tools: [] } };
+  await runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout,
+    fetchImpl: async () => new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } }),
+  });
+});
+
+test('persistent GET event channel enforces per-event limits only, not a cumulative cap', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  // Three valid ~30 KB events: 90 KB of session traffic against a 64 KB limit.
+  // A cumulative cap would truncate the channel; the per-event contract must
+  // deliver all three.
+  const events = [1, 2, 3]
+    .map(n => `data: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { n, pad: 'x'.repeat(30_000) } })}\n\n`)
+    .join('');
+  const written = [];
+  await runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_MAX_BODY_BYTES: '65536' },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout: { write: chunk => { written.push(chunk); return true; } },
+    fetchImpl: async (_url, options) => {
+      if (options.method === 'GET') {
+        return new Response(events, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      }
+      return new Response(null, { status: 202, headers: { 'mcp-session-id': 'session-1' } });
+    },
+  });
+  const notifications = written.map(line => JSON.parse(line)).filter(message => message.params?.n);
+  assert.deepEqual(notifications.map(message => message.params.n), [1, 2, 3]);
+});
+
+test('proxy POST requests carry an abort timeout signal', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const response = { jsonrpc: '2.0', id: 1, result: { tools: [] } };
+  let sawSignal = false;
+  await runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_TIMEOUT_MS: '5000' },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout: { write: () => {} },
+    fetchImpl: async (_url, options) => {
+      sawSignal = options.signal instanceof AbortSignal;
+      return new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  assert.equal(sawSignal, typeof AbortSignal?.timeout === 'function');
+});
+
 test('agentic proxy plans are workspace-only and command hints contain no credentials or remote URL', () => {
   const workspace = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
@@ -4529,7 +4685,7 @@ test('agentic proxy plans are workspace-only and command hints contain no creden
   assert.equal(plan.writes[0].path, path.join(workspace, '.roo', 'mcp.json'));
   assert.deepEqual(JSON.parse(plan.writes[0].content).mcpServers['spala-project'], {
     command: 'pnpm',
-    args: ['dlx', '@spala-ai/mcp-install@0.1.14', 'proxy', '--project-id', 'project-123'],
+    args: ['dlx', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
   });
   const commands = buildProxyCommandHints('spala-project', 'project-123');
   const serialized = JSON.stringify(commands);
@@ -4543,4 +4699,58 @@ test('agentic proxy plans are workspace-only and command hints contain no creden
   });
   assert.equal(unsupported.writes.length, 0);
   assert.equal(unsupported.skipped[0].unsupportedScope, true);
+});
+
+test('agentic proxy plans support claude-code and cursor as writable workspace clients', () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+
+  const claudePlan = createProxyInstallPlan({
+    clientSelection: 'claude-code',
+    cwd: workspace,
+    projectId: 'project-123',
+    serverName: 'spala-project',
+  });
+  assert.equal(claudePlan.installScope, 'workspace');
+  assert.equal(claudePlan.writes[0].path, path.join(workspace, '.mcp.json'));
+  assert.deepEqual(JSON.parse(claudePlan.writes[0].content).mcpServers['spala-project'], {
+    type: 'stdio',
+    command: 'npx',
+    args: ['--yes', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+  });
+
+  const cursorPlan = createProxyInstallPlan({
+    clientSelection: 'cursor',
+    cwd: workspace,
+    projectId: 'project-123',
+    serverName: 'spala-project',
+  });
+  assert.equal(cursorPlan.installScope, 'workspace');
+  assert.equal(cursorPlan.writes[0].path, path.join(workspace, '.cursor', 'mcp.json'));
+  assert.deepEqual(JSON.parse(cursorPlan.writes[0].content).mcpServers['spala-project'], {
+    command: 'npx',
+    args: ['--yes', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+  });
+
+  const serialized = JSON.stringify([claudePlan, cursorPlan]);
+  assert.doesNotMatch(serialized, /https?:|bearer|bootstrap/i);
+});
+
+test('unselected claude-code is skipped on workspace binds unless the client is detected', () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const undetected = createProxyInstallPlan({
+    cwd: workspace,
+    projectId: 'project-123',
+    serverName: 'spala-project',
+  });
+  assert.equal(undetected.writes.some(write => write.client === 'claude-code'), false);
+
+  fs.mkdirSync(path.join(workspace, '.claude'));
+  const detected = createProxyInstallPlan({
+    cwd: workspace,
+    projectId: 'project-123',
+    serverName: 'spala-project',
+  });
+  assert.equal(detected.writes.some(write => write.client === 'claude-code'), true);
 });

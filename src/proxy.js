@@ -1,10 +1,12 @@
 import readline from 'node:readline';
-import { readProjectCredential } from './credentialStore.js';
+import { projectCredentialStatus, readProjectCredential } from './credentialStore.js';
 import { findWorkspaceRoot } from './workspace.js';
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
-const DEFAULT_REQUEST_TIMEOUT_MS = 600_000;
+// Project MCP calls are interactive; a hung backend must surface quickly,
+// not stall the whole client for ten minutes.
+const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
 
 function boundedIntFromEnv(env, name, fallback, minimum, maximum) {
   const raw = Number.parseInt(env?.[name] ?? '', 10);
@@ -150,7 +152,17 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   if (typeof fetchImpl !== 'function') throw new Error('MCP proxy is unavailable in this Node runtime.');
   const maxBodyBytes = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES, 65_536, 1_073_741_824);
   const requestTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 3_600_000);
-  const credential = readProjectCredential(projectId, env, findWorkspaceRoot(cwd));
+  const workspaceRoot = findWorkspaceRoot(cwd);
+  // Missing credentials are a configuration error and still fail the spawn.
+  // An expired-but-present credential must NOT kill the proxy: the server
+  // stays up, requests answer with an actionable error, and a re-bind heals
+  // the live session without a client restart.
+  let credential = null;
+  if (projectCredentialStatus(projectId, env, workspaceRoot).status === 'expired') {
+    process.stderr?.write?.(`Spala MCP proxy: stored credential for project ${projectId} is expired; requests will error until the project is re-bound.\n`);
+  } else {
+    credential = readProjectCredential(projectId, env, workspaceRoot);
+  }
   let sessionId;
   let protocolVersion = DEFAULT_PROTOCOL_VERSION;
   let eventStream;
@@ -168,6 +180,27 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       }
       if (request?.method === 'initialize' && typeof request?.params?.protocolVersion === 'string') {
         protocolVersion = request.params.protocolVersion;
+      }
+      // Re-read the stored credential on every request. Long-lived proxies
+      // outlive short-TTL bearers; a re-bind refreshes the store and the
+      // running proxy must pick it up without a restart. When the credential
+      // is expired or missing, answer the request with an actionable JSON-RPC
+      // error instead of hanging against the backend or killing the process —
+      // a later re-bind then heals the live session.
+      try {
+        credential = readProjectCredential(projectId, env, workspaceRoot);
+      } catch (credentialError) {
+        if (request?.id !== undefined && request?.id !== null) {
+          await emitMessages([{
+            jsonrpc: '2.0',
+            id: request.id,
+            error: {
+              code: -32000,
+              message: `${credentialError instanceof Error ? credentialError.message : 'Stored project credential is unavailable.'} Re-run the project bind (project_connect) for project ${projectId}; the running proxy picks up fresh credentials automatically.`,
+            },
+          }], stdout);
+        }
+        continue;
       }
       const headers = {
         accept: 'application/json, text/event-stream',

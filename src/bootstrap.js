@@ -7,24 +7,67 @@ import {
 
 const MAX_BOOTSTRAP_CAPABILITY_BYTES = 16 * 1024;
 const ALLOWED_PROJECT_SCOPES = new Set(DEFAULT_PROJECT_SCOPE.split(','));
+const BOOTSTRAP_CAPABILITY_ID_PATTERN = /^[A-Za-z0-9_-]{1,512}$/;
 
 function isLocalHost(hostname) {
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname);
 }
 
-export function validateBootstrapUrl(rawUrl, projectUrl) {
+function hasAmbiguousPath(rawUrl, parsedUrl) {
+  return rawUrl.includes('\\')
+    || /%[0-9a-f]{2}/i.test(parsedUrl.pathname)
+    || /%2e/i.test(rawUrl)
+    || /\/{2,}/.test(parsedUrl.pathname)
+    || /\/\.{1,2}(?:\/|[?#]|$)/.test(rawUrl);
+}
+
+export function validateBootstrapUrl(rawUrl, mcpUrl) {
   if (typeof rawUrl !== 'string' || !rawUrl.trim()) throw new Error('Bootstrap capability did not contain a URL.');
-  const bootstrap = new URL(rawUrl.trim());
-  const project = new URL(projectUrl);
+  if (typeof mcpUrl !== 'string' || !mcpUrl.trim()) throw new Error('The requested MCP URL is invalid.');
+  let bootstrap;
+  let mcp;
+  const trimmedBootstrapUrl = rawUrl.trim();
+  const trimmedMcpUrl = mcpUrl.trim();
+  try {
+    bootstrap = new URL(trimmedBootstrapUrl);
+    mcp = new URL(trimmedMcpUrl);
+  } catch {
+    throw new Error('The bootstrap capability or requested MCP URL is invalid.');
+  }
   if (bootstrap.protocol !== 'https:' && !(bootstrap.protocol === 'http:' && isLocalHost(bootstrap.hostname))) {
     throw new Error('Bootstrap URL must use HTTPS, except localhost development URLs.');
   }
-  if (bootstrap.username || bootstrap.password || bootstrap.hash) {
+  if (bootstrap.username || bootstrap.password || bootstrap.hash || trimmedBootstrapUrl.includes('#')) {
     throw new Error('Bootstrap URL must not contain credentials or a fragment.');
   }
-  const projectPath = `${project.pathname.replace(/\/+$/, '')}/`;
-  if (bootstrap.origin !== project.origin || !`${bootstrap.pathname.replace(/\/+$/, '')}/`.startsWith(projectPath)) {
-    throw new Error('Bootstrap URL must belong to the exact project backend.');
+  if (bootstrap.search || trimmedBootstrapUrl.includes('?')) {
+    throw new Error('Bootstrap URL must not contain query parameters.');
+  }
+  if (mcp.protocol !== 'https:' && !(mcp.protocol === 'http:' && isLocalHost(mcp.hostname))) {
+    throw new Error('The requested MCP URL must use HTTPS, except localhost development URLs.');
+  }
+  if (mcp.username || mcp.password || mcp.hash || trimmedMcpUrl.includes('#')) {
+    throw new Error('The requested MCP URL must not contain credentials or a fragment.');
+  }
+  if ([...mcp.searchParams.keys()].some(key => key !== 'scope')) {
+    throw new Error('The requested MCP URL contains unsupported query parameters.');
+  }
+  if (hasAmbiguousPath(trimmedBootstrapUrl, bootstrap) || hasAmbiguousPath(trimmedMcpUrl, mcp)) {
+    throw new Error('Bootstrap and MCP URL paths must not contain encoded or ambiguous path segments.');
+  }
+
+  const mcpPath = mcp.pathname.replace(/\/+$/, '') || '/';
+  const capabilityPrefix = `${mcpPath}/agent-instructions/`;
+  if (bootstrap.origin !== mcp.origin || !bootstrap.pathname.startsWith(capabilityPrefix)) {
+    throw new Error('Bootstrap URL must belong to the exact requested MCP endpoint.');
+  }
+  const capabilityPath = bootstrap.pathname.slice(capabilityPrefix.length).split('/');
+  if (
+    capabilityPath.length !== 2
+    || !BOOTSTRAP_CAPABILITY_ID_PATTERN.test(capabilityPath[0])
+    || capabilityPath[1] !== 'consume'
+  ) {
+    throw new Error('Bootstrap URL must use the exact one-time capability consume path.');
   }
   return bootstrap.toString();
 }
@@ -160,8 +203,8 @@ function validateBootstrapScopes(requested, response) {
   }
 }
 
-export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, fetchImpl = globalThis.fetch }) {
-  const validatedUrl = validateBootstrapUrl(bootstrapUrl, projectUrl);
+export async function consumeBootstrap({ bootstrapUrl, mcpUrl, fetchImpl = globalThis.fetch }) {
+  const validatedUrl = validateBootstrapUrl(bootstrapUrl, mcpUrl);
   const requestedScopes = parseProjectScopeSet(mcpUrl, 'The requested MCP URL');
   if (typeof fetchImpl !== 'function') throw new Error('Bootstrap exchange is unavailable in this Node runtime.');
   let response;

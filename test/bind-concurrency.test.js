@@ -90,7 +90,7 @@ test('failed pending bind does not roll back a later successful concurrent bind'
   }), {
     SPALA_MCP_CREDENTIAL_HOME: credentialHome,
   }, workspace, quietStreams(Readable.from([
-    'https://concurrent-a.spala.ai/mcp/bootstrap/opaque/consume\n',
+    'https://concurrent-a.spala.ai/mcp/agent-instructions/opaque/consume\n',
   ])), {
     fetch: async () => {
       fetchStarted.resolve();
@@ -143,7 +143,7 @@ test('scoped bootstrap canonicalization cannot overwrite a later successful bind
   }), {
     SPALA_MCP_CREDENTIAL_HOME: credentialHome,
   }, workspace, quietStreams(Readable.from([
-    'https://canonical-concurrent-a.spala.ai/mcp/bootstrap/opaque/consume\n',
+    'https://canonical-concurrent-a.spala.ai/mcp/agent-instructions/opaque/consume\n',
   ])), {
     fetch: async () => {
       fetchStarted.resolve();
@@ -190,29 +190,28 @@ test('parent .spala swap after bootstrap consume preserves the replacement bindi
   const credentialHome = tempDirectory();
   fs.mkdirSync(path.join(workspace, '.git'));
 
-  const bareMcpUrl = 'https://parent-swap.spala.ai/mcp';
-  const scopedMcpUrl = `${bareMcpUrl}?scope=builder%2Cproject%2Cdata`;
+  const scopedMcpUrl = 'https://parent-swap.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
   const laterBinding = binding('parent-swap-winner');
   const spalaDirectory = path.join(workspace, '.spala');
   const displacedDirectory = path.join(workspace, '.spala-displaced');
-  const originalCopyFileSync = fs.copyFileSync;
+  const originalOpenSync = fs.openSync;
   let bootstrapConsumed = false;
-  let publicationReached = false;
+  let validationReached = false;
   let credentialPersistenceAttempts = 0;
 
-  fs.copyFileSync = (sourcePath, destinationPath, mode) => {
+  fs.openSync = (filePath, flags, mode) => {
     if (
-      !publicationReached
+      !validationReached
       && bootstrapConsumed
-      && path.basename(String(sourcePath)).startsWith('.project.json.revision-update-')
-      && path.basename(String(destinationPath)) === 'project.json'
+      && String(filePath) === 'project.json'
+      && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) === 0
     ) {
-      publicationReached = true;
+      validationReached = true;
       fs.renameSync(spalaDirectory, displacedDirectory);
       fs.mkdirSync(spalaDirectory, { mode: 0o700 });
       writeProjectBinding(workspace, laterBinding);
     }
-    return originalCopyFileSync(sourcePath, destinationPath, mode);
+    return originalOpenSync(filePath, flags, mode);
   };
 
   let bindError;
@@ -220,12 +219,12 @@ test('parent .spala swap after bootstrap consume preserves the replacement bindi
     bindError = await runCli(bindArgs({
       projectId: 'project-parent-swap',
       projectUrl: 'https://parent-swap.spala.ai/',
-      mcpUrl: bareMcpUrl,
+      mcpUrl: scopedMcpUrl,
       bootstrap: true,
     }), {
       SPALA_MCP_CREDENTIAL_HOME: credentialHome,
     }, workspace, quietStreams(Readable.from([
-      'https://parent-swap.spala.ai/mcp/bootstrap/opaque/consume\n',
+      'https://parent-swap.spala.ai/mcp/agent-instructions/opaque/consume\n',
     ])), {
       fetch: async () => {
         bootstrapConsumed = true;
@@ -244,16 +243,68 @@ test('parent .spala swap after bootstrap consume preserves the replacement bindi
       },
     }).then(() => null, error => error);
   } finally {
-    fs.copyFileSync = originalCopyFileSync;
+    fs.openSync = originalOpenSync;
   }
 
   assert.match(bindError?.message || '', /\.spala changed after it was inspected/);
   assert.doesNotMatch(bindError.message, /rollback was incomplete/);
   assert.equal(bootstrapConsumed, true);
-  assert.equal(publicationReached, true);
+  assert.equal(validationReached, true);
   assert.equal(credentialPersistenceAttempts, 0);
   assert.deepEqual(readProjectBinding(workspace).binding, laterBinding);
   assert.deepEqual(fs.readdirSync(displacedDirectory), []);
+});
+
+test('post-credential binding validation rejects success and preserves a concurrent winner', async () => {
+  const workspace = tempDirectory();
+  const credentialHome = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+
+  const scopedMcpUrl = 'https://post-credential.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
+  const winnerBinding = binding('post-credential-winner');
+  let stdout = '';
+  let credentialPersistenceAttempts = 0;
+
+  await assert.rejects(
+    runCli(bindArgs({
+      projectId: 'project-post-credential',
+      projectUrl: 'https://post-credential.spala.ai/',
+      mcpUrl: scopedMcpUrl,
+      bootstrap: true,
+    }), {
+      SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+    }, workspace, {
+      stdin: Readable.from([
+        'https://post-credential.spala.ai/mcp/agent-instructions/opaque/consume\n',
+      ]),
+      stdout: { write: value => { stdout += value; } },
+      stderr: { write: () => {} },
+    }, {
+      fetch: async () => new Response(JSON.stringify({
+        access_token: 'mcp_post_credential_test_secret',
+        token_type: 'Bearer',
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        mcp_url: scopedMcpUrl,
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+      storeProjectCredential: () => {
+        credentialPersistenceAttempts += 1;
+        writeProjectBinding(
+          workspace,
+          winnerBinding,
+          { switchProject: true },
+        );
+      },
+    }),
+    /Workspace binding changed while the project bind was pending/,
+  );
+
+  assert.equal(credentialPersistenceAttempts, 1);
+  assert.equal(stdout, '');
+  assert.deepEqual(readProjectBinding(workspace).binding, winnerBinding);
+  assert.deepEqual(fs.readdirSync(path.join(workspace, '.spala')), ['project.json']);
 });
 
 test('rollback preserves a writer landing after the isolated revision check', async t => {
@@ -274,7 +325,7 @@ test('rollback preserves a writer landing after the isolated revision check', as
       );
       const laterBinding = binding(`later-${testCase.name.replaceAll(' ', '-')}`);
       const filePath = path.join(workspace, '.spala', 'project.json');
-      const originalCopyFileSync = fs.copyFileSync;
+      const originalOpenSync = fs.openSync;
       const originalLstatSync = fs.lstatSync;
       const originalRenameSync = fs.renameSync;
       const originalUnlinkSync = fs.unlinkSync;
@@ -295,14 +346,15 @@ test('rollback preserves a writer landing after the isolated revision check', as
         injectedAction = action;
         writeProjectBinding(workspace, laterBinding, { switchProject: true });
       };
-      fs.copyFileSync = (sourcePath, destinationPath, mode) => {
+      fs.openSync = (targetPath, flags, mode) => {
         if (
-          path.basename(String(sourcePath)).startsWith('.project.json.rollback-restore-')
-          && path.basename(String(destinationPath)) === 'project.json'
+          testCase.previousBinding
+          && path.basename(String(targetPath)) === 'project.json'
+          && (flags & fs.constants.O_EXCL) !== 0
         ) {
-          injectLaterWriter('copy');
+          injectLaterWriter('open');
         }
-        return originalCopyFileSync(sourcePath, destinationPath, mode);
+        return originalOpenSync(targetPath, flags, mode);
       };
       fs.renameSync = (sourcePath, destinationPath) => {
         if (path.resolve(String(destinationPath)) === filePath) injectLaterWriter('rename');
@@ -323,7 +375,7 @@ test('rollback preserves a writer landing after the isolated revision check', as
           testCase.previousBinding,
         );
       } finally {
-        fs.copyFileSync = originalCopyFileSync;
+        fs.openSync = originalOpenSync;
         fs.lstatSync = originalLstatSync;
         fs.renameSync = originalRenameSync;
         fs.unlinkSync = originalUnlinkSync;
@@ -331,7 +383,7 @@ test('rollback preserves a writer landing after the isolated revision check', as
 
       assert.equal(
         injectedAction,
-        testCase.previousBinding ? 'copy' : 'unlink',
+        testCase.previousBinding ? 'open' : 'unlink',
         'the later writer must run immediately before rollback acts',
       );
       assert.deepEqual(readProjectBinding(workspace).binding, laterBinding);
@@ -372,39 +424,150 @@ test('binding publication and rollback do not depend on hard links', () => {
   assert.deepEqual(fs.readdirSync(path.join(workspace, '.spala')), ['project.json']);
 });
 
-test('binding publication aborts when a writer replaces the exclusive copy before verification', () => {
+test('binding publication cleans a partial exclusive write and restores the guarded binding', () => {
   const workspace = tempDirectory();
   fs.mkdirSync(path.join(workspace, '.git'));
-  const attemptedBinding = binding('post-copy-attempt');
-  const winnerBinding = binding('post-copy-winner');
-  const originalCopyFileSync = fs.copyFileSync;
-  let writerInjected = false;
+  const originalBinding = binding('partial-write-original');
+  const attemptedBinding = binding('partial-write-attempt');
+  writeProjectBinding(workspace, originalBinding);
 
-  fs.copyFileSync = (sourcePath, destinationPath, mode) => {
-    const result = originalCopyFileSync(sourcePath, destinationPath, mode);
+  const originalOpenSync = fs.openSync;
+  const originalWriteSync = fs.writeSync;
+  let publicationDescriptor;
+  let partialWriteInjected = false;
+
+  fs.openSync = (filePath, flags, mode) => {
+    const descriptor = originalOpenSync(filePath, flags, mode);
     if (
-      !writerInjected
-      && path.basename(String(sourcePath)).startsWith('.project.json.tmp-')
-      && path.basename(String(destinationPath)) === 'project.json'
+      !partialWriteInjected
+      && String(filePath) === 'project.json'
+      && (flags & fs.constants.O_EXCL) !== 0
     ) {
-      writerInjected = true;
-      const writerPath = `.project.json.writer-${process.pid}-${Date.now()}`;
-      fs.writeFileSync(
-        writerPath,
-        `${JSON.stringify(winnerBinding, null, 2)}\n`,
-        { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+      publicationDescriptor = descriptor;
+    }
+    return descriptor;
+  };
+  fs.writeSync = (descriptor, buffer, offset, length, position) => {
+    if (!partialWriteInjected && descriptor === publicationDescriptor) {
+      partialWriteInjected = true;
+      originalWriteSync(
+        descriptor,
+        buffer,
+        offset,
+        Math.min(length, 12),
+        position,
       );
-      fs.renameSync(writerPath, destinationPath);
+      throw new Error('injected partial exclusive-write failure');
+    }
+    return originalWriteSync(descriptor, buffer, offset, length, position);
+  };
+  try {
+    assert.throws(
+      () => writeProjectBinding(
+        workspace,
+        attemptedBinding,
+        { switchProject: true },
+      ),
+      /injected partial exclusive-write failure/,
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.writeSync = originalWriteSync;
+  }
+
+  assert.equal(partialWriteInjected, true);
+  assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+  assert.deepEqual(fs.readdirSync(path.join(workspace, '.spala')), ['project.json']);
+});
+
+test('binding publication removes its canonical name after a post-publication hardlink', () => {
+  const workspace = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const attemptedBinding = binding('post-publication-hardlink');
+  const filePath = path.join(workspace, '.spala', 'project.json');
+  const aliasPath = path.join(workspace, 'project-publication-alias.json');
+  const originalOpenSync = fs.openSync;
+  const originalFsyncSync = fs.fsyncSync;
+  let publicationDescriptor;
+  let hardlinkInjected = false;
+
+  fs.openSync = (targetPath, flags, mode) => {
+    const descriptor = originalOpenSync(targetPath, flags, mode);
+    if (
+      String(targetPath) === 'project.json'
+      && (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      publicationDescriptor = descriptor;
+    }
+    return descriptor;
+  };
+  fs.fsyncSync = descriptor => {
+    const result = originalFsyncSync(descriptor);
+    if (!hardlinkInjected && descriptor === publicationDescriptor) {
+      hardlinkInjected = true;
+      fs.linkSync(filePath, aliasPath);
     }
     return result;
   };
   try {
     assert.throws(
       () => writeProjectBinding(workspace, attemptedBinding),
-      /Workspace binding changed while the project bind was pending/,
+      /changed while it was being published|hard-linked/,
     );
   } finally {
-    fs.copyFileSync = originalCopyFileSync;
+    fs.openSync = originalOpenSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  assert.equal(hardlinkInjected, true);
+  assert.equal(fs.existsSync(filePath), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(aliasPath, 'utf8')), attemptedBinding);
+  assert.deepEqual(fs.readdirSync(path.join(workspace, '.spala')), []);
+});
+
+test('binding publication preserves a concurrent winner replacing its owned descriptor', () => {
+  const workspace = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const attemptedBinding = binding('descriptor-attempt');
+  const winnerBinding = binding('descriptor-winner');
+  const originalOpenSync = fs.openSync;
+  const originalWriteSync = fs.writeSync;
+  let publicationDescriptor;
+  let writerInjected = false;
+
+  fs.openSync = (filePath, flags, mode) => {
+    const descriptor = originalOpenSync(filePath, flags, mode);
+    if (
+      !writerInjected
+      && String(filePath) === 'project.json'
+      && (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      publicationDescriptor = descriptor;
+    }
+    return descriptor;
+  };
+  fs.writeSync = (descriptor, buffer, offset, length, position) => {
+    if (!writerInjected && descriptor === publicationDescriptor) {
+      writerInjected = true;
+      const writerPath = `.project.json.writer-${process.pid}-${Date.now()}`;
+      fs.unlinkSync('project.json');
+      fs.writeFileSync(
+        writerPath,
+        `${JSON.stringify(winnerBinding, null, 2)}\n`,
+        { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+      );
+      fs.renameSync(writerPath, 'project.json');
+    }
+    return originalWriteSync(descriptor, buffer, offset, length, position);
+  };
+  try {
+    assert.throws(
+      () => writeProjectBinding(workspace, attemptedBinding),
+      /changed while it was being published/,
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.writeSync = originalWriteSync;
   }
 
   assert.equal(writerInjected, true);
@@ -412,7 +575,7 @@ test('binding publication aborts when a writer replaces the exclusive copy befor
   assert.deepEqual(fs.readdirSync(path.join(workspace, '.spala')), ['project.json']);
 });
 
-test('rollback rejects symbolic and hard-linked binding targets without moving them', async t => {
+test('rollback rejects symbolic targets and removes only an expected hardlinked canonical name', async t => {
   await t.test('symbolic link', () => {
     const workspace = tempDirectory();
     fs.mkdirSync(path.join(workspace, '.git'));
@@ -433,20 +596,28 @@ test('rollback rejects symbolic and hard-linked binding targets without moving t
   await t.test('hard link', () => {
     const workspace = tempDirectory();
     fs.mkdirSync(path.join(workspace, '.git'));
-    const failedWrite = writeProjectBinding(workspace, binding('rollback-hardlink'));
+    const originalBinding = binding('rollback-hardlink-original');
+    const attemptedBinding = binding('rollback-hardlink-attempt');
+    writeProjectBinding(workspace, originalBinding);
+    const failedWrite = writeProjectBinding(
+      workspace,
+      attemptedBinding,
+      { switchProject: true },
+    );
     const filePath = path.join(workspace, '.spala', 'project.json');
     const aliasPath = path.join(workspace, 'project-alias.json');
     fs.linkSync(filePath, aliasPath);
 
-    assert.throws(
-      () => rollbackProjectBinding(workspace, failedWrite.revision),
-      /hard-linked/,
+    const result = rollbackProjectBinding(
+      workspace,
+      failedWrite.revision,
+      originalBinding,
     );
-    const targetStat = fs.statSync(filePath, { bigint: true });
+    assert.equal(result.changed, true);
+    assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
     const aliasStat = fs.statSync(aliasPath, { bigint: true });
-    assert.equal(targetStat.ino, aliasStat.ino);
-    assert.equal(targetStat.nlink, 2n);
-    assert.deepEqual(JSON.parse(fs.readFileSync(filePath, 'utf8')), binding('rollback-hardlink'));
+    assert.equal(aliasStat.nlink, 1n);
+    assert.deepEqual(JSON.parse(fs.readFileSync(aliasPath, 'utf8')), attemptedBinding);
   });
 });
 

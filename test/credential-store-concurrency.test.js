@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import properLockfile from 'proper-lockfile';
 import * as credentialStore from '../src/credentialStore.js';
 
@@ -14,7 +14,10 @@ const {
   storeProjectCredential,
 } = credentialStore;
 const WORKER_FLAG = '--credential-store-worker';
+const VERSION_015_COMMIT = 'bd7b94e47855f2dc1544fc47e10528261211d504';
 const WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+let version015ModulePath;
 
 function waitForRelease(releasePath) {
   const deadline = Date.now() + 10_000;
@@ -57,25 +60,70 @@ function installLockHooks(options) {
   };
 }
 
-function runWorker(options) {
+function prepareVersion015Module() {
+  if (version015ModulePath) return version015ModulePath;
+  const fixtureRoot = tempHome();
+  const archivePath = path.join(fixtureRoot, 'mcp-install-0.1.15.tar');
+  execFileSync(
+    'git',
+    ['archive', '--format=tar', `--output=${archivePath}`, VERSION_015_COMMIT],
+    { cwd: REPOSITORY_ROOT },
+  );
+  execFileSync('tar', ['-xf', archivePath, '-C', fixtureRoot]);
+  version015ModulePath = path.join(fixtureRoot, 'src', 'credentialStore.js');
+  return version015ModulePath;
+}
+
+async function runWorker(options) {
   const env = { SPALA_MCP_CREDENTIAL_HOME: options.credentialHome };
   const storePath = credentialStorePath(env);
+
+  if (options.writerVersion === '0.1.15') {
+    const renameSync = fs.renameSync;
+    if (options.pauseBeforeLegacyRename) {
+      fs.renameSync = (source, destination, ...args) => {
+        if (
+          typeof source === 'string'
+          && path.basename(source).startsWith('.mcp-credentials.tmp-')
+          && destination === storePath
+        ) {
+          writeMarker(options.markerPath);
+          waitForRelease(options.releasePath);
+          const result = renameSync(source, destination, ...args);
+          if (options.landedPath) writeMarker(options.landedPath);
+          return result;
+        }
+        return renameSync(source, destination, ...args);
+      };
+    }
+    const legacyStore = await import(pathToFileURL(options.version015ModulePath).href);
+    const result = legacyStore.storeProjectCredential({
+      projectId: options.projectId,
+      mcpUrl: `https://${options.projectId}.spala.test/mcp`,
+      bearerToken: options.bearerToken,
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    }, env);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+
   installLockHooks(options);
 
-  if (options.pauseBeforePublication) {
-    const copyFileSync = fs.copyFileSync;
+  if (options.pauseBeforeExclusiveCreation) {
+    const openSync = fs.openSync;
     let paused = false;
-    fs.copyFileSync = (source, destination, mode) => {
+    fs.openSync = (file, flags, ...args) => {
       if (
         !paused
-        && destination === path.basename(storePath)
-        && path.basename(source).startsWith('.mcp-credentials.tmp-')
+        && file === path.basename(storePath)
+        && (flags & fs.constants.O_CREAT) !== 0
+        && (flags & fs.constants.O_EXCL) !== 0
       ) {
         paused = true;
         writeMarker(options.markerPath);
         waitForRelease(options.releasePath);
       }
-      return copyFileSync(source, destination, mode);
+      return openSync(file, flags, ...args);
     };
   }
 
@@ -90,7 +138,7 @@ function runWorker(options) {
 
 if (process.argv[2] === WORKER_FLAG) {
   try {
-    runWorker(JSON.parse(process.argv[3]));
+    await runWorker(JSON.parse(process.argv[3]));
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     process.exitCode = 1;
@@ -240,7 +288,7 @@ if (process.argv[2] !== WORKER_FLAG) test('overlapping process writers serialize
     credentialHome,
     projectId: 'concurrent-project-a',
     bearerToken: 'mcp_concurrent_a',
-    pauseBeforePublication: true,
+    pauseBeforeExclusiveCreation: true,
     markerPath: firstMarker,
     releasePath: firstRelease,
   });
@@ -410,34 +458,41 @@ if (process.argv[2] !== WORKER_FLAG) test('credential lock chmod stays anchored 
   assert.equal(readProjectCredential(existingProject, env).bearerToken, existingBearer);
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('credential write rejects a parent swap during temporary creation and removes the empty artifact', {
+if (process.argv[2] !== WORKER_FLAG) test('exclusive credential creation stays anchored during a parent swap', {
   skip: process.platform === 'win32',
 }, () => {
   const credentialHome = tempHome();
   const outside = tempHome();
   const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
-  const protectedBearer = 'mcp_temp_creation_protected';
-  storeFixtureCredential(credentialHome, 'existing-temp-create-project', 'mcp_existing_temp_create');
+  const protectedBearer = 'mcp_exclusive_creation_protected';
+  const existingProject = 'existing-exclusive-create-project';
+  const existingBearer = 'mcp_existing_exclusive_create';
+  storeFixtureCredential(credentialHome, existingProject, existingBearer);
   const storePath = credentialStorePath(env);
 
   const openSync = fs.openSync;
+  const renameSync = fs.renameSync;
   let swapped;
   let hookReached = false;
   fs.openSync = (file, flags, ...args) => {
     if (
       !hookReached
-      && typeof file === 'string'
-      && file.startsWith('.mcp-credentials.tmp-')
+      && file === path.basename(storePath)
       && (flags & fs.constants.O_CREAT) !== 0
+      && (flags & fs.constants.O_EXCL) !== 0
     ) {
       hookReached = true;
-      swapped = swapCredentialDirectory(storePath, outside);
+      swapped = swapCredentialDirectory(storePath, outside, renameSync);
     }
     return openSync(file, flags, ...args);
   };
   try {
     assert.throws(
-      () => storeFixtureCredential(credentialHome, 'temp-create-project', protectedBearer),
+      () => storeFixtureCredential(
+        credentialHome,
+        'exclusive-create-project',
+        protectedBearer,
+      ),
       /credential directory changed after it was inspected/,
     );
     assert.equal(hookReached, true);
@@ -452,9 +507,11 @@ if (process.argv[2] !== WORKER_FLAG) test('credential write rejects a parent swa
     fs.openSync = openSync;
     swapped?.restore();
   }
+
+  assert.equal(readProjectCredential(existingProject, env).bearerToken, existingBearer);
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('credential write cleans a bearer temp after an active parent swap during descriptor write', {
+if (process.argv[2] !== WORKER_FLAG) test('descriptor credential write recovers after an active parent swap', {
   skip: process.platform === 'win32',
 }, () => {
   const credentialHome = tempHome();
@@ -464,19 +521,19 @@ if (process.argv[2] !== WORKER_FLAG) test('credential write cleans a bearer temp
   storeFixtureCredential(credentialHome, 'existing-temp-write-project', 'mcp_existing_temp_write');
   const storePath = credentialStorePath(env);
 
-  const writeFileSync = fs.writeFileSync;
+  const writeSync = fs.writeSync;
   let swapped;
   let hookReached = false;
-  fs.writeFileSync = (file, data, ...args) => {
+  fs.writeSync = (descriptor, data, ...args) => {
     if (
       !hookReached
-      && typeof file === 'number'
-      && String(data).includes(protectedBearer)
+      && Buffer.isBuffer(data)
+      && data.includes(Buffer.from(protectedBearer))
     ) {
       hookReached = true;
       swapped = swapCredentialDirectory(storePath, outside);
     }
-    return writeFileSync(file, data, ...args);
+    return writeSync(descriptor, data, ...args);
   };
   try {
     assert.throws(
@@ -492,116 +549,17 @@ if (process.argv[2] !== WORKER_FLAG) test('credential write cleans a bearer temp
       false,
     );
   } finally {
-    fs.writeFileSync = writeFileSync;
-    swapped?.restore();
-  }
-});
-
-if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a parent swap at exclusive copy and removes the published bearer', {
-  skip: process.platform === 'win32',
-}, () => {
-  const credentialHome = tempHome();
-  const outside = tempHome();
-  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
-  const protectedBearer = 'mcp_final_rename_protected';
-  storeFixtureCredential(credentialHome, 'existing-final-rename-project', 'mcp_existing_final_rename');
-  const storePath = credentialStorePath(env);
-  const originalBody = fs.readFileSync(storePath, 'utf8');
-
-  const copyFileSync = fs.copyFileSync;
-  const renameSync = fs.renameSync;
-  let swapped;
-  let hookReached = false;
-  fs.copyFileSync = (source, destination, mode) => {
-    if (
-      !hookReached
-      && typeof source === 'string'
-      && source.startsWith('.mcp-credentials.tmp-')
-      && destination === path.basename(storePath)
-    ) {
-      hookReached = true;
-      swapped = swapCredentialDirectory(storePath, outside, renameSync);
-    }
-    return copyFileSync(source, destination, mode);
-  };
-  try {
-    assert.throws(
-      () => storeFixtureCredential(credentialHome, 'final-rename-project', protectedBearer),
-      /credential directory changed after it was inspected/,
-    );
-    assert.equal(hookReached, true);
-    assertNoCredentialArtifacts(swapped.parkedDirectory);
-    assertTreeDoesNotContain(outside, protectedBearer);
-    assertTreeDoesNotContain(swapped.parkedDirectory, protectedBearer);
-    assert.equal(fs.existsSync(path.join(outside, path.basename(storePath))), false);
-    assert.equal(
-      fs.readFileSync(path.join(swapped.parkedDirectory, path.basename(storePath)), 'utf8'),
-      originalBody,
-    );
-    assert.equal(
-      fs.existsSync(path.join(swapped.parkedDirectory, `${path.basename(storePath)}.lock`)),
-      false,
-    );
-  } finally {
-    fs.copyFileSync = copyFileSync;
+    fs.writeSync = writeSync;
     swapped?.restore();
   }
 
   assert.equal(
-    readProjectCredential('existing-final-rename-project', env).bearerToken,
-    'mcp_existing_final_rename',
+    readProjectCredential('existing-temp-write-project', env).bearerToken,
+    'mcp_existing_temp_write',
   );
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('credential publication restores a missing target after a parent swap at exclusive copy', {
-  skip: process.platform === 'win32',
-}, () => {
-  const credentialHome = tempHome();
-  const outside = tempHome();
-  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
-  const protectedBearer = 'mcp_missing_final_rename_protected';
-  const storePath = credentialStorePath(env);
-
-  const copyFileSync = fs.copyFileSync;
-  const renameSync = fs.renameSync;
-  let swapped;
-  let hookReached = false;
-  fs.copyFileSync = (source, destination, mode) => {
-    if (
-      !hookReached
-      && typeof source === 'string'
-      && source.startsWith('.mcp-credentials.tmp-')
-      && destination === path.basename(storePath)
-    ) {
-      hookReached = true;
-      swapped = swapCredentialDirectory(storePath, outside, renameSync);
-    }
-    return copyFileSync(source, destination, mode);
-  };
-  try {
-    assert.throws(
-      () => storeFixtureCredential(credentialHome, 'missing-final-rename-project', protectedBearer),
-      /credential directory changed after it was inspected/,
-    );
-    assert.equal(hookReached, true);
-    assertNoCredentialArtifacts(swapped.parkedDirectory);
-    assertTreeDoesNotContain(outside, protectedBearer);
-    assertTreeDoesNotContain(swapped.parkedDirectory, protectedBearer);
-    assert.equal(fs.existsSync(path.join(outside, path.basename(storePath))), false);
-    assert.equal(fs.existsSync(path.join(swapped.parkedDirectory, path.basename(storePath))), false);
-    assert.equal(
-      fs.existsSync(path.join(swapped.parkedDirectory, `${path.basename(storePath)}.lock`)),
-      false,
-    );
-  } finally {
-    fs.copyFileSync = copyFileSync;
-    swapped?.restore();
-  }
-
-  assert.equal(fs.existsSync(storePath), false);
-});
-
-if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a same-inode revision changed at the isolation boundary', {
+if (process.argv[2] !== WORKER_FLAG) test('credential publication merges a same-inode revision changed at isolation', {
   skip: process.platform === 'win32',
 }, () => {
   const credentialHome = tempHome();
@@ -609,6 +567,7 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a sa
   const protectedBearer = 'mcp_revision_guard_protected';
   const concurrentBearer = 'mcp_revision_guard_concurrent';
   const projectId = 'revision-guard-project';
+  const newProject = 'new-revision-guard-project';
   storeFixtureCredential(credentialHome, projectId, 'mcp_revision_guard_original');
   const storePath = credentialStorePath(env);
   const concurrentStore = JSON.parse(fs.readFileSync(storePath, 'utf8'));
@@ -630,84 +589,363 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a sa
     return renameSync(source, destination, ...args);
   };
   try {
-    assert.throws(
-      () => storeFixtureCredential(credentialHome, 'new-revision-guard-project', protectedBearer),
-      /credential store changed after it was inspected/,
+    const result = storeFixtureCredential(
+      credentialHome,
+      newProject,
+      protectedBearer,
     );
+    assert.equal(result.changed, true);
+    assert.equal(hookReached, true);
   } finally {
     fs.renameSync = renameSync;
   }
 
-  assert.equal(hookReached, true);
-  assert.equal(fs.readFileSync(storePath, 'utf8'), concurrentBody);
   assert.equal(readProjectCredential(projectId, env).bearerToken, concurrentBearer);
-  assertTreeDoesNotContain(path.dirname(storePath), protectedBearer);
+  assert.equal(readProjectCredential(newProject, env).bearerToken, protectedBearer);
   assertNoCredentialArtifacts(path.dirname(storePath));
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('exclusive publication preserves a legacy atomic writer in the final publication window', () => {
+if (process.argv[2] !== WORKER_FLAG) test('publication merges the actual 0.1.15 writer that reads the isolated missing name', async () => {
   const credentialHome = tempHome();
   const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
-  const existingProject = 'legacy-window-existing-project';
-  const concurrentProject = 'legacy-window-concurrent-project';
-  const protectedBearer = 'mcp_legacy_window_must_not_publish';
-  const concurrentBearer = 'mcp_legacy_window_concurrent';
-  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-  storeFixtureCredential(credentialHome, existingProject, 'mcp_legacy_window_existing');
+  const existingProject = 'legacy-missing-existing-project';
+  const legacyProject = 'legacy-missing-concurrent-project';
+  const intendedProject = 'legacy-missing-intended-project';
+  const existingBearer = 'mcp_legacy_missing_existing';
+  const legacyBearer = 'mcp_legacy_missing_concurrent';
+  const intendedBearer = 'mcp_legacy_missing_intended';
+  storeFixtureCredential(credentialHome, existingProject, existingBearer);
   const storePath = credentialStorePath(env);
-  const directory = path.dirname(storePath);
-  const legacyStore = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-  legacyStore.projects[concurrentProject] = {
-    mcpUrl: `https://${concurrentProject}.spala.test/mcp`,
-    bearerToken: concurrentBearer,
-    expiresAt,
-    status: 'active',
-  };
-  const legacyBody = `${JSON.stringify(legacyStore, null, 2)}\n`;
-  const legacyTemporary = `.mcp-credentials.legacy-${process.pid}-${Date.now()}`;
+  const legacyStore = await import(pathToFileURL(prepareVersion015Module()).href);
 
-  const copyFileSync = fs.copyFileSync;
-  const renameSync = fs.renameSync;
+  const openSync = fs.openSync;
   let hookReached = false;
-  fs.copyFileSync = (source, destination, mode) => {
+  fs.openSync = (file, flags, ...args) => {
     if (
       !hookReached
-      && typeof source === 'string'
-      && source.startsWith('.mcp-credentials.tmp-')
-      && destination === path.basename(storePath)
-      && mode === fs.constants.COPYFILE_EXCL
+      && file === path.basename(storePath)
+      && (flags & fs.constants.O_CREAT) !== 0
+      && (flags & fs.constants.O_EXCL) !== 0
     ) {
       hookReached = true;
-      fs.writeFileSync(legacyTemporary, legacyBody, { flag: 'wx', mode: 0o600 });
-      renameSync(legacyTemporary, destination);
+      legacyStore.storeProjectCredential({
+        projectId: legacyProject,
+        mcpUrl: `https://${legacyProject}.spala.test/mcp`,
+        bearerToken: legacyBearer,
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      }, env);
     }
-    return copyFileSync(source, destination, mode);
+    return openSync(file, flags, ...args);
+  };
+  try {
+    const result = storeFixtureCredential(
+      credentialHome,
+      intendedProject,
+      intendedBearer,
+    );
+    assert.equal(result.changed, true);
+    assert.equal(hookReached, true);
+  } finally {
+    fs.openSync = openSync;
+  }
+
+  assert.equal(readProjectCredential(existingProject, env).bearerToken, existingBearer);
+  assert.equal(readProjectCredential(legacyProject, env).bearerToken, legacyBearer);
+  assert.equal(readProjectCredential(intendedProject, env).bearerToken, intendedBearer);
+  assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('publication recovers an actual 0.1.15 rename during guard cleanup', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const existingProject = 'legacy-cleanup-existing-project';
+  const legacyProject = 'legacy-cleanup-concurrent-project';
+  const intendedProject = 'legacy-cleanup-intended-project';
+  const markerPath = path.join(coordination, 'legacy-ready');
+  const releasePath = path.join(coordination, 'release-legacy');
+  const landedPath = path.join(coordination, 'legacy-landed');
+  storeFixtureCredential(credentialHome, existingProject, 'mcp_legacy_cleanup_existing');
+  const storePath = credentialStorePath(env);
+  const legacy = startWorker({
+    credentialHome,
+    writerVersion: '0.1.15',
+    version015ModulePath: prepareVersion015Module(),
+    projectId: legacyProject,
+    bearerToken: 'mcp_legacy_cleanup_concurrent',
+    pauseBeforeLegacyRename: true,
+    markerPath,
+    releasePath,
+    landedPath,
+  });
+  await waitForPath(markerPath, legacy);
+
+  const unlinkSync = fs.unlinkSync;
+  let hookReached = false;
+  fs.unlinkSync = file => {
+    if (
+      !hookReached
+      && typeof file === 'string'
+      && file.startsWith('.mcp-credentials.restore-')
+    ) {
+      hookReached = true;
+      writeMarker(releasePath);
+      waitForRelease(landedPath);
+    }
+    return unlinkSync(file);
+  };
+  let result;
+  try {
+    result = storeFixtureCredential(
+      credentialHome,
+      intendedProject,
+      'mcp_legacy_cleanup_intended',
+    );
+  } finally {
+    fs.unlinkSync = unlinkSync;
+  }
+  const legacyResult = await legacy.exited;
+  assertSuccessfulWorker(legacyResult);
+
+  assert.equal(hookReached, true);
+  assert.equal(result.changed, true);
+  assert.equal(
+    readProjectCredential(existingProject, env).bearerToken,
+    'mcp_legacy_cleanup_existing',
+  );
+  assert.equal(
+    readProjectCredential(legacyProject, env).bearerToken,
+    'mcp_legacy_cleanup_concurrent',
+  );
+  assert.equal(
+    readProjectCredential(intendedProject, env).bearerToken,
+    'mcp_legacy_cleanup_intended',
+  );
+  assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('same-project conflict is resolved in favor of the verified current operation', async () => {
+  const credentialHome = tempHome();
+  const coordination = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'legacy-same-project';
+  const markerPath = path.join(coordination, 'legacy-ready');
+  const releasePath = path.join(coordination, 'release-legacy');
+  const landedPath = path.join(coordination, 'legacy-landed');
+  storeFixtureCredential(credentialHome, projectId, 'mcp_legacy_same_original');
+  const storePath = credentialStorePath(env);
+  const legacy = startWorker({
+    credentialHome,
+    writerVersion: '0.1.15',
+    version015ModulePath: prepareVersion015Module(),
+    projectId,
+    bearerToken: 'mcp_legacy_same_concurrent',
+    pauseBeforeLegacyRename: true,
+    markerPath,
+    releasePath,
+    landedPath,
+  });
+  await waitForPath(markerPath, legacy);
+
+  const unlinkSync = fs.unlinkSync;
+  let hookReached = false;
+  fs.unlinkSync = file => {
+    if (
+      !hookReached
+      && typeof file === 'string'
+      && file.startsWith('.mcp-credentials.restore-')
+    ) {
+      hookReached = true;
+      writeMarker(releasePath);
+      waitForRelease(landedPath);
+    }
+    return unlinkSync(file);
+  };
+  let result;
+  try {
+    result = storeFixtureCredential(
+      credentialHome,
+      projectId,
+      'mcp_legacy_same_intended',
+    );
+  } finally {
+    fs.unlinkSync = unlinkSync;
+  }
+  const legacyResult = await legacy.exited;
+  assertSuccessfulWorker(legacyResult);
+
+  assert.equal(hookReached, true);
+  assert.equal(result.changed, true);
+  assert.equal(readProjectCredential(projectId, env).bearerToken, 'mcp_legacy_same_intended');
+  assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('partial exclusive descriptor failure restores the prior canonical revision', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'partial-write-project';
+  const protectedBearer = 'mcp_partial_write_rejected';
+  storeFixtureCredential(credentialHome, projectId, 'mcp_partial_write_original');
+  const storePath = credentialStorePath(env);
+  const originalBody = fs.readFileSync(storePath, 'utf8');
+
+  const openSync = fs.openSync;
+  const writeSync = fs.writeSync;
+  let canonicalDescriptor;
+  let hookReached = false;
+  fs.openSync = (file, flags, ...args) => {
+    const descriptor = openSync(file, flags, ...args);
+    if (
+      file === path.basename(storePath)
+      && (flags & fs.constants.O_CREAT) !== 0
+      && (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      canonicalDescriptor = descriptor;
+    }
+    return descriptor;
+  };
+  fs.writeSync = (descriptor, data, offset, length, ...args) => {
+    if (
+      !hookReached
+      && descriptor === canonicalDescriptor
+      && Buffer.isBuffer(data)
+      && data.includes(Buffer.from(protectedBearer))
+    ) {
+      hookReached = true;
+      if (process.platform !== 'win32') {
+        assert.equal(fs.fstatSync(descriptor).mode & 0o777, 0o000);
+        assert.equal(fs.lstatSync(storePath).mode & 0o777, 0o000);
+      }
+      writeSync(descriptor, data, offset, Math.max(1, Math.floor(length / 2)), ...args);
+      const error = new Error('Injected partial exclusive descriptor failure.');
+      error.code = 'EIO';
+      throw error;
+    }
+    return writeSync(descriptor, data, offset, length, ...args);
   };
   try {
     assert.throws(
-      () => storeFixtureCredential(
-        credentialHome,
-        'legacy-window-new-project',
-        protectedBearer,
-      ),
-      /credential store changed after it was inspected/,
+      () => storeFixtureCredential(credentialHome, projectId, protectedBearer),
+      /Injected partial exclusive descriptor failure/,
     );
   } finally {
-    fs.copyFileSync = copyFileSync;
+    fs.openSync = openSync;
+    fs.writeSync = writeSync;
   }
 
   assert.equal(hookReached, true);
-  assert.equal(fs.readFileSync(storePath, 'utf8'), legacyBody);
+  assert.equal(fs.readFileSync(storePath, 'utf8'), originalBody);
+  assert.equal(readProjectCredential(projectId, env).bearerToken, 'mcp_partial_write_original');
+  assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('post-write hardlink failure does not leave the rejected credential canonical', {
+  skip: process.platform === 'win32',
+}, () => {
+  const credentialHome = tempHome();
+  const outside = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectId = 'post-write-hardlink-project';
+  const protectedBearer = 'mcp_post_write_hardlink_rejected';
+  storeFixtureCredential(credentialHome, projectId, 'mcp_post_write_hardlink_original');
+  const storePath = credentialStorePath(env);
+  const originalBody = fs.readFileSync(storePath, 'utf8');
+  const secondLink = path.join(outside, 'rejected-credential-link.json');
+
+  const openSync = fs.openSync;
+  const fchmodSync = fs.fchmodSync;
+  let canonicalDescriptor;
+  let hookReached = false;
+  fs.openSync = (file, flags, ...args) => {
+    const descriptor = openSync(file, flags, ...args);
+    if (
+      file === path.basename(storePath)
+      && (flags & fs.constants.O_CREAT) !== 0
+      && (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      canonicalDescriptor = descriptor;
+    }
+    return descriptor;
+  };
+  fs.fchmodSync = (descriptor, mode) => {
+    const result = fchmodSync(descriptor, mode);
+    if (!hookReached && descriptor === canonicalDescriptor && mode === 0o600) {
+      hookReached = true;
+      fs.linkSync(storePath, secondLink);
+    }
+    return result;
+  };
+  try {
+    assert.throws(
+      () => storeFixtureCredential(credentialHome, projectId, protectedBearer),
+      /multiple hard links/,
+    );
+  } finally {
+    fs.openSync = openSync;
+    fs.fchmodSync = fchmodSync;
+  }
+
+  assert.equal(hookReached, true);
+  assert.equal(fs.readFileSync(storePath, 'utf8'), originalBody);
   assert.equal(
-    readProjectCredential(existingProject, env).bearerToken,
-    'mcp_legacy_window_existing',
+    readProjectCredential(projectId, env).bearerToken,
+    'mcp_post_write_hardlink_original',
   );
-  assert.equal(
-    readProjectCredential(concurrentProject, env).bearerToken,
-    concurrentBearer,
-  );
-  assertTreeDoesNotContain(directory, protectedBearer);
-  assertNoCredentialArtifacts(directory);
+  assert.equal(fs.readFileSync(secondLink, 'utf8').includes(protectedBearer), true);
+  assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('bounded publication contention fails closed and retains every valid guarded project', async () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const existingProject = 'bounded-existing-project';
+  const legacyProject = 'bounded-legacy-project';
+  const intendedProject = 'bounded-intended-project';
+  const existingBearer = 'mcp_bounded_existing';
+  const legacyBearer = 'mcp_bounded_legacy';
+  const intendedBearer = 'mcp_bounded_intended';
+  storeFixtureCredential(credentialHome, existingProject, existingBearer);
+  const storePath = credentialStorePath(env);
+  const legacyStore = await import(pathToFileURL(prepareVersion015Module()).href);
+
+  const openSync = fs.openSync;
+  let collisionCount = 0;
+  fs.openSync = (file, flags, ...args) => {
+    if (
+      file === path.basename(storePath)
+      && (flags & fs.constants.O_CREAT) !== 0
+      && (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      collisionCount += 1;
+      legacyStore.storeProjectCredential({
+        projectId: legacyProject,
+        mcpUrl: `https://${legacyProject}.spala.test/mcp`,
+        bearerToken: legacyBearer,
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      }, env);
+    }
+    return openSync(file, flags, ...args);
+  };
+  try {
+    assert.throws(
+      () => storeFixtureCredential(credentialHome, intendedProject, intendedBearer),
+      /changed too many times during publication/,
+    );
+  } finally {
+    fs.openSync = openSync;
+  }
+
+  assert.equal(collisionCount, 16);
+  assert.equal(readProjectCredential(legacyProject, env).bearerToken, legacyBearer);
+  assert.throws(() => readProjectCredential(intendedProject, env), /No agentic MCP credential/);
+
+  const guardedStores = fs.readdirSync(path.dirname(storePath))
+    .filter(name => name.startsWith('.mcp-credentials.restore-'))
+    .map(name => JSON.parse(fs.readFileSync(path.join(path.dirname(storePath), name), 'utf8')));
+  assert.ok(guardedStores.some(store => (
+    store.projects[existingProject]?.bearerToken === existingBearer
+  )));
+  assert.equal(guardedStores.some(store => Object.hasOwn(store.projects, intendedProject)), false);
 });
 
 if (process.argv[2] !== WORKER_FLAG) test('a hard-linked credential store fails closed', {

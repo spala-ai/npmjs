@@ -24,7 +24,7 @@ import {
   serverNameFromUrl,
 } from '../src/installer.js';
 import { CODEX_SPALA_SKILL } from '../src/codexSkill.js';
-import { consumeBootstrap } from '../src/bootstrap.js';
+import { consumeBootstrap, validateBootstrapUrl } from '../src/bootstrap.js';
 import { credentialStorePath, projectCredentialStatus, readProjectCredential, storeProjectCredential } from '../src/credentialStore.js';
 import { runProxy } from '../src/proxy.js';
 import { Readable } from 'node:stream';
@@ -4226,7 +4226,7 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   fs.mkdirSync(path.join(workspace, '.git'));
   fs.mkdirSync(path.join(workspace, '.codex'), { recursive: true });
   fs.writeFileSync(path.join(workspace, '.codex', 'config.toml'), '[projects]\ntrust_level = "trusted"\n');
-  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/bootstrap/consume/one-time-id?nonce=opaque';
+  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_one-time-id/consume';
   const bearerToken = 'mcp_test_secret_that_must_never_leak';
   let calls = 0;
   let output = '';
@@ -4268,12 +4268,12 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   assert.equal(payload.agenticCredentialConfigured, true);
   assert.equal(payload.plan.proxy.transport, 'stdio');
   assert.doesNotMatch(output, new RegExp(bearerToken));
-  assert.doesNotMatch(output, /one-time-id|nonce=opaque/);
+  assert.doesNotMatch(output, /mcp_agent_one-time-id/);
 
   const bindingBody = fs.readFileSync(path.join(workspace, '.spala', 'project.json'), 'utf8');
   const codexBody = fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8');
-  assert.doesNotMatch(bindingBody, /one-time-id|nonce=opaque|mcp_test_secret/);
-  assert.doesNotMatch(codexBody, /one-time-id|nonce=opaque|mcp_test_secret|shared\.spala\.ai/);
+  assert.doesNotMatch(bindingBody, /mcp_agent_one-time-id|mcp_test_secret/);
+  assert.doesNotMatch(codexBody, /mcp_agent_one-time-id|mcp_test_secret|shared\.spala\.ai/);
   assert.match(codexBody, /\[projects]/);
   assert.match(codexBody, /command = "pnpm"/);
   assert.match(codexBody, /"proxy","--project-id","project-123"/);
@@ -4415,9 +4415,91 @@ test('bootstrap endpoint identity ignores scope but rejects other origins and pa
   ), false);
 });
 
+test('shared-runtime bootstrap capability is validated against the explicit requested MCP endpoint', async () => {
+  const projectUrl = 'https://project.example';
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_shared-runtime/consume';
+  let calls = 0;
+
+  const exchanged = await consumeBootstrap({
+    bootstrapUrl,
+    projectUrl,
+    mcpUrl,
+    fetchImpl: async (url, options) => {
+      calls += 1;
+      assert.equal(url, bootstrapUrl);
+      assert.deepEqual(options, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { accept: 'application/json' },
+      });
+      return new Response(JSON.stringify({
+        access_token: 'mcp_shared_runtime_credential',
+        expires_at: new Date(Date.now() + 120_000).toISOString(),
+        mcp_url: mcpUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(exchanged.mcpUrl, mcpUrl);
+});
+
+test('shared-runtime bootstrap capability rejects cross-origin and cross-project endpoints before POST', async () => {
+  const projectUrl = 'https://project.example';
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+
+  for (const bootstrapUrl of [
+    'https://other.spala.ai/p123/mcp/agent-instructions/mcp_agent_wrong-origin/consume',
+    'https://shared.spala.ai/p999/mcp/agent-instructions/mcp_agent_wrong-project/consume',
+  ]) {
+    let calls = 0;
+    await assert.rejects(consumeBootstrap({
+      bootstrapUrl,
+      projectUrl,
+      mcpUrl,
+      fetchImpl: async () => {
+        calls += 1;
+        throw new Error('must not consume');
+      },
+    }), /exact requested MCP endpoint/);
+    assert.equal(calls, 0);
+  }
+});
+
+test('bootstrap capability URL rejects credentials, fragments, query, and path confusion', () => {
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  for (const [bootstrapUrl, pattern] of [
+    ['https://user:pass@shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_secret/consume', /credentials/],
+    ['https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_secret/consume#fragment', /fragment/],
+    ['https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_secret/consume?nonce=secret', /query parameters/],
+    ['https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_secret%2Fother/consume', /encoded or ambiguous/],
+    ['https://shared.spala.ai/p999/../p123/mcp/agent-instructions/mcp_agent_secret/consume', /encoded or ambiguous/],
+    ['https://shared.spala.ai/p123/agent-instructions/mcp_agent_secret/consume', /exact requested MCP endpoint/],
+    ['https://shared.spala.ai/p123/mcp/agent-instructions/not.valid/consume', /exact one-time capability consume path/],
+    ['https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_secret/consume/extra', /exact one-time capability consume path/],
+  ]) {
+    assert.throws(() => validateBootstrapUrl(bootstrapUrl, mcpUrl), pattern);
+  }
+});
+
+test('bootstrap validation requires a safe explicit requested MCP URL', () => {
+  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_secret/consume';
+  assert.throws(() => validateBootstrapUrl(bootstrapUrl), /requested MCP URL/);
+
+  for (const [mcpUrl, pattern] of [
+    ['https://user:pass@shared.spala.ai/p123/mcp', /credentials/],
+    ['https://shared.spala.ai/p123/mcp#fragment', /fragment/],
+    ['https://shared.spala.ai/p123/mcp?scope=builder&token=secret', /unsupported query/],
+    ['https://shared.spala.ai/p123%2Fmcp?scope=builder', /encoded or ambiguous/],
+  ]) {
+    assert.throws(() => validateBootstrapUrl(bootstrapUrl, mcpUrl), pattern);
+  }
+});
+
 test('bootstrap consumption preserves requested scopes and rejects widening, narrowing, unknown, and duplicate scopes', async () => {
   const projectUrl = 'https://scope-check.spala.ai/';
-  const bootstrapUrl = 'https://scope-check.spala.ai/mcp/bootstrap/opaque/consume';
+  const bootstrapUrl = 'https://scope-check.spala.ai/mcp/agent-instructions/opaque/consume';
   const response = mcpUrl => new Response(JSON.stringify({
     access_token: 'mcp_scope_test_credential',
     expires_at: new Date(Date.now() + 120_000).toISOString(),
@@ -4483,7 +4565,7 @@ test('bootstrap consumption preserves requested scopes and rejects widening, nar
 
 test('bare bootstrap requests adopt only the canonical default project scope', async () => {
   const projectUrl = 'https://bare-scope.spala.ai/';
-  const bootstrapUrl = 'https://bare-scope.spala.ai/mcp/bootstrap/opaque/consume';
+  const bootstrapUrl = 'https://bare-scope.spala.ai/mcp/agent-instructions/opaque/consume';
   const response = mcpUrl => new Response(JSON.stringify({
     access_token: 'mcp_bare_scope_test_credential',
     expires_at: new Date(Date.now() + 120_000).toISOString(),
@@ -4545,7 +4627,7 @@ test('credential persistence failure rolls back binding and client config withou
   ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
     stdout: { write: () => {} },
     stderr: { write: () => {} },
-    stdin: Readable.from(['https://rollback.spala.ai/mcp/bootstrap/opaque/consume\n']),
+    stdin: Readable.from(['https://rollback.spala.ai/mcp/agent-instructions/opaque/consume\n']),
   }, {
     fetch: async () => new Response(JSON.stringify({
       access_token: 'mcp_replacement_credential',
@@ -4619,7 +4701,7 @@ test('credential temporary chmod failure precedes rename and rolls back binding 
     ], credentialEnv, workspace, {
       stdout: { write: () => {} },
       stderr: { write: () => {} },
-      stdin: Readable.from(['https://chmod-failure.spala.ai/mcp/bootstrap/opaque/consume\n']),
+      stdin: Readable.from(['https://chmod-failure.spala.ai/mcp/agent-instructions/opaque/consume\n']),
     }, {
       fetch: async () => new Response(JSON.stringify({
         access_token: 'mcp_replacement_chmod_credential',
@@ -4652,7 +4734,7 @@ test('failed bootstrap replay cannot overwrite a successful later credential', a
   const projectId = 'project-concurrent-renewal';
   const projectUrl = 'https://concurrent-renewal.spala.ai/';
   const mcpUrl = 'https://concurrent-renewal.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
-  const bootstrapUrl = 'https://concurrent-renewal.spala.ai/mcp/bootstrap/shared-capability/consume';
+  const bootstrapUrl = 'https://concurrent-renewal.spala.ai/mcp/agent-instructions/shared-capability/consume';
   storeProjectCredential({
     projectId,
     mcpUrl,
@@ -4746,14 +4828,14 @@ test('explicit exact builder scope replaces an old bare binding only with switch
   await assert.rejects(runCli(bindArgs, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
     stdout: { write: () => {} },
     stderr: { write: () => {} },
-    stdin: Readable.from([`${projectUrl}mcp/bootstrap/opaque/consume\n`]),
+    stdin: Readable.from([`${projectUrl}mcp/agent-instructions/opaque/consume\n`]),
   }, runtime), /already bound.*--switch/);
   assert.equal(calls, 0);
 
   await runCli([...bindArgs, '--switch'], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
     stdout: { write: () => {} },
     stderr: { write: () => {} },
-    stdin: Readable.from([`${projectUrl}mcp/bootstrap/opaque/consume\n`]),
+    stdin: Readable.from([`${projectUrl}mcp/agent-instructions/opaque/consume\n`]),
   }, runtime);
 
   assert.equal(calls, 1);
@@ -4865,7 +4947,7 @@ test('agentic project bind reads a bootstrap URL from a TTY without echoing it a
   const workspace = tempHome();
   const credentialHome = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
-  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/bootstrap/consume/tty-secret?nonce=opaque';
+  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/agent-instructions/tty-secret/consume';
   const stdin = ttyInput([bootstrapUrl, '\n']);
   let stdout = '';
   let stderr = '';
@@ -4902,7 +4984,7 @@ test('agentic project bind reads a bootstrap URL from a TTY without echoing it a
   assert.equal(stdin.isRaw, false);
   assert.equal(stdout.includes(bootstrapUrl), false);
   assert.equal(stderr.includes(bootstrapUrl), false);
-  assert.doesNotMatch(`${stdout}\n${stderr}`, /tty-secret|nonce=opaque/);
+  assert.doesNotMatch(`${stdout}\n${stderr}`, /tty-secret/);
 });
 
 test('Ctrl-C while reading a TTY bootstrap leaves project and credential files untouched', async () => {
@@ -4948,7 +5030,7 @@ test('rejected bootstrap is redacted and leaves no binding, client config, or cr
   const workspace = tempHome();
   const credentialHome = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
-  const bootstrapUrl = 'https://shared.spala.ai/p123/bootstrap/consume/do-not-print?nonce=secretish';
+  const bootstrapUrl = 'https://shared.spala.ai/p123/mcp/agent-instructions/do-not-print/consume';
   let calls = 0;
   await assert.rejects(
     runCli([
@@ -4969,7 +5051,7 @@ test('rejected bootstrap is redacted and leaves no binding, client config, or cr
     }),
     error => {
       assert.match(error.message, /HTTP 410/);
-      assert.doesNotMatch(error.message, /do-not-print|nonce|server-body-secret/);
+      assert.doesNotMatch(error.message, /do-not-print|server-body-secret/);
       return true;
     },
   );
@@ -5078,7 +5160,7 @@ test('agentic bind preflight rejects invalid flat credential stores before boots
     ], credentialEnv, workspace, {
       stdout: { write: () => {} },
       stderr: { write: () => {} },
-      stdin: Readable.from(['https://invalid-preflight.spala.ai/mcp/bootstrap/opaque/consume\n']),
+      stdin: Readable.from(['https://invalid-preflight.spala.ai/mcp/agent-instructions/opaque/consume\n']),
     }, {
       fetch: async () => {
         calls += 1;

@@ -45,6 +45,7 @@ import {
 import { runProxy } from './proxy.js';
 import {
   PROJECT_BINDING_SCHEMA_VERSION,
+  assertProjectBindingRevision,
   closeProjectBindingDirectory,
   openProjectBindingDirectory,
   planProjectBinding,
@@ -1343,10 +1344,14 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         // the scope query even when the requested URL was bare). Store and
         // bind the exchanged URL so proxy credentials and the workspace
         // binding agree with the server.
+        const exchangedBinding = {
+          ...bindingPlan.binding,
+          mcpUrl: exchanged.mcpUrl,
+        };
         if (exchanged.mcpUrl !== bindingPlan.binding.mcpUrl) {
           bound = replaceProjectBindingIfRevision(
             bindingPlan.workspaceRoot,
-            { ...bindingPlan.binding, mcpUrl: exchanged.mcpUrl },
+            exchangedBinding,
             bound.revision,
             {
               directoryHandle: bindingDirectory,
@@ -1355,6 +1360,16 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
             },
           );
         }
+        assertProjectBindingRevision(
+          bindingPlan.workspaceRoot,
+          exchangedBinding,
+          bound.revision,
+          {
+            directoryHandle: bindingDirectory,
+            failureRollbackBinding: bindingPlan.existing,
+            rollbackOnFailure: bound.changed,
+          },
+        );
         const persistCredential = runtime.storeProjectCredential || storeProjectCredential;
         persistCredential({
           projectId: bindingPlan.binding.projectId,
@@ -1362,6 +1377,16 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           bearerToken: exchanged.bearerToken,
           expiresAt: exchanged.expiresAt,
         }, env, bindingPlan.workspaceRoot);
+        assertProjectBindingRevision(
+          bindingPlan.workspaceRoot,
+          exchangedBinding,
+          bound.revision,
+          {
+            directoryHandle: bindingDirectory,
+            failureRollbackBinding: bindingPlan.existing,
+            rollbackOnFailure: bound.changed,
+          },
+        );
       }
     } catch (error) {
       const failures = [];

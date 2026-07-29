@@ -13,6 +13,7 @@ import {
   createInstallPlan,
   createProxyInstallPlan,
   createUninstallPlan,
+  INSTALLER_PACKAGE_SPEC,
   installPlan,
   mcpEndpointsMatch,
   normalizeMcpUrl,
@@ -22,6 +23,7 @@ import {
   rollbackInstallPlan,
   serverNameFromUrl,
 } from '../src/installer.js';
+import { CODEX_SPALA_SKILL } from '../src/codexSkill.js';
 import { credentialStorePath, projectCredentialStatus, readProjectCredential, storeProjectCredential } from '../src/credentialStore.js';
 import { runProxy } from '../src/proxy.js';
 import { Readable } from 'node:stream';
@@ -112,6 +114,27 @@ function ttyInput(chunks, initialRawMode = false) {
   return stdin;
 }
 
+test('release package references stay synchronized with package.json', () => {
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(packageJson.version, '0.1.16');
+  assert.equal(INSTALLER_PACKAGE_SPEC, `@spala-ai/mcp-install@${packageJson.version}`);
+
+  const releaseFiles = [
+    new URL('../README.md', import.meta.url),
+    new URL('../src/installer.js', import.meta.url),
+    new URL('../src/codexSkill.js', import.meta.url),
+    new URL('./installer.test.js', import.meta.url),
+  ];
+  for (const file of releaseFiles) {
+    const source = fs.readFileSync(file, 'utf8');
+    const versions = [...source.matchAll(/@spala-ai\/mcp-install@(\d+\.\d+\.\d+)/g)]
+      .map(match => match[1]);
+    assert.ok(versions.length > 0, `${file.pathname} must contain a pinned installer reference`);
+    assert.deepEqual([...new Set(versions)], [packageJson.version], `${file.pathname} contains a stale installer version`);
+  }
+  assert.match(CODEX_SPALA_SKILL, new RegExp(`@spala-ai/mcp-install@${packageJson.version.replaceAll('.', '\\.')}`));
+});
+
 test('normalizes missing scope without replacing an existing scope', () => {
   assert.equal(
     normalizeMcpUrl('https://example.test/mcp', 'builder,project,data'),
@@ -182,7 +205,7 @@ test('shell command hints safely quote command substitution characters', () => {
 
 test('public MCP command hints match the live manifest scope contract', () => {
   const hints = buildCommandHints(PUBLIC_SERVER_NAME, PUBLIC_MCP_URL);
-  assert.match(hints.codexAdd, /npx.*--yes.*@spala-ai\/mcp-install@0\.1\.15/);
+  assert.match(hints.codexAdd, /npx.*--yes.*@spala-ai\/mcp-install@0\.1\.16/);
   assert.equal(hints.codexLogin, null);
   assert.deepEqual(hints.argv.codexLogin, null);
 });
@@ -2973,7 +2996,7 @@ test('command-style init writes public Codex config and managed skill for user s
 
 test('failed init authentication reports changed and explicit init safely retries authentication', async () => {
   const home = tempHome();
-  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json';
+  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.16 login --client codex --json';
   const secret = 'oauth-failure-code-must-not-leak';
   let errorOutput = '';
   const error = await captureAsyncError(() => runCli(
@@ -3028,7 +3051,7 @@ test('failed init authentication reports changed and explicit init safely retrie
 });
 
 test('unchanged canonical --public --yes retries missing or expired native OAuth without inspecting credentials', async () => {
-  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json';
+  const retryCommand = 'pnpm dlx @spala-ai/mcp-install@0.1.16 login --client codex --json';
 
   for (const authState of ['missing', 'expired']) {
     const home = tempHome();
@@ -3173,7 +3196,7 @@ test('native failed init JSON reports one exact retry command without child outp
   assert.equal(payload.changed, true);
   assert.deepEqual(payload.nextSteps, [{
     action: 'run_command',
-    command: 'pnpm dlx @spala-ai/mcp-install@0.1.15 login --client codex --json',
+    command: 'pnpm dlx @spala-ai/mcp-install@0.1.16 login --client codex --json',
   }]);
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(secret));
 });
@@ -4270,44 +4293,66 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   assert.equal(stored.mcpUrl, 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata');
 });
 
-test('exact-url project bind accepts a scoped bootstrap response for a bare requested URL', async () => {
+test('repeated exact-url Claude Code binds adopt and reuse the canonical scoped endpoint', async () => {
   const workspace = tempHome();
   const credentialHome = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
   const bootstrapUrl = 'https://activity-stream.spala.ai/mcp/agent-instructions/one-time-id/consume';
-  let output = '';
+  const canonicalMcpUrl = 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata';
+  let calls = 0;
+  const bind = async () => {
+    let output = '';
+    await runCli([
+      'project', 'bind',
+      '--project-id', 'project-777',
+      '--project-url', 'https://activity-stream.spala.ai/',
+      '--url', 'https://activity-stream.spala.ai/mcp',
+      '--exact-url',
+      '--bootstrap-stdin',
+      '--client', 'claude-code',
+      '--yes',
+      '--json',
+    ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+      stdout: { write: chunk => { output += chunk; } },
+      stderr: { write: () => {} },
+      stdin: Readable.from([`${bootstrapUrl}\n`]),
+    }, {
+      fetch: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({
+          access_token: `mcp_scoped_response_secret_${calls}`,
+          token_type: 'Bearer',
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          mcp_url: canonicalMcpUrl,
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    return JSON.parse(output);
+  };
 
-  await runCli([
-    'project', 'bind',
-    '--project-id', 'project-777',
-    '--project-url', 'https://activity-stream.spala.ai/',
-    '--url', 'https://activity-stream.spala.ai/mcp',
-    '--exact-url',
-    '--bootstrap-stdin',
-    '--client', 'codex',
-    '--yes',
-    '--json',
-  ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
-    stdout: { write: chunk => { output += chunk; } },
-    stderr: { write: () => {} },
-    stdin: Readable.from([`${bootstrapUrl}\n`]),
-  }, {
-    fetch: async () => new Response(JSON.stringify({
-      access_token: 'mcp_scoped_response_secret',
-      token_type: 'Bearer',
-      expires_at: new Date(Date.now() + 60_000).toISOString(),
-      mcp_url: 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
-    }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    }),
-  });
+  const first = await bind();
+  const second = await bind();
 
-  const payload = JSON.parse(output);
-  assert.equal(payload.ok, true);
-  assert.equal(payload.outcome, 'bound');
+  assert.equal(calls, 2);
+  for (const payload of [first, second]) {
+    assert.equal(payload.ok, true);
+    assert.equal(payload.outcome, 'bound');
+    assert.equal(payload.binding.mcpUrl, canonicalMcpUrl);
+  }
+  assert.deepEqual(readProjectBinding(workspace).binding, second.binding);
   const stored = readProjectCredential('project-777', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
-  assert.equal(stored.mcpUrl, 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+  assert.equal(stored.mcpUrl, canonicalMcpUrl);
+  assert.equal(stored.bearerToken, 'mcp_scoped_response_secret_2');
+
+  const claudeConfig = JSON.parse(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'));
+  assert.deepEqual(claudeConfig.mcpServers[second.binding.serverName], {
+    type: 'stdio',
+    command: 'npx',
+    args: ['--yes', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-777'],
+  });
 });
 
 test('bootstrap endpoint identity ignores scope but rejects other origins and paths', () => {
@@ -4327,6 +4372,76 @@ test('bootstrap endpoint identity ignores scope but rejects other origins and pa
     'https://activity.spala.test/mcp',
     'https://activity.spala.test/other?scope=builder%2Cproject%2Cdata',
   ), false);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp?tenant=other',
+    'https://activity.spala.test/mcp?scope=builder%2Cproject%2Cdata',
+  ), false);
+  assert.equal(mcpEndpointsMatch(
+    'https://activity.spala.test/mcp?tenant=one',
+    'https://activity.spala.test/mcp?tenant=one',
+  ), false);
+});
+
+test('credential persistence failure after canonicalization rolls back binding, client config, and credential', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const originalBinding = {
+    schemaVersion: 1,
+    projectId: 'project-rollback',
+    projectUrl: 'https://rollback.spala.ai/',
+    mcpUrl: 'https://rollback.spala.ai/mcp',
+    serverName: serverNameFromUrl('https://rollback.spala.ai/mcp'),
+  };
+  writeProjectBinding(workspace, originalBinding);
+  const originalClaudeConfig = `${JSON.stringify({
+    mcpServers: {
+      unrelated: { command: 'node', args: ['server.js'] },
+    },
+  }, null, 2)}\n`;
+  fs.writeFileSync(path.join(workspace, '.mcp.json'), originalClaudeConfig);
+  storeProjectCredential({
+    projectId: originalBinding.projectId,
+    mcpUrl: originalBinding.mcpUrl,
+    bearerToken: 'mcp_original_credential',
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+
+  let persistenceAttempts = 0;
+  await assert.rejects(runCli([
+    'project', 'bind',
+    '--project-id', originalBinding.projectId,
+    '--project-url', originalBinding.projectUrl,
+    '--url', originalBinding.mcpUrl,
+    '--exact-url',
+    '--bootstrap-stdin',
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://rollback.spala.ai/mcp/bootstrap/opaque/consume\n']),
+  }, {
+    fetch: async () => new Response(JSON.stringify({
+      access_token: 'mcp_replacement_credential',
+      expires_at: new Date(Date.now() + 120_000).toISOString(),
+      mcp_url: 'https://rollback.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    storeProjectCredential: (input, credentialEnv, workspaceRoot) => {
+      persistenceAttempts += 1;
+      assert.equal(input.mcpUrl, 'https://rollback.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+      storeProjectCredential(input, credentialEnv, workspaceRoot);
+      throw new Error('simulated credential persistence failure');
+    },
+  }), /simulated credential persistence failure/);
+
+  assert.equal(persistenceAttempts, 1);
+  assert.deepEqual(readProjectBinding(workspace).binding, originalBinding);
+  assert.equal(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'), originalClaudeConfig);
+  const stored = readProjectCredential(originalBinding.projectId, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  assert.equal(stored.mcpUrl, originalBinding.mcpUrl);
+  assert.equal(stored.bearerToken, 'mcp_original_credential');
 });
 
 test('agentic project bind reads a bootstrap URL from a TTY without echoing it and restores raw mode', async () => {
@@ -4745,7 +4860,7 @@ test('agentic proxy plans are workspace-only and command hints contain no creden
   assert.equal(plan.writes[0].path, path.join(workspace, '.roo', 'mcp.json'));
   assert.deepEqual(JSON.parse(plan.writes[0].content).mcpServers['spala-project'], {
     command: 'pnpm',
-    args: ['dlx', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+    args: ['dlx', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-123'],
   });
   const commands = buildProxyCommandHints('spala-project', 'project-123');
   const serialized = JSON.stringify(commands);
@@ -4776,7 +4891,7 @@ test('agentic proxy plans support claude-code and cursor as writable workspace c
   assert.deepEqual(JSON.parse(claudePlan.writes[0].content).mcpServers['spala-project'], {
     type: 'stdio',
     command: 'npx',
-    args: ['--yes', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+    args: ['--yes', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-123'],
   });
 
   const cursorPlan = createProxyInstallPlan({
@@ -4789,7 +4904,7 @@ test('agentic proxy plans support claude-code and cursor as writable workspace c
   assert.equal(cursorPlan.writes[0].path, path.join(workspace, '.cursor', 'mcp.json'));
   assert.deepEqual(JSON.parse(cursorPlan.writes[0].content).mcpServers['spala-project'], {
     command: 'npx',
-    args: ['--yes', '@spala-ai/mcp-install@0.1.15', 'proxy', '--project-id', 'project-123'],
+    args: ['--yes', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-123'],
   });
 
   const serialized = JSON.stringify([claudePlan, cursorPlan]);

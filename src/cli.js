@@ -307,7 +307,8 @@ const CLIENT_RELOAD_GUIDANCE = {
   'claude-desktop': 'Quit and reopen Claude Desktop to load the updated MCP configuration.',
   zed: 'Reload Zed to load the updated MCP configuration.',
   codex: 'Start a new or resumed Codex session in this workspace to load the updated MCP configuration. Do not continue with app inspection, design, scaffolding, coding, testing, or QA in the pre-reload session.',
-  'claude-code': 'Start a new Claude Code session after running the project-scoped add command.',
+  'claude-code': 'Start a new Claude Code session in this workspace to load the updated MCP configuration.',
+  cursor: 'Reload Cursor (or toggle the MCP server in Cursor settings) to load the updated MCP configuration.',
 };
 
 function commandName(args) {
@@ -1124,7 +1125,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         ok: true,
         clients: clientInstallCapabilities(),
         writable: WRITABLE_CLIENTS.map(client => ({ name: client, label: CLIENT_LABELS[client] })),
-        commandOnly: COMMAND_ONLY_CLIENTS.map(client => ({ name: client, label: CLIENT_LABELS[client] })),
+        commandOnly: COMMAND_ONLY_CLIENTS.map(client => ({ name: client, label: CLIENT_LABELS[client], scope: 'user' })),
       }, null, 2)}\n`);
       return;
     }

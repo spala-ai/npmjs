@@ -26,8 +26,13 @@ export const WRITABLE_CLIENTS = [
   'roo',
   'claude-desktop',
   'zed',
+  'cursor',
 ];
 
+// Clients whose USER-scoped public install is applied via a printed client CLI
+// command instead of a config-file write. Scope matters: claude-code is
+// command-only at user scope but workspace-WRITABLE (.mcp.json) for project
+// binds — clientInstallCapabilities() reports the per-scope truth.
 export const COMMAND_ONLY_CLIENTS = [
   'claude-code',
 ];
@@ -42,7 +47,7 @@ export const PUBLIC_LEGACY_SERVER_NAMES = [
   'spala-mcp-spala-ai',
 ];
 export const MCP_REMOTE_VERSION = '0.1.38';
-export const INSTALLER_PACKAGE_SPEC = '@spala-ai/mcp-install@0.1.14';
+export const INSTALLER_PACKAGE_SPEC = '@spala-ai/mcp-install@0.1.15';
 
 export const CLIENT_LABELS = {
   antigravity: 'Antigravity',
@@ -55,6 +60,7 @@ export const CLIENT_LABELS = {
   zed: 'Zed',
   codex: 'Codex CLI',
   'claude-code': 'Claude Code',
+  cursor: 'Cursor',
 };
 
 function homeDir(env) {
@@ -88,8 +94,8 @@ const ALL_CLIENTS = Object.keys(CLIENT_LABELS);
 
 function installMode(client, installScope) {
   if (installScope === 'workspace') {
-    if (client === 'codex' || client === 'roo') return 'writable';
-    if (client === 'claude-code' || client === 'gemini') return 'command';
+    if (client === 'codex' || client === 'roo' || client === 'claude-code' || client === 'cursor') return 'writable';
+    if (client === 'gemini') return 'command';
     return 'unsupported';
   }
   if (client === 'codex') return 'writable';
@@ -112,11 +118,15 @@ function targetPath(client, env, workspaceRoot, installScope = 'user') {
   if (installScope === 'workspace') {
     if (client === 'codex') return joinPath(env, workspaceRoot, '.codex', 'config.toml');
     if (client === 'roo') return joinPath(env, workspaceRoot, '.roo', 'mcp.json');
+    if (client === 'claude-code') return joinPath(env, workspaceRoot, '.mcp.json');
+    if (client === 'cursor') return joinPath(env, workspaceRoot, '.cursor', 'mcp.json');
     return null;
   }
   switch (client) {
     case 'codex':
       return joinPath(env, home, '.codex', 'config.toml');
+    case 'cursor':
+      return joinPath(env, home, '.cursor', 'mcp.json');
     case 'antigravity':
       return joinPath(env, home, '.gemini', 'antigravity', 'mcp_config.json');
     case 'antigravity-cli':
@@ -160,7 +170,12 @@ function codexSkillPath(env) {
   return joinPath(env, homeDir(env), '.codex', 'skills', 'spala-backend', 'SKILL.md');
 }
 
-function parentLooksInstalled(filePath) {
+function parentLooksInstalled(filePath, client, workspaceRoot) {
+  if (client === 'claude-code' && workspaceRoot) {
+    return fs.existsSync(filePath)
+      || fs.existsSync(path.join(workspaceRoot, '.claude'))
+      || fs.existsSync(path.join(workspaceRoot, 'CLAUDE.md'));
+  }
   return fs.existsSync(filePath) || fs.existsSync(path.dirname(filePath));
 }
 
@@ -272,7 +287,10 @@ function desiredPatch(client, serverName, mcpUrl) {
       return { topKey: 'mcpServers', serverName, value: directHttpConfig(mcpUrl, 'serverUrl') };
     case 'cline':
     case 'roo':
+    case 'cursor':
       return { topKey: 'mcpServers', serverName, value: directHttpConfig(mcpUrl, 'url') };
+    case 'claude-code':
+      return { topKey: 'mcpServers', serverName, value: { type: 'http', url: mcpUrl } };
     case 'gemini':
       return { topKey: 'mcpServers', serverName, value: directHttpConfig(mcpUrl, 'httpUrl') };
     case 'claude-desktop':
@@ -575,7 +593,7 @@ export function createInstallPlan({ clientSelection = 'all', cleanupDuplicates =
       skipped.push({ client, reason: 'No config target is known for this client.' });
       continue;
     }
-    if (!forced && !parentLooksInstalled(filePath)) {
+    if (!forced && !parentLooksInstalled(filePath, client, workspaceRoot)) {
       skipped.push({ client, reason: 'Config directory was not detected. Use --client to create it anyway.' });
       continue;
     }
@@ -594,9 +612,15 @@ export function createInstallPlan({ clientSelection = 'all', cleanupDuplicates =
   };
 }
 
-export function proxyCommandForProject(projectId) {
+export function proxyCommandForProject(projectId, runner = 'pnpm') {
   const id = String(projectId || '').trim();
   if (!id || id.length > 200 || /[\0\r\n/\\]/.test(id)) throw new Error('projectId must be a non-empty identifier without path separators.');
+  if (runner === 'npx') {
+    return {
+      command: 'npx',
+      args: ['--yes', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', id],
+    };
+  }
   return {
     command: 'pnpm',
     args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', id],
@@ -627,18 +651,21 @@ export function createProxyInstallPlan({ clientSelection = 'all', cwd = process.
       writes.push(planCodexTomlProxyInstall(filePath, safeServerName, proxy.command, proxy.args, dryRun, safetyRoot));
       continue;
     }
-    if (client !== 'roo' || !filePath) {
+    if (!['roo', 'claude-code', 'cursor'].includes(client) || !filePath) {
       skipped.push({ client, reason: 'No verified workspace stdio configuration target is available.', unsupportedScope: true });
       continue;
     }
-    if (!forced && !parentLooksInstalled(filePath)) {
+    if (!forced && !parentLooksInstalled(filePath, client, workspaceRoot)) {
       skipped.push({ client, reason: 'Config directory was not detected. Use --client to create it anyway.' });
       continue;
     }
+    const clientProxy = client === 'roo' ? proxy : proxyCommandForProject(projectId, 'npx');
     writes.push(planWrite(client, filePath, safetyRoot, {
       topKey: 'mcpServers',
       serverName: safeServerName,
-      value: { command: proxy.command, args: proxy.args },
+      value: client === 'claude-code'
+        ? { type: 'stdio', command: clientProxy.command, args: clientProxy.args }
+        : { command: clientProxy.command, args: clientProxy.args },
     }, dryRun, false));
   }
 

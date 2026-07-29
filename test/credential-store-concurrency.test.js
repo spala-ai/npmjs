@@ -62,25 +62,20 @@ function runWorker(options) {
   const storePath = credentialStorePath(env);
   installLockHooks(options);
 
-  if (options.pauseBeforeRename) {
-    const renameSync = fs.renameSync;
+  if (options.pauseBeforePublication) {
+    const copyFileSync = fs.copyFileSync;
     let paused = false;
-    fs.renameSync = (source, destination) => {
+    fs.copyFileSync = (source, destination, mode) => {
       if (
         !paused
-        && (
-          path.resolve(destination) === storePath
-          || (
-            destination === path.basename(storePath)
-            && path.basename(source).startsWith('.mcp-credentials.tmp-')
-          )
-        )
+        && destination === path.basename(storePath)
+        && path.basename(source).startsWith('.mcp-credentials.tmp-')
       ) {
         paused = true;
         writeMarker(options.markerPath);
         waitForRelease(options.releasePath);
       }
-      return renameSync(source, destination);
+      return copyFileSync(source, destination, mode);
     };
   }
 
@@ -237,7 +232,7 @@ async function leaveCrashedLock(credentialHome, coordination) {
 if (process.argv[2] !== WORKER_FLAG) test('overlapping process writers serialize and preserve both flat-store projects', async () => {
   const credentialHome = tempHome();
   const coordination = tempHome();
-  const firstMarker = path.join(coordination, 'first-before-rename');
+  const firstMarker = path.join(coordination, 'first-before-publication');
   const firstRelease = path.join(coordination, 'release-first');
   const contentionMarker = path.join(coordination, 'second-contended');
 
@@ -245,7 +240,7 @@ if (process.argv[2] !== WORKER_FLAG) test('overlapping process writers serialize
     credentialHome,
     projectId: 'concurrent-project-a',
     bearerToken: 'mcp_concurrent_a',
-    pauseBeforeRename: true,
+    pauseBeforePublication: true,
     markerPath: firstMarker,
     releasePath: firstRelease,
   });
@@ -502,7 +497,7 @@ if (process.argv[2] !== WORKER_FLAG) test('credential write cleans a bearer temp
   }
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a parent swap at rename and removes the published bearer', {
+if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a parent swap at exclusive copy and removes the published bearer', {
   skip: process.platform === 'win32',
 }, () => {
   const credentialHome = tempHome();
@@ -513,10 +508,11 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a pare
   const storePath = credentialStorePath(env);
   const originalBody = fs.readFileSync(storePath, 'utf8');
 
+  const copyFileSync = fs.copyFileSync;
   const renameSync = fs.renameSync;
   let swapped;
   let hookReached = false;
-  fs.renameSync = (source, destination, ...args) => {
+  fs.copyFileSync = (source, destination, mode) => {
     if (
       !hookReached
       && typeof source === 'string'
@@ -526,7 +522,7 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a pare
       hookReached = true;
       swapped = swapCredentialDirectory(storePath, outside, renameSync);
     }
-    return renameSync(source, destination, ...args);
+    return copyFileSync(source, destination, mode);
   };
   try {
     assert.throws(
@@ -547,7 +543,7 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a pare
       false,
     );
   } finally {
-    fs.renameSync = renameSync;
+    fs.copyFileSync = copyFileSync;
     swapped?.restore();
   }
 
@@ -557,7 +553,7 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication rejects a pare
   );
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('credential publication restores a missing target after a parent swap at rename', {
+if (process.argv[2] !== WORKER_FLAG) test('credential publication restores a missing target after a parent swap at exclusive copy', {
   skip: process.platform === 'win32',
 }, () => {
   const credentialHome = tempHome();
@@ -566,10 +562,11 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication restores a mis
   const protectedBearer = 'mcp_missing_final_rename_protected';
   const storePath = credentialStorePath(env);
 
+  const copyFileSync = fs.copyFileSync;
   const renameSync = fs.renameSync;
   let swapped;
   let hookReached = false;
-  fs.renameSync = (source, destination, ...args) => {
+  fs.copyFileSync = (source, destination, mode) => {
     if (
       !hookReached
       && typeof source === 'string'
@@ -579,7 +576,7 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication restores a mis
       hookReached = true;
       swapped = swapCredentialDirectory(storePath, outside, renameSync);
     }
-    return renameSync(source, destination, ...args);
+    return copyFileSync(source, destination, mode);
   };
   try {
     assert.throws(
@@ -597,14 +594,14 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication restores a mis
       false,
     );
   } finally {
-    fs.renameSync = renameSync;
+    fs.copyFileSync = copyFileSync;
     swapped?.restore();
   }
 
   assert.equal(fs.existsSync(storePath), false);
 });
 
-if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a same-inode revision changed at the rename boundary', {
+if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a same-inode revision changed at the isolation boundary', {
   skip: process.platform === 'win32',
 }, () => {
   const credentialHome = tempHome();
@@ -623,12 +620,12 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a sa
   fs.renameSync = (source, destination, ...args) => {
     if (
       !hookReached
-      && typeof source === 'string'
-      && source.startsWith('.mcp-credentials.tmp-')
-      && destination === path.basename(storePath)
+      && source === path.basename(storePath)
+      && typeof destination === 'string'
+      && destination.startsWith('.mcp-credentials.restore-')
     ) {
       hookReached = true;
-      fs.writeFileSync(destination, concurrentBody, { mode: 0o600 });
+      fs.writeFileSync(source, concurrentBody, { mode: 0o600 });
     }
     return renameSync(source, destination, ...args);
   };
@@ -646,6 +643,71 @@ if (process.argv[2] !== WORKER_FLAG) test('credential publication preserves a sa
   assert.equal(readProjectCredential(projectId, env).bearerToken, concurrentBearer);
   assertTreeDoesNotContain(path.dirname(storePath), protectedBearer);
   assertNoCredentialArtifacts(path.dirname(storePath));
+});
+
+if (process.argv[2] !== WORKER_FLAG) test('exclusive publication preserves a legacy atomic writer in the final publication window', () => {
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const existingProject = 'legacy-window-existing-project';
+  const concurrentProject = 'legacy-window-concurrent-project';
+  const protectedBearer = 'mcp_legacy_window_must_not_publish';
+  const concurrentBearer = 'mcp_legacy_window_concurrent';
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  storeFixtureCredential(credentialHome, existingProject, 'mcp_legacy_window_existing');
+  const storePath = credentialStorePath(env);
+  const directory = path.dirname(storePath);
+  const legacyStore = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  legacyStore.projects[concurrentProject] = {
+    mcpUrl: `https://${concurrentProject}.spala.test/mcp`,
+    bearerToken: concurrentBearer,
+    expiresAt,
+    status: 'active',
+  };
+  const legacyBody = `${JSON.stringify(legacyStore, null, 2)}\n`;
+  const legacyTemporary = `.mcp-credentials.legacy-${process.pid}-${Date.now()}`;
+
+  const copyFileSync = fs.copyFileSync;
+  const renameSync = fs.renameSync;
+  let hookReached = false;
+  fs.copyFileSync = (source, destination, mode) => {
+    if (
+      !hookReached
+      && typeof source === 'string'
+      && source.startsWith('.mcp-credentials.tmp-')
+      && destination === path.basename(storePath)
+      && mode === fs.constants.COPYFILE_EXCL
+    ) {
+      hookReached = true;
+      fs.writeFileSync(legacyTemporary, legacyBody, { flag: 'wx', mode: 0o600 });
+      renameSync(legacyTemporary, destination);
+    }
+    return copyFileSync(source, destination, mode);
+  };
+  try {
+    assert.throws(
+      () => storeFixtureCredential(
+        credentialHome,
+        'legacy-window-new-project',
+        protectedBearer,
+      ),
+      /credential store changed after it was inspected/,
+    );
+  } finally {
+    fs.copyFileSync = copyFileSync;
+  }
+
+  assert.equal(hookReached, true);
+  assert.equal(fs.readFileSync(storePath, 'utf8'), legacyBody);
+  assert.equal(
+    readProjectCredential(existingProject, env).bearerToken,
+    'mcp_legacy_window_existing',
+  );
+  assert.equal(
+    readProjectCredential(concurrentProject, env).bearerToken,
+    concurrentBearer,
+  );
+  assertTreeDoesNotContain(directory, protectedBearer);
+  assertNoCredentialArtifacts(directory);
 });
 
 if (process.argv[2] !== WORKER_FLAG) test('a hard-linked credential store fails closed', {

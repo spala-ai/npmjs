@@ -45,6 +45,8 @@ import {
 import { runProxy } from './proxy.js';
 import {
   PROJECT_BINDING_SCHEMA_VERSION,
+  closeProjectBindingDirectory,
+  openProjectBindingDirectory,
   planProjectBinding,
   readProjectBinding,
   removeProjectBinding,
@@ -1315,6 +1317,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     }
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
+    let bindingDirectory;
     try {
       let bootstrapUrl;
       if (agentic) {
@@ -1323,7 +1326,11 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       }
 
       installed = installPlan(plan);
-      bound = writeProjectBinding(bindingPlan.workspaceRoot, bindingPlan.binding, { switchProject: args.switchProject });
+      bindingDirectory = openProjectBindingDirectory(bindingPlan.workspaceRoot);
+      bound = writeProjectBinding(bindingPlan.workspaceRoot, bindingPlan.binding, {
+        switchProject: args.switchProject,
+        directoryHandle: bindingDirectory,
+      });
 
       if (agentic) {
         const exchanged = await consumeBootstrap({
@@ -1341,6 +1348,11 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
             bindingPlan.workspaceRoot,
             { ...bindingPlan.binding, mcpUrl: exchanged.mcpUrl },
             bound.revision,
+            {
+              directoryHandle: bindingDirectory,
+              failureRollbackBinding: bindingPlan.existing,
+              rollbackOnDirectoryChange: true,
+            },
           );
         }
         const persistCredential = runtime.storeProjectCredential || storeProjectCredential;
@@ -1353,12 +1365,19 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       }
     } catch (error) {
       const failures = [];
+      if (error && typeof error === 'object' && error.bindingRevisionAfterRecovery) {
+        bound.revision = error.bindingRevisionAfterRecovery;
+      }
+      if (error && typeof error === 'object' && error.bindingRollbackCompleted) {
+        bound.changed = false;
+      }
       if (bound.changed) {
         try {
           rollbackProjectBinding(
             bindingPlan.workspaceRoot,
             bound.revision,
             bindingPlan.existing,
+            { directoryHandle: bindingDirectory },
           );
         } catch (rollbackError) {
           failures.push(`binding rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
@@ -1370,6 +1389,8 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         : (error instanceof Error ? error.message : String(error)));
       wrapped.changed = failures.length > 0;
       throw wrapped;
+    } finally {
+      closeProjectBindingDirectory(bindingDirectory);
     }
     const payload = {
       ...basePayload,

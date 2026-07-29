@@ -367,6 +367,22 @@ export function mcpUrlsMatch(left, right) {
   return urlsMatch(left, right);
 }
 
+// Endpoint identity ignores the scope query: origin + path only. The scope a
+// bootstrap response carries is authorization detail, not a different server,
+// so a bare requested URL must accept a scoped response (and vice versa).
+export function mcpEndpointsMatch(left, right) {
+  const stripScope = value => {
+    const normalized = normalizeComparableMcpUrl(value || '');
+    if (!normalized) return undefined;
+    const parsed = new URL(normalized);
+    parsed.search = '';
+    return parsed.toString();
+  };
+  const strippedLeft = stripScope(left);
+  const strippedRight = stripScope(right);
+  return Boolean(strippedLeft && strippedRight && strippedLeft === strippedRight);
+}
+
 function publicLegacyNamesForTarget(serverName, mcpUrl) {
   return serverName === PUBLIC_SERVER_NAME && urlsMatch(mcpUrl, PUBLIC_MCP_URL)
     ? PUBLIC_LEGACY_SERVER_NAMES

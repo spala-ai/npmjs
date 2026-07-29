@@ -125,6 +125,64 @@ test('failed pending bind does not roll back a later successful concurrent bind'
   assert.equal(readProjectBinding(workspace).binding.projectId, 'project-concurrent-b');
 });
 
+test('scoped bootstrap canonicalization cannot overwrite a later successful bind', async () => {
+  const workspace = tempDirectory();
+  const credentialHome = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+
+  const fetchStarted = deferred();
+  const finishFetch = deferred();
+  const bareMcpUrl = 'https://canonical-concurrent-a.spala.ai/mcp';
+  const scopedMcpUrl = `${bareMcpUrl}?scope=builder%2Cproject%2Cdata`;
+  let credentialPersistenceAttempts = 0;
+  const firstBind = runCli(bindArgs({
+    projectId: 'project-canonical-concurrent-a',
+    projectUrl: 'https://canonical-concurrent-a.spala.ai/',
+    mcpUrl: bareMcpUrl,
+    bootstrap: true,
+  }), {
+    SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+  }, workspace, quietStreams(Readable.from([
+    'https://canonical-concurrent-a.spala.ai/mcp/bootstrap/opaque/consume\n',
+  ])), {
+    fetch: async () => {
+      fetchStarted.resolve();
+      await finishFetch.promise;
+      return new Response(JSON.stringify({
+        access_token: 'mcp_canonical_concurrency_test_secret',
+        token_type: 'Bearer',
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        mcp_url: scopedMcpUrl,
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+    storeProjectCredential: () => {
+      credentialPersistenceAttempts += 1;
+    },
+  });
+
+  await fetchStarted.promise;
+  assert.equal(readProjectBinding(workspace).binding.mcpUrl, bareMcpUrl);
+
+  await runCli(bindArgs({
+    projectId: 'project-canonical-concurrent-b',
+    projectUrl: 'https://canonical-concurrent-b.spala.ai/',
+    mcpUrl: 'https://canonical-concurrent-b.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    switchProject: true,
+  }), {}, workspace, quietStreams());
+  const laterBinding = readProjectBinding(workspace).binding;
+
+  finishFetch.resolve();
+  await assert.rejects(
+    firstBind,
+    /Workspace binding changed while the project bind was pending|local rollback was incomplete/,
+  );
+  assert.equal(credentialPersistenceAttempts, 0);
+  assert.deepEqual(readProjectBinding(workspace).binding, laterBinding);
+});
+
 test('rollback preserves a writer landing after the isolated revision check', async t => {
   for (const testCase of [
     { name: 'restore previous binding', previousBinding: binding('rollback-original') },

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import lockfile from 'proper-lockfile';
 import { normalizeMcpUrl } from './installer.js';
 import { assertSafePath } from './pathSafety.js';
@@ -10,6 +11,10 @@ const CREDENTIAL_STORE_LOCK_TIMEOUT_MS = 5_000;
 const CREDENTIAL_STORE_STALE_LOCK_MS = 30_000;
 const CREDENTIAL_STORE_LOCK_RETRY_MS = 10;
 const LOCK_WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const DIRECTORY_FLAGS = fs.constants.O_RDONLY
+  | (fs.constants.O_DIRECTORY || 0)
+  | NOFOLLOW;
 
 function homeDir(env) {
   return env.SPALA_MCP_CREDENTIAL_HOME || env.HOME || env.USERPROFILE || os.homedir();
@@ -57,11 +62,13 @@ function emptyStore() {
 
 function assertPrivateRegularFile(stat, label) {
   if (!stat.isFile()) throw new Error(`${label} must be a regular file.`);
-  if (stat.nlink !== 1) throw new Error(`${label} must not have multiple hard links.`);
-  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+  if (stat.nlink !== (typeof stat.nlink === 'bigint' ? 1n : 1)) {
+    throw new Error(`${label} must not have multiple hard links.`);
+  }
+  if (typeof process.getuid === 'function' && Number(stat.uid) !== process.getuid()) {
     throw new Error(`${label} is owned by another user.`);
   }
-  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+  if (process.platform !== 'win32' && (Number(stat.mode) & 0o077) !== 0) {
     throw new Error(`${label} must not be accessible by group or other users.`);
   }
 }
@@ -73,6 +80,155 @@ function sameFileVersion(left, right) {
     && left.size === right.size
     && left.mtimeMs === right.mtimeMs
     && left.ctimeMs === right.ctimeMs;
+}
+
+function sameBigintFileVersion(left, right) {
+  return identitiesMatch(identity(left), identity(right))
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function pathKind(stat) {
+  if (stat.isDirectory()) return 'directory';
+  if (stat.isFile()) return 'file';
+  return 'other';
+}
+
+function identity(stat) {
+  return {
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    kind: pathKind(stat),
+  };
+}
+
+function identitiesMatch(left, right) {
+  return Boolean(left && right)
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.kind === right.kind;
+}
+
+function changedError(label) {
+  return new Error(`${label} changed after it was inspected; refusing to continue.`);
+}
+
+function lstatOrUndefined(filePath) {
+  try {
+    return fs.lstatSync(filePath, { bigint: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function chdirToDescriptor(descriptor, fallbackPath, expectedIdentity, label) {
+  if (identitiesMatch(identity(fs.statSync('.', { bigint: true })), expectedIdentity)) return;
+
+  const descriptorPath = process.platform === 'win32' ? undefined : `/dev/fd/${descriptor}`;
+  if (descriptorPath) {
+    try {
+      process.chdir(descriptorPath);
+      if (!identitiesMatch(identity(fs.statSync('.', { bigint: true })), expectedIdentity)) {
+        throw changedError(label);
+      }
+      return;
+    } catch (error) {
+      const unsupported = error
+        && typeof error === 'object'
+        && ['ENOENT', 'ENOTDIR', 'EACCES', 'EINVAL'].includes(error.code);
+      if (!unsupported) throw error;
+    }
+  }
+
+  const named = lstatOrUndefined(fallbackPath);
+  if (
+    !named
+    || named.isSymbolicLink()
+    || !named.isDirectory()
+    || !identitiesMatch(identity(named), expectedIdentity)
+  ) {
+    throw changedError(label);
+  }
+  process.chdir(fallbackPath);
+  if (!identitiesMatch(identity(fs.statSync('.', { bigint: true })), expectedIdentity)) {
+    throw changedError(label);
+  }
+}
+
+function expectedDirectoryIdentity(location, pathState) {
+  return pathState.components.find(component => (
+    component.path === location.directory && component.kind === 'directory'
+  ));
+}
+
+function verifyAnchoredDirectory(location, directoryIdentity) {
+  if (!identitiesMatch(identity(fs.statSync('.', { bigint: true })), directoryIdentity)) {
+    throw changedError('Spala credential directory');
+  }
+  const named = lstatOrUndefined(location.directory);
+  if (
+    !named
+    || named.isSymbolicLink()
+    || !named.isDirectory()
+    || !identitiesMatch(identity(named), directoryIdentity)
+  ) {
+    throw changedError('Spala credential directory');
+  }
+}
+
+function withAnchoredStoreDirectory(location, pathState, action) {
+  const expectedIdentity = expectedDirectoryIdentity(location, pathState);
+  if (!expectedIdentity) throw changedError('Spala credential directory');
+
+  const previousPath = process.cwd();
+  const previousDescriptor = fs.openSync('.', DIRECTORY_FLAGS);
+  const previousIdentity = identity(fs.fstatSync(previousDescriptor, { bigint: true }));
+  let directoryDescriptor;
+  let changedDirectory = false;
+  let restorationError;
+  try {
+    directoryDescriptor = fs.openSync(location.directory, DIRECTORY_FLAGS);
+    const directoryStat = fs.fstatSync(directoryDescriptor, { bigint: true });
+    const directoryIdentity = identity(directoryStat);
+    if (
+      !directoryStat.isDirectory()
+      || !identitiesMatch(directoryIdentity, expectedIdentity)
+    ) {
+      throw changedError('Spala credential directory');
+    }
+    chdirToDescriptor(
+      directoryDescriptor,
+      location.directory,
+      directoryIdentity,
+      'Spala credential directory',
+    );
+    changedDirectory = true;
+    verifyAnchoredDirectory(location, directoryIdentity);
+    return action(directoryIdentity);
+  } catch (error) {
+    if (error && typeof error === 'object' && ['ELOOP', 'EMLINK'].includes(error.code)) {
+      throw new Error('Spala credential store path must not contain symbolic links.');
+    }
+    throw error;
+  } finally {
+    if (changedDirectory) {
+      try {
+        chdirToDescriptor(
+          previousDescriptor,
+          previousPath,
+          previousIdentity,
+          'Installer working directory',
+        );
+      } catch (error) {
+        restorationError = error;
+      }
+    }
+    if (directoryDescriptor !== undefined) fs.closeSync(directoryDescriptor);
+    fs.closeSync(previousDescriptor);
+    if (restorationError) throw restorationError;
+  }
 }
 
 function assertCredentialPath(location, expectedState, options) {
@@ -104,7 +260,19 @@ function ensureStoreDirectory(location, expectedState) {
   if (typeof process.getuid === 'function' && directoryStat.uid !== process.getuid()) {
     throw new Error('Spala credential directory is owned by another user.');
   }
-  if (process.platform !== 'win32') fs.chmodSync(location.directory, 0o700);
+  if (process.platform !== 'win32') {
+    const expectedDirectory = expectedDirectoryIdentity(location, created);
+    const descriptor = fs.openSync(location.directory, DIRECTORY_FLAGS);
+    try {
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      if (!identitiesMatch(identity(opened), expectedDirectory)) {
+        throw changedError('Spala credential directory');
+      }
+      fs.fchmodSync(descriptor, 0o700);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  }
   return assertCredentialPath(location, created);
 }
 
@@ -115,30 +283,35 @@ function waitForStoreLock(deadline) {
   return true;
 }
 
-function acquireStoreLock(location) {
+function acquireStoreLock(location, pathState, directoryIdentity) {
   const deadline = Date.now() + CREDENTIAL_STORE_LOCK_TIMEOUT_MS;
 
   while (true) {
-    assertCredentialPath(location);
+    verifyAnchoredDirectory(location, directoryIdentity);
+    assertCredentialPath(location, pathState, { allowTargetChange: true });
     assertLockPath(location);
     try {
       const release = lockfile.lockSync(location.filePath, {
+        lockfilePath: path.basename(location.lockPath),
         realpath: false,
         retries: 0,
         stale: CREDENTIAL_STORE_STALE_LOCK_MS,
         update: CREDENTIAL_STORE_STALE_LOCK_MS / 2,
       });
       try {
-        assertCredentialPath(location);
+        verifyAnchoredDirectory(location, directoryIdentity);
+        assertCredentialPath(location, pathState, { allowTargetChange: true });
         assertLockPath(location);
-        const lockStat = fs.lstatSync(location.lockPath);
+        const lockStat = fs.lstatSync(path.basename(location.lockPath));
         if (!lockStat.isDirectory()) {
           throw new Error('Spala credential store lock must be a directory.');
         }
         if (typeof process.getuid === 'function' && lockStat.uid !== process.getuid()) {
           throw new Error('Spala credential store lock is owned by another user.');
         }
-        if (process.platform !== 'win32') fs.chmodSync(location.lockPath, 0o700);
+        if (process.platform !== 'win32') {
+          fs.chmodSync(path.basename(location.lockPath), 0o700);
+        }
         assertLockPath(location);
       } catch (error) {
         release();
@@ -155,13 +328,17 @@ function acquireStoreLock(location) {
 }
 
 function withStoreLock(location, action) {
-  ensureStoreDirectory(location);
-  const release = acquireStoreLock(location);
-  try {
-    return action();
-  } finally {
-    release();
-  }
+  const pathState = ensureStoreDirectory(location);
+  return withAnchoredStoreDirectory(location, pathState, directoryIdentity => {
+    const release = acquireStoreLock(location, pathState, directoryIdentity);
+    try {
+      const result = action();
+      verifyAnchoredDirectory(location, directoryIdentity);
+      return result;
+    } finally {
+      release();
+    }
+  });
 }
 
 function readStoreAtLocation(location) {
@@ -173,20 +350,33 @@ function readStoreAtLocation(location) {
   let descriptor;
   let body;
   try {
-    descriptor = fs.openSync(
-      location.filePath,
-      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
-    );
-    const before = fs.fstatSync(descriptor);
-    assertPrivateRegularFile(before, 'Spala credential store');
-    assertCredentialPath(location, pathState);
-    body = fs.readFileSync(descriptor, 'utf8');
-    const after = fs.fstatSync(descriptor);
-    assertPrivateRegularFile(after, 'Spala credential store');
-    if (!sameFileVersion(before, after)) {
-      throw new Error('Spala credential store changed while it was read.');
-    }
-    assertCredentialPath(location, pathState);
+    withAnchoredStoreDirectory(location, pathState, directoryIdentity => {
+      descriptor = fs.openSync(path.basename(location.filePath), fs.constants.O_RDONLY | NOFOLLOW);
+      const before = fs.fstatSync(descriptor, { bigint: true });
+      assertPrivateRegularFile(before, 'Spala credential store');
+      const expectedFile = pathState.components.find(component => component.path === location.filePath);
+      if (!identitiesMatch(identity(before), expectedFile)) {
+        throw changedError('Spala credential store');
+      }
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, pathState);
+      body = fs.readFileSync(descriptor, 'utf8');
+      const after = fs.fstatSync(descriptor, { bigint: true });
+      assertPrivateRegularFile(after, 'Spala credential store');
+      if (!sameFileVersion(before, after)) {
+        throw new Error('Spala credential store changed while it was read.');
+      }
+      const named = lstatOrUndefined(path.basename(location.filePath));
+      if (
+        !named
+        || named.isSymbolicLink()
+        || !identitiesMatch(identity(named), identity(after))
+      ) {
+        throw changedError('Spala credential store');
+      }
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, pathState);
+    });
   } catch (error) {
     if (error && typeof error === 'object' && ['ELOOP', 'EMLINK'].includes(error.code)) {
       throw new Error('Spala credential store path must not contain symbolic links.');
@@ -212,63 +402,404 @@ function readStore(env, workspaceRoot) {
   return readStoreAtLocation(credentialStoreLocation(env, workspaceRoot));
 }
 
-function removeTemporary(temporary) {
+function removeOwnedEntry(name, expectedIdentity, label, { ignoreMismatch = false } = {}) {
+  if (!expectedIdentity) return;
+  const stat = lstatOrUndefined(name);
+  if (!stat) return;
+  if (
+    stat.isSymbolicLink()
+    || !identitiesMatch(identity(stat), expectedIdentity)
+  ) {
+    if (ignoreMismatch) return;
+    throw changedError(label);
+  }
+  fs.unlinkSync(name);
+}
+
+function expectedTargetRevision(pathState, filePath) {
+  return pathState.components.find(component => component.path === filePath);
+}
+
+function statMatchesExpectedRevision(stat, expected) {
+  return identitiesMatch(identity(stat), expected)
+    && stat.nlink.toString() === expected.nlink
+    && stat.size.toString() === expected.size
+    && stat.mtimeNs.toString() === expected.mtimeNs
+    && stat.ctimeNs.toString() === expected.ctimeNs;
+}
+
+function readAll(descriptor) {
+  const chunks = [];
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (true) {
+    const count = fs.readSync(descriptor, buffer, 0, buffer.length, position);
+    if (!count) break;
+    chunks.push(Buffer.from(buffer.subarray(0, count)));
+    position += count;
+  }
+  return Buffer.concat(chunks);
+}
+
+function readDescriptorRevision(descriptor, label, { requireSingleLink = true } = {}) {
+  const before = fs.fstatSync(descriptor, { bigint: true });
+  if (!before.isFile()) throw new Error(`${label} must be a regular file.`);
+  if (requireSingleLink && before.nlink !== 1n) {
+    throw new Error(`${label} must not have multiple hard links.`);
+  }
+  if (typeof process.getuid === 'function' && Number(before.uid) !== process.getuid()) {
+    throw new Error(`${label} is owned by another user.`);
+  }
+  if (process.platform !== 'win32' && (Number(before.mode) & 0o077) !== 0) {
+    throw new Error(`${label} must not be accessible by group or other users.`);
+  }
+  const content = readAll(descriptor);
+  const after = fs.fstatSync(descriptor, { bigint: true });
+  if (
+    !after.isFile()
+    || (requireSingleLink && after.nlink !== 1n)
+    || !sameBigintFileVersion(before, after)
+  ) {
+    throw changedError(label);
+  }
+  return {
+    content,
+    gid: after.gid.toString(),
+    identity: identity(after),
+    mode: Number(after.mode) & 0o777,
+    nlink: after.nlink,
+    size: after.size,
+    mtimeNs: after.mtimeNs,
+    ctimeNs: after.ctimeNs,
+    sha256: createHash('sha256').update(content).digest('hex'),
+    uid: after.uid.toString(),
+  };
+}
+
+function guardExpectedTarget(location, pathState) {
+  const targetName = path.basename(location.filePath);
+  const expected = expectedTargetRevision(pathState, location.filePath);
+  if (!expected) {
+    if (lstatOrUndefined(targetName)) throw changedError('Spala credential store');
+    return { existed: false };
+  }
+
+  const descriptor = fs.openSync(targetName, fs.constants.O_RDONLY | NOFOLLOW);
   try {
-    fs.unlinkSync(temporary);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!statMatchesExpectedRevision(opened, expected)) {
+      throw changedError('Spala credential store');
+    }
+    const revision = readDescriptorRevision(descriptor, 'Spala credential store');
+    if (
+      revision.sha256 !== expected.sha256
+      || revision.size.toString() !== expected.size
+      || revision.mtimeNs.toString() !== expected.mtimeNs
+      || revision.ctimeNs.toString() !== expected.ctimeNs
+    ) {
+      throw changedError('Spala credential store');
+    }
+    const named = lstatOrUndefined(targetName);
+    if (
+      !named
+      || named.isSymbolicLink()
+      || !identitiesMatch(identity(named), revision.identity)
+    ) {
+      throw changedError('Spala credential store');
+    }
+    return { descriptor, existed: true, revision };
   } catch (error) {
-    if (!error || typeof error !== 'object' || error.code !== 'ENOENT') throw error;
+    fs.closeSync(descriptor);
+    throw error;
   }
 }
 
-function writeStore(location, store, expectedState) {
-  const pathState = ensureStoreDirectory(location, expectedState);
-  const temporary = path.join(
-    location.directory,
-    `.mcp-credentials.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+function verifyGuardedTargetName(targetName, guard) {
+  const named = lstatOrUndefined(targetName);
+  if (!guard.existed) {
+    if (named) throw changedError('Spala credential store');
+    return;
+  }
+  if (
+    !named
+    || named.isSymbolicLink()
+    || !identitiesMatch(identity(named), guard.revision.identity)
+    || named.nlink !== 1n
+    || named.size !== guard.revision.size
+    || named.mtimeNs !== guard.revision.mtimeNs
+    || named.ctimeNs !== guard.revision.ctimeNs
+  ) {
+    throw changedError('Spala credential store');
+  }
+}
+
+function detachedRevision(guard) {
+  if (!guard.existed) return { changed: false, revision: null };
+  const revision = readDescriptorRevision(
+    guard.descriptor,
+    'Spala credential store',
+    { requireSingleLink: false },
   );
+  return {
+    changed: !revision.content.equals(guard.revision.content)
+      || revision.size !== guard.revision.size
+      || revision.mtimeNs !== guard.revision.mtimeNs
+      || revision.mode !== guard.revision.mode
+      || revision.uid !== guard.revision.uid
+      || revision.gid !== guard.revision.gid
+      || revision.nlink !== 0n,
+    revision,
+  };
+}
+
+function restoreTargetRevision(targetName, replacementIdentity, revision) {
+  if (!revision) {
+    removeOwnedEntry(targetName, replacementIdentity, 'Spala credential store');
+    return;
+  }
+
+  const restoreName = `.mcp-credentials.restore-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let descriptor;
-  let temporaryState;
+  let restoreIdentity;
+  let restored = false;
+  let cleanupError;
   try {
-    assertSafePath(temporary, location.homePath, 'Spala credential store temporary path');
     descriptor = fs.openSync(
-      temporary,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
+      restoreName,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | NOFOLLOW,
       0o600,
     );
-    fs.writeFileSync(descriptor, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
-    if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
-    fs.chmodSync(temporary, 0o600);
+    restoreIdentity = identity(fs.fstatSync(descriptor, { bigint: true }));
+    fs.writeFileSync(descriptor, revision.content);
+    if (process.platform !== 'win32') fs.fchmodSync(descriptor, revision.mode);
+    fs.chmodSync(restoreName, revision.mode);
     fs.fsyncSync(descriptor);
-    const temporaryStat = fs.fstatSync(descriptor);
-    assertPrivateRegularFile(temporaryStat, 'Spala credential store temporary file');
-    temporaryState = assertSafePath(
-      temporary,
-      location.homePath,
-      'Spala credential store temporary path',
-    );
-    const namedTemporary = fs.lstatSync(temporary);
-    if (temporaryStat.dev !== namedTemporary.dev || temporaryStat.ino !== namedTemporary.ino) {
-      throw new Error('Spala credential store temporary file changed before it was written.');
+    const written = fs.fstatSync(descriptor, { bigint: true });
+    assertPrivateRegularFile(written, 'Spala credential store recovery file');
+    if (!identitiesMatch(identity(written), restoreIdentity)) {
+      throw changedError('Spala credential store recovery file');
+    }
+    const namedRestore = lstatOrUndefined(restoreName);
+    if (
+      !namedRestore
+      || namedRestore.isSymbolicLink()
+      || !identitiesMatch(identity(namedRestore), restoreIdentity)
+    ) {
+      throw changedError('Spala credential store recovery file');
     }
     fs.closeSync(descriptor);
     descriptor = undefined;
 
-    assertCredentialPath(location, pathState);
-    assertSafePath(
-      temporary,
-      location.homePath,
-      'Spala credential store temporary path',
-      temporaryState,
-    );
-    fs.renameSync(temporary, location.filePath);
-    const writtenState = assertCredentialPath(location);
-    const written = fs.lstatSync(location.filePath);
-    assertPrivateRegularFile(written, 'Spala credential store');
-    return writtenState;
+    const current = lstatOrUndefined(targetName);
+    if (
+      !current
+      || current.isSymbolicLink()
+      || !identitiesMatch(identity(current), replacementIdentity)
+    ) {
+      throw changedError('Spala credential store');
+    }
+    fs.renameSync(restoreName, targetName);
+    const restoredStat = lstatOrUndefined(targetName);
+    if (
+      !restoredStat
+      || restoredStat.isSymbolicLink()
+      || !identitiesMatch(identity(restoredStat), restoreIdentity)
+    ) {
+      throw changedError('Spala credential store');
+    }
+    assertPrivateRegularFile(restoredStat, 'Spala credential store');
+    const restoredDescriptor = fs.openSync(targetName, fs.constants.O_RDONLY | NOFOLLOW);
+    try {
+      const restoredRevision = readDescriptorRevision(
+        restoredDescriptor,
+        'Spala credential store',
+      );
+      if (
+        !identitiesMatch(restoredRevision.identity, restoreIdentity)
+        || !restoredRevision.content.equals(revision.content)
+      ) {
+        throw changedError('Spala credential store');
+      }
+    } finally {
+      fs.closeSync(restoredDescriptor);
+    }
+    restored = true;
   } finally {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
-    removeTemporary(temporary);
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    if (!restored) {
+      try {
+        removeOwnedEntry(
+          restoreName,
+          restoreIdentity,
+          'Spala credential store recovery file',
+        );
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (cleanupError) throw cleanupError;
   }
+}
+
+function writeStore(location, store, expectedState) {
+  const pathState = assertCredentialPath(location, expectedState);
+  const temporaryName = `.mcp-credentials.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const temporary = path.join(location.directory, temporaryName);
+  const targetName = path.basename(location.filePath);
+  const content = `${JSON.stringify(store, null, 2)}\n`;
+
+  return withAnchoredStoreDirectory(location, pathState, directoryIdentity => {
+    let descriptor;
+    let targetGuard;
+    let temporaryIdentity;
+    let replacementPublished = false;
+    let rollbackRevision;
+    let completed = false;
+    try {
+      assertSafePath(temporary, location.homePath, 'Spala credential store temporary path');
+      verifyAnchoredDirectory(location, directoryIdentity);
+      descriptor = fs.openSync(
+        temporaryName,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | NOFOLLOW,
+        0o600,
+      );
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      assertPrivateRegularFile(opened, 'Spala credential store temporary file');
+      temporaryIdentity = identity(opened);
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, pathState);
+      fs.chmodSync(temporaryName, 0o600);
+      const modeChecked = lstatOrUndefined(temporaryName);
+      if (
+        !modeChecked
+        || modeChecked.isSymbolicLink()
+        || !identitiesMatch(identity(modeChecked), temporaryIdentity)
+      ) {
+        throw changedError('Spala credential store temporary file');
+      }
+      assertPrivateRegularFile(modeChecked, 'Spala credential store temporary file');
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, pathState);
+
+      fs.writeFileSync(descriptor, content, 'utf8');
+      if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
+      fs.fsyncSync(descriptor);
+      const temporaryStat = fs.fstatSync(descriptor, { bigint: true });
+      assertPrivateRegularFile(temporaryStat, 'Spala credential store temporary file');
+      if (!identitiesMatch(identity(temporaryStat), temporaryIdentity)) {
+        throw changedError('Spala credential store temporary file');
+      }
+      const namedTemporary = lstatOrUndefined(temporaryName);
+      if (
+        !namedTemporary
+        || namedTemporary.isSymbolicLink()
+        || !identitiesMatch(identity(namedTemporary), temporaryIdentity)
+      ) {
+        throw changedError('Spala credential store temporary file');
+      }
+      verifyAnchoredDirectory(location, directoryIdentity);
+      assertCredentialPath(location, pathState);
+
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      assertCredentialPath(location, pathState);
+      verifyAnchoredDirectory(location, directoryIdentity);
+      targetGuard = guardExpectedTarget(location, pathState);
+      rollbackRevision = targetGuard.existed ? targetGuard.revision : null;
+      assertCredentialPath(location, pathState);
+      verifyAnchoredDirectory(location, directoryIdentity);
+      verifyGuardedTargetName(targetName, targetGuard);
+      fs.renameSync(temporaryName, targetName);
+      replacementPublished = true;
+      const written = lstatOrUndefined(targetName);
+      if (
+        !written
+        || written.isSymbolicLink()
+        || !identitiesMatch(identity(written), temporaryIdentity)
+      ) {
+        throw changedError('Spala credential store');
+      }
+      assertPrivateRegularFile(written, 'Spala credential store');
+      const detached = detachedRevision(targetGuard);
+      rollbackRevision = detached.changed ? detached.revision : rollbackRevision;
+      if (detached.changed) throw changedError('Spala credential store');
+      verifyAnchoredDirectory(location, directoryIdentity);
+      const writtenState = assertCredentialPath(
+        location,
+        pathState,
+        { allowTargetChange: true },
+      );
+      verifyAnchoredDirectory(location, directoryIdentity);
+      completed = true;
+      return writtenState;
+    } catch (error) {
+      if (replacementPublished) {
+        try {
+          restoreTargetRevision(targetName, temporaryIdentity, rollbackRevision);
+        } catch (restoreError) {
+          try {
+            removeOwnedEntry(targetName, temporaryIdentity, 'Spala credential store');
+          } catch (cleanupError) {
+            if (restoreError && typeof restoreError === 'object') {
+              restoreError.cleanupError = cleanupError;
+            }
+          }
+          const rollbackError = new Error(
+            'Spala credential store publication failed and the prior revision could not be restored.',
+            { cause: restoreError },
+          );
+          rollbackError.changed = true;
+          throw rollbackError;
+        }
+      }
+      throw error;
+    } finally {
+      let cleanupError;
+      if (descriptor !== undefined) {
+        try {
+          fs.closeSync(descriptor);
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+      if (targetGuard?.descriptor !== undefined) {
+        try {
+          fs.closeSync(targetGuard.descriptor);
+        } catch (error) {
+          cleanupError ||= error;
+        }
+      }
+      if (!completed) {
+        const cleanupActions = [
+          () => removeOwnedEntry(
+            temporaryName,
+            temporaryIdentity,
+            'Spala credential store temporary file',
+          ),
+          () => removeOwnedEntry(
+            targetName,
+            temporaryIdentity,
+            'Spala credential store',
+            { ignoreMismatch: true },
+          ),
+        ];
+        for (const cleanup of cleanupActions) {
+          try {
+            cleanup();
+          } catch (error) {
+            cleanupError ||= error;
+          }
+        }
+      }
+      if (cleanupError) throw cleanupError;
+    }
+  });
 }
 
 function updateStore(env, workspaceRoot, update) {
@@ -302,22 +833,33 @@ function credentialStatus(credential) {
 
 export function preflightCredentialStore(env = process.env, workspaceRoot) {
   const { location, pathState } = readStore(env, workspaceRoot);
-  ensureStoreDirectory(location, pathState);
-  const probe = path.join(location.directory, `.write-probe-${process.pid}-${Date.now()}`);
-  let descriptor;
-  try {
-    assertSafePath(probe, location.homePath, 'Spala credential store write probe');
-    descriptor = fs.openSync(
-      probe,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
-      0o600,
-    );
-    if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
-    assertPrivateRegularFile(fs.fstatSync(descriptor), 'Spala credential store write probe');
-  } finally {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
-    removeTemporary(probe);
-  }
+  const createdState = ensureStoreDirectory(location, pathState);
+  const probeName = `.write-probe-${process.pid}-${Date.now()}`;
+  const probe = path.join(location.directory, probeName);
+  withAnchoredStoreDirectory(location, createdState, directoryIdentity => {
+    let descriptor;
+    let probeIdentity;
+    try {
+      assertSafePath(probe, location.homePath, 'Spala credential store write probe');
+      verifyAnchoredDirectory(location, directoryIdentity);
+      descriptor = fs.openSync(
+        probeName,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | NOFOLLOW,
+        0o600,
+      );
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      probeIdentity = identity(opened);
+      if (process.platform !== 'win32') fs.fchmodSync(descriptor, 0o600);
+      assertPrivateRegularFile(
+        fs.fstatSync(descriptor, { bigint: true }),
+        'Spala credential store write probe',
+      );
+      verifyAnchoredDirectory(location, directoryIdentity);
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+      removeOwnedEntry(probeName, probeIdentity, 'Spala credential store write probe');
+    }
+  });
   return { filePath: location.filePath };
 }
 

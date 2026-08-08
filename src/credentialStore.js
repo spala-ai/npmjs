@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
 import { normalizeMcpUrl } from './installer.js';
 
 export const CREDENTIAL_STORE_SCHEMA_VERSION = 1;
@@ -45,7 +46,7 @@ function assertNotSymlink(filePath, label) {
 }
 
 function emptyStore() {
-  return { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects: {} };
+  return { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects: {}, claims: {} };
 }
 
 function readStore(env, workspaceRoot) {
@@ -64,6 +65,10 @@ function readStore(env, workspaceRoot) {
   if (!parsed || parsed.schemaVersion !== CREDENTIAL_STORE_SCHEMA_VERSION || !parsed.projects || typeof parsed.projects !== 'object' || Array.isArray(parsed.projects)) {
     throw new Error('Spala credential store has an unsupported format.');
   }
+  if (parsed.claims !== undefined && (!parsed.claims || typeof parsed.claims !== 'object' || Array.isArray(parsed.claims))) {
+    throw new Error('Spala credential store has an unsupported claim format.');
+  }
+  parsed.claims ||= {};
   return { filePath, store: parsed };
 }
 
@@ -131,6 +136,7 @@ export function storeProjectCredential({ projectId, mcpUrl, bearerToken, expires
   }
   const next = {
     schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION,
+    claims: store.claims,
     projects: {
       ...store.projects,
       [id]: credential,
@@ -222,7 +228,7 @@ export function restoreProjectCredential(projectId, snapshot, env = process.env,
   const projects = { ...store.projects };
   if (snapshot === null) delete projects[id];
   else projects[id] = structuredClone(snapshot);
-  writeStore(filePath, { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects });
+  writeStore(filePath, { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects, claims: store.claims });
 }
 
 export function removeProjectCredential(projectId, env = process.env, workspaceRoot) {
@@ -231,6 +237,73 @@ export function removeProjectCredential(projectId, env = process.env, workspaceR
   if (!Object.hasOwn(store.projects, id)) return { changed: false, projectId: id };
   const projects = { ...store.projects };
   delete projects[id];
-  writeStore(filePath, { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects });
+  writeStore(filePath, { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects, claims: store.claims });
   return { changed: true, projectId: id };
+}
+
+function validateClaimRequestId(value) {
+  if (typeof value !== 'string' || !/^claim_[A-Za-z0-9_-]{20,80}$/.test(value)) {
+    throw new Error('bootstrapRequestId is invalid. Prepare a fresh project authorization.');
+  }
+  return value;
+}
+
+function activeClaims(store) {
+  const now = Date.now();
+  return Object.fromEntries(Object.entries(store.claims || {}).filter(([, claim]) => (
+    claim && Number.isFinite(Date.parse(String(claim.expiresAt || ''))) && Date.parse(claim.expiresAt) > now
+  )));
+}
+
+export function createProjectClaimRequest(binding, env = process.env, workspaceRoot) {
+  const projectId = validateProjectId(binding.projectId);
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const requestId = `claim_${randomBytes(18).toString('base64url')}`;
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const { filePath, store } = readStore(env, workspaceRoot);
+  const claims = Object.fromEntries(Object.entries(activeClaims(store)).filter(([, claim]) => claim.projectId !== projectId));
+  claims[requestId] = {
+    projectId,
+    projectUrl: String(binding.projectUrl),
+    mcpUrl: normalizeMcpUrl(binding.mcpUrl, '', true),
+    serverName: String(binding.serverName),
+    verifier,
+    challenge,
+    expiresAt,
+  };
+  writeStore(filePath, { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects: store.projects, claims });
+  return { requestId, challenge, expiresAt };
+}
+
+export function readProjectClaimRequest(requestId, binding, env = process.env, workspaceRoot) {
+  const id = validateClaimRequestId(requestId);
+  const { store } = readStore(env, workspaceRoot);
+  const claim = store.claims?.[id];
+  if (!claim || Date.parse(String(claim.expiresAt || '')) <= Date.now()) {
+    throw new Error('The local project authorization request is missing or expired. Prepare it again.');
+  }
+  const expected = {
+    projectId: validateProjectId(binding.projectId),
+    projectUrl: String(binding.projectUrl),
+    mcpUrl: normalizeMcpUrl(binding.mcpUrl, '', true),
+    serverName: String(binding.serverName),
+  };
+  for (const [key, value] of Object.entries(expected)) {
+    if (claim[key] !== value) throw new Error('The local project authorization request does not match this project binding.');
+  }
+  if (typeof claim.verifier !== 'string' || claim.verifier.length < 43 || claim.verifier.length > 128) {
+    throw new Error('The local project authorization verifier is invalid. Prepare it again.');
+  }
+  return { requestId: id, verifier: claim.verifier, challenge: claim.challenge, expiresAt: claim.expiresAt };
+}
+
+export function removeProjectClaimRequest(requestId, env = process.env, workspaceRoot) {
+  const id = validateClaimRequestId(requestId);
+  const { filePath, store } = readStore(env, workspaceRoot);
+  if (!Object.hasOwn(store.claims || {}, id)) return { changed: false, requestId: id };
+  const claims = { ...(store.claims || {}) };
+  delete claims[id];
+  writeStore(filePath, { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects: store.projects, claims });
+  return { changed: true, requestId: id };
 }

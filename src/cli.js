@@ -32,8 +32,11 @@ import { assertExactCodexRemoteRegistration } from './codexToml.js';
 import { consumeBootstrap, readBootstrapCapability } from './bootstrap.js';
 import {
   hasProjectCredential,
+  createProjectClaimRequest,
   preflightCredentialStore,
+  readProjectClaimRequest,
   removeProjectCredential,
+  removeProjectClaimRequest,
   restoreCredentialStore,
   snapshotCredentialStore,
   storeProjectCredential,
@@ -79,6 +82,8 @@ function parseArgs(argv) {
     projectId: undefined,
     projectUrl: undefined,
     bootstrapUrl: undefined,
+    bootstrapClaim: undefined,
+    bootstrapRequestId: undefined,
     bootstrapStdin: false,
     bootstrapFd: undefined,
     switchProject: false,
@@ -98,8 +103,8 @@ function parseArgs(argv) {
   let startIndex = 0;
   if (argv[0] === 'project') {
     const subcommand = argv[1];
-    if (!['bind', 'status', 'unbind', 'disconnect'].includes(subcommand)) {
-      throw new Error('Unknown project command. Use project bind, project status, or project unbind.');
+    if (!['prepare', 'bind', 'status', 'unbind', 'disconnect'].includes(subcommand)) {
+      throw new Error('Unknown project command. Use project prepare, project bind, project status, or project unbind.');
     }
     args.command = subcommand === 'disconnect' ? 'project-unbind' : `project-${subcommand}`;
     startIndex = 2;
@@ -154,6 +159,8 @@ function parseArgs(argv) {
     else if (arg === '--project-id') args.projectId = requireValue('--project-id', argv[++index]);
     else if (arg === '--project-url') args.projectUrl = requireValue('--project-url', argv[++index]);
     else if (arg === '--bootstrap-url') args.bootstrapUrl = requireValue('--bootstrap-url', argv[++index]);
+    else if (arg === '--bootstrap-claim') args.bootstrapClaim = requireValue('--bootstrap-claim', argv[++index]);
+    else if (arg === '--bootstrap-request-id') args.bootstrapRequestId = requireValue('--bootstrap-request-id', argv[++index]);
     else if (arg === '--bootstrap-fd') args.bootstrapFd = Number(requireValue('--bootstrap-fd', argv[++index]));
     else if (arg === '--client') args.client = requireValue('--client', argv[++index]);
     else if (arg === '--name') args.name = requireValue('--name', argv[++index]);
@@ -174,6 +181,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--project-id=')) args.projectId = requireValue('--project-id', arg.slice('--project-id='.length));
     else if (arg.startsWith('--project-url=')) args.projectUrl = requireValue('--project-url', arg.slice('--project-url='.length));
     else if (arg.startsWith('--bootstrap-url=')) args.bootstrapUrl = requireValue('--bootstrap-url', arg.slice('--bootstrap-url='.length));
+    else if (arg.startsWith('--bootstrap-claim=')) args.bootstrapClaim = requireValue('--bootstrap-claim', arg.slice('--bootstrap-claim='.length));
+    else if (arg.startsWith('--bootstrap-request-id=')) args.bootstrapRequestId = requireValue('--bootstrap-request-id', arg.slice('--bootstrap-request-id='.length));
     else if (arg.startsWith('--bootstrap-fd=')) args.bootstrapFd = Number(requireValue('--bootstrap-fd', arg.slice('--bootstrap-fd='.length)));
     else if (arg.startsWith('--client=')) args.client = requireValue('--client', arg.slice('--client='.length));
     else if (arg.startsWith('--name=')) args.name = requireValue('--name', arg.slice('--name='.length));
@@ -205,25 +214,36 @@ function parseArgs(argv) {
   if (args.installScope && !INSTALL_SCOPES.includes(args.installScope)) {
     throw new Error(`--install-scope must be one of: ${INSTALL_SCOPES.join(', ')}.`);
   }
-  if (args.command === 'project-bind') {
+  if (args.command === 'project-prepare' || args.command === 'project-bind') {
     if (!args.urlProvided || !args.projectId || !args.projectUrl) {
-      throw new Error('project bind requires --project-id, --project-url, and --url.');
+      throw new Error(`${args.command.replace('-', ' ')} requires --project-id, --project-url, and --url.`);
     }
     args.exactUrl = true;
     args.installScope = args.installScope || 'workspace';
     if (args.installScope !== 'workspace') throw new Error('Project bindings must use --install-scope workspace.');
-    if (args.bootstrapUrl) throw new Error('--bootstrap-url is not accepted because command arguments may be inspected. Use --bootstrap-stdin.');
+    if (args.bootstrapUrl) throw new Error('--bootstrap-url is not accepted because unbound capabilities may be inspected. Use --bootstrap-stdin.');
+  }
+  if (args.command === 'project-prepare') {
+    if (args.bootstrapStdin || args.bootstrapFd !== undefined || args.bootstrapClaim || args.bootstrapRequestId) {
+      throw new Error('project prepare creates a new verifier and does not accept bootstrap input.');
+    }
+    if (!args.yes) throw new Error('project prepare requires --yes.');
+  }
+  if (args.command === 'project-bind') {
     if (args.bootstrapFd !== undefined && (!Number.isInteger(args.bootstrapFd) || args.bootstrapFd < 0)) throw new Error('--bootstrap-fd must be a non-negative integer.');
     if (args.bootstrapStdin && args.bootstrapFd !== undefined) throw new Error('Use only one of --bootstrap-stdin or --bootstrap-fd.');
-    if ((args.bootstrapStdin || args.bootstrapFd !== undefined) && !args.yes) throw new Error('Bootstrap capability input requires --yes so it is never mixed with an interactive prompt.');
+    const protectedClaim = Boolean(args.bootstrapClaim || args.bootstrapRequestId);
+    if (Boolean(args.bootstrapClaim) !== Boolean(args.bootstrapRequestId)) throw new Error('Use --bootstrap-claim and --bootstrap-request-id together.');
+    if (protectedClaim && (args.bootstrapStdin || args.bootstrapFd !== undefined)) throw new Error('Use either a verifier-bound claim or stdin bootstrap, not both.');
+    if ((args.bootstrapStdin || args.bootstrapFd !== undefined || protectedClaim) && !args.yes) throw new Error('Bootstrap capability input requires --yes so it is never mixed with an interactive prompt.');
   }
   if (args.command === 'proxy') {
     if (!args.projectId) throw new Error('proxy requires --project-id.');
-    const unsupported = args.client !== 'all' || args.bootstrapUrl || args.bootstrapStdin || args.bootstrapFd !== undefined || args.check || args.cleanupDuplicates || args.doctor || args.dryRun || args.exactUrl || args.installScope || args.json || args.manifest || args.name || args.printOnly || args.projectUrl || args.public || args.scopeProvided || args.switchProject || args.uninstall || args.urlProvided || args.yes;
+    const unsupported = args.client !== 'all' || args.bootstrapUrl || args.bootstrapClaim || args.bootstrapRequestId || args.bootstrapStdin || args.bootstrapFd !== undefined || args.check || args.cleanupDuplicates || args.doctor || args.dryRun || args.exactUrl || args.installScope || args.json || args.manifest || args.name || args.printOnly || args.projectUrl || args.public || args.scopeProvided || args.switchProject || args.uninstall || args.urlProvided || args.yes;
     if (unsupported) throw new Error('proxy only accepts --project-id.');
   }
   if (args.command === 'project-status' || args.command === 'project-unbind') {
-    if (args.urlProvided || args.manifest || args.projectId || args.projectUrl || args.bootstrapUrl || args.bootstrapStdin || args.bootstrapFd !== undefined || args.public || args.scopeProvided || args.installScope) {
+    if (args.urlProvided || args.manifest || args.projectId || args.projectUrl || args.bootstrapUrl || args.bootstrapClaim || args.bootstrapRequestId || args.bootstrapStdin || args.bootstrapFd !== undefined || args.public || args.scopeProvided || args.installScope) {
       throw new Error(`${args.command.replace('-', ' ')} reads the existing workspace binding and does not accept project identity flags.`);
     }
   }
@@ -244,6 +264,7 @@ function usage() {
   spala-ai login --client codex --json
   spala-ai login --client codex --url <exact-mcp-url> --name <server-name> --json
   spala-ai init --client codex --json
+  spala-ai project prepare --project-id <id> --project-url <url> --url <exact-mcp-url> --client claude-code --yes --json
   spala-ai project bind --project-id <id> --project-url <url> --url <exact-mcp-url> --client <client> --yes
   spala-ai project bind --project-id <id> --project-url <url> --url <exact-mcp-url> --bootstrap-stdin --client <client> --yes
   spala-ai project status --json
@@ -284,6 +305,10 @@ Options:
   --project-url <url>
                      Credential-free project URL stored by project bind.
   --bootstrap-stdin  Read one one-time bootstrap URL from stdin so it never appears in process arguments.
+  --bootstrap-claim <url>
+                     Redeem a verifier-bound one-time claim. Safe in argv only with --bootstrap-request-id.
+  --bootstrap-request-id <id>
+                     Select the locally stored verifier created by project prepare.
   --switch           Explicitly replace a different existing workspace binding.
   --dry-run          Print planned changes without writing files.
   --json             Print machine-readable JSON.
@@ -1217,8 +1242,45 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
   const uninstallByNameOnly = args.uninstall && Boolean(args.name) && !args.urlProvided && !args.manifest && !args.public;
   const reconcilePublicAliases = isPublicInstall && !args.uninstall;
 
+  if (args.command === 'project-prepare') {
+    const bindingInput = {
+      schemaVersion: PROJECT_BINDING_SCHEMA_VERSION,
+      projectId: args.projectId,
+      projectUrl: args.projectUrl,
+      mcpUrl,
+      serverName,
+    };
+    const bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
+    preflightCredentialStore(env, bindingPlan.workspaceRoot);
+    const authorizationRequest = createProjectClaimRequest(
+      bindingPlan.binding,
+      env,
+      bindingPlan.workspaceRoot,
+    );
+    const payload = {
+      schemaVersion: 1,
+      command: 'project-prepare',
+      outcome: 'authorization_prepared',
+      ok: true,
+      changed: true,
+      projectId: bindingPlan.binding.projectId,
+      authorizationRequest,
+      nextSteps: [
+        'Call project_connect again with this project, client claude-code, bootstrapRequestId, and bootstrapChallenge.',
+        'Run the returned verifier-bound project bind command. No browser authentication is required.',
+      ],
+    };
+    if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    else {
+      io.stdout.write('Prepared a local verifier for delegated project authorization.\n');
+      printNextSteps(payload.nextSteps, io);
+    }
+    return;
+  }
+
   if (args.command === 'project-bind') {
-    const agentic = args.bootstrapStdin || args.bootstrapFd !== undefined;
+    const protectedClaim = Boolean(args.bootstrapClaim && args.bootstrapRequestId);
+    const agentic = args.bootstrapStdin || args.bootstrapFd !== undefined || protectedClaim;
     const bindingInput = {
       schemaVersion: PROJECT_BINDING_SCHEMA_VERSION,
       projectId: args.projectId,
@@ -1289,8 +1351,20 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     let credentialSnapshot;
     try {
       let bootstrapUrl;
+      let codeVerifier;
       if (agentic) {
-        bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
+        if (protectedClaim) {
+          const pending = readProjectClaimRequest(
+            args.bootstrapRequestId,
+            bindingPlan.binding,
+            env,
+            bindingPlan.workspaceRoot,
+          );
+          bootstrapUrl = args.bootstrapClaim;
+          codeVerifier = pending.verifier;
+        } else {
+          bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
+        }
         credentialSnapshot = snapshotCredentialStore(env, bindingPlan.workspaceRoot);
         preflightCredentialStore(env, bindingPlan.workspaceRoot);
       }
@@ -1303,6 +1377,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           bootstrapUrl,
           projectUrl: bindingPlan.binding.projectUrl,
           mcpUrl: bindingPlan.binding.mcpUrl,
+          codeVerifier,
           fetchImpl: runtime.fetch || globalThis.fetch,
         });
         // The consume response is the authority on the endpoint (it may carry
@@ -1322,6 +1397,9 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           bearerToken: exchanged.bearerToken,
           expiresAt: exchanged.expiresAt,
         }, env, bindingPlan.workspaceRoot);
+        if (protectedClaim) {
+          removeProjectClaimRequest(args.bootstrapRequestId, env, bindingPlan.workspaceRoot);
+        }
       }
     } catch (error) {
       const failures = [];

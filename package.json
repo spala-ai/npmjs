@@ -1,6 +1,6 @@
 {
   "name": "@spala-ai/mcp-install",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Install Spala Public MCP and project MCP servers into local AI coding clients.",
   "homepage": "https://docs.spala.ai/agents/mcp/",
   "readmeFilename": "README.md",
@@ -38,6 +38,10 @@
   },
   "scripts": {
     "test": "node --test",
+    "sync:versioned-docs": "node scripts/sync-versioned-docs.mjs",
+    "check:versioned-docs": "node scripts/sync-versioned-docs.mjs --check",
+    "version": "node scripts/sync-versioned-docs.mjs && git add README.md package.json",
+    "prepack": "node scripts/sync-versioned-docs.mjs --check",
     "ci": "pnpm test && pnpm pack"
   },
   "engines": {

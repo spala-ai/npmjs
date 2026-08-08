@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { runBoundedCommand, runCli } from '../src/cli.js';
 import {
@@ -4269,6 +4270,88 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   const stored = readProjectCredential('project-123', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.bearerToken, bearerToken);
   assert.equal(stored.mcpUrl, 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('Claude Code redeems a verifier-bound project claim without browser OAuth or secret argv', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.claude'));
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const projectUrl = 'https://shared.spala.ai/p123/';
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const serverName = 'spala_project_test';
+  let prepareOutput = '';
+
+  await runCli([
+    'project', 'prepare',
+    '--project-id', 'project-123',
+    '--project-url', projectUrl,
+    '--url', mcpUrl,
+    '--name', serverName,
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], env, workspace, {
+    stdout: { write: chunk => { prepareOutput += chunk; } },
+    stderr: { write: () => {} },
+    stdin: { isTTY: false },
+  });
+
+  const prepared = JSON.parse(prepareOutput);
+  const { requestId, challenge } = prepared.authorizationRequest;
+  assert.match(requestId, /^claim_/);
+  assert.match(challenge, /^[A-Za-z0-9_-]{43}$/);
+  const rawPreparedStore = fs.readFileSync(credentialStorePath(env), 'utf8');
+  const preparedStore = JSON.parse(rawPreparedStore);
+  const verifier = preparedStore.claims[requestId].verifier;
+  assert.equal(createHash('sha256').update(verifier).digest('base64url'), challenge);
+  assert.doesNotMatch(prepareOutput, new RegExp(verifier));
+
+  const claimUrl = 'https://shared.spala.ai/p123/mcp/agent-instructions/mcp_agent_pkce/consume';
+  const bearerToken = 'mcp_verifier_bound_project_token';
+  let bindOutput = '';
+  let exchanges = 0;
+  await runCli([
+    'project', 'bind',
+    '--project-id', 'project-123',
+    '--project-url', projectUrl,
+    '--url', mcpUrl,
+    '--name', serverName,
+    '--bootstrap-claim', claimUrl,
+    '--bootstrap-request-id', requestId,
+    '--client', 'claude-code',
+    '--yes',
+    '--json',
+  ], env, workspace, {
+    stdout: { write: chunk => { bindOutput += chunk; } },
+    stderr: { write: () => {} },
+    stdin: { isTTY: false },
+  }, {
+    fetch: async (url, options) => {
+      exchanges += 1;
+      assert.equal(url, claimUrl);
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers['content-type'], 'application/json');
+      assert.deepEqual(JSON.parse(options.body), { codeVerifier: verifier });
+      return new Response(JSON.stringify({
+        access_token: bearerToken,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        mcp_url: mcpUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+
+  assert.equal(exchanges, 1);
+  const result = JSON.parse(bindOutput);
+  assert.equal(result.agenticCredentialConfigured, true);
+  assert.doesNotMatch(bindOutput, new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
+  const claudeConfig = fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8');
+  assert.doesNotMatch(claudeConfig, new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
+  assert.match(claudeConfig, /"type"\s*:\s*"stdio"/);
+  const stored = JSON.parse(fs.readFileSync(credentialStorePath(env), 'utf8'));
+  assert.equal(stored.projects['project-123'].bearerToken, bearerToken);
+  assert.equal(stored.claims[requestId], undefined);
 });
 
 test('exact-url project bind accepts a scoped bootstrap response for a bare requested URL', async () => {

@@ -114,15 +114,27 @@ export async function readBootstrapCapability({ stdin, fd, stderr } = {}) {
   return values[0];
 }
 
-export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, fetchImpl = globalThis.fetch }) {
+export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, codeVerifier, fetchImpl = globalThis.fetch }) {
   const validatedUrl = validateBootstrapUrl(bootstrapUrl, projectUrl);
+  if (codeVerifier !== undefined && (
+    typeof codeVerifier !== 'string'
+    || codeVerifier.length < 43
+    || codeVerifier.length > 128
+    || !/^[A-Za-z0-9._~-]+$/.test(codeVerifier)
+  )) {
+    throw new Error('The local project authorization verifier is invalid.');
+  }
   if (typeof fetchImpl !== 'function') throw new Error('Bootstrap exchange is unavailable in this Node runtime.');
   let response;
   try {
     response = await fetchImpl(validatedUrl, {
       method: 'POST',
       redirect: 'error',
-      headers: { accept: 'application/json' },
+      headers: {
+        accept: 'application/json',
+        ...(codeVerifier !== undefined ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(codeVerifier !== undefined ? { body: JSON.stringify({ codeVerifier }) } : {}),
     });
   } catch {
     throw new Error('The one-time project bootstrap exchange failed. Request a fresh project connection.');

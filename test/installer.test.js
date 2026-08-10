@@ -4826,6 +4826,73 @@ test('proxy write waits never hang when stdout closes synchronously inside write
   });
 });
 
+test('proxy exits when a client leaves stdout permanently backpressured', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const listeners = {};
+  const stdout = {
+    write: () => false,
+    once: (event, handler) => { listeners[event] = handler; },
+    removeListener: (event, handler) => { if (listeners[event] === handler) delete listeners[event]; },
+  };
+  const response = { jsonrpc: '2.0', id: 1, result: { blob: 'x'.repeat(100_000) } };
+
+  await assert.rejects(runProxy({
+    projectId: 'project-123',
+    env: {
+      SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+      SPALA_MCP_PROXY_STDOUT_TIMEOUT_MS: '100',
+    },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {} })}\n`]),
+    stdout,
+    fetchImpl: async () => new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }),
+  }), /stdout remained backpressured/);
+  assert.deepEqual(listeners, {});
+});
+
+test('proxy continues when backpressured stdout drains before the deadline', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const listeners = {};
+  const stdout = {
+    write: () => {
+      setTimeout(() => listeners.drain?.(), 10);
+      return false;
+    },
+    once: (event, handler) => { listeners[event] = handler; },
+    removeListener: (event, handler) => { if (listeners[event] === handler) delete listeners[event]; },
+  };
+
+  await runProxy({
+    projectId: 'project-123',
+    env: {
+      SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+      SPALA_MCP_PROXY_STDOUT_TIMEOUT_MS: '100',
+    },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
+    stdout,
+    fetchImpl: async () => new Response(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      result: { tools: [] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  });
+  assert.deepEqual(listeners, {});
+});
+
 test('persistent GET event channel enforces per-event limits only, not a cumulative cap', async () => {
   const credentialHome = tempHome();
   storeProjectCredential({

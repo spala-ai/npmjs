@@ -7,43 +7,62 @@ const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
 // Project MCP calls are interactive; a hung backend must surface quickly,
 // not stall the whole client for ten minutes.
 const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+// If the MCP client stops consuming stdout, fail the proxy instead of
+// deadlocking its sequential request loop behind one backpressured response.
+const DEFAULT_STDOUT_DRAIN_TIMEOUT_MS = 15_000;
+
+class ProxyOutputError extends Error {}
 
 function boundedIntFromEnv(env, name, fallback, minimum, maximum) {
   const raw = Number.parseInt(env?.[name] ?? '', 10);
   return Number.isFinite(raw) && raw >= minimum && raw <= maximum ? raw : fallback;
 }
 
-function writeLine(stdout, text) {
-  // Invariant: this promise always settles — including when the stream closes
-  // or errors SYNCHRONOUSLY inside write(). Listeners are therefore attached
-  // before write() is called, never after.
+function writeLine(stdout, text, drainTimeoutMs) {
+  // Listeners are attached before write() because close/error may fire
+  // synchronously. A bounded drain wait also covers a client that remains open
+  // but stops reading after cancelling a large tool response.
   if (stdout.destroyed || stdout.writableEnded) return Promise.resolve();
   if (typeof stdout.once !== 'function') {
     stdout.write(`${text}\n`);
     return Promise.resolve();
   }
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    const settle = () => {
+    let timer;
+    const settle = error => {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
       if (typeof stdout.removeListener === 'function') {
-        stdout.removeListener('drain', settle);
-        stdout.removeListener('close', settle);
-        stdout.removeListener('error', settle);
+        stdout.removeListener('drain', onDrain);
+        stdout.removeListener('close', onClose);
+        stdout.removeListener('error', onError);
       }
-      resolve();
+      if (error) reject(error);
+      else resolve();
     };
-    stdout.once('drain', settle);
-    stdout.once('close', settle);
-    stdout.once('error', settle);
+    const onDrain = () => settle();
+    const onClose = () => settle();
+    const onError = () => settle(new ProxyOutputError('MCP proxy stdout failed.'));
+    stdout.once('drain', onDrain);
+    stdout.once('close', onClose);
+    stdout.once('error', onError);
     let accepted;
     try {
       accepted = stdout.write(`${text}\n`);
     } catch {
-      accepted = true;
+      settle(new ProxyOutputError('MCP proxy stdout failed.'));
+      return;
     }
-    if (accepted !== false || stdout.destroyed) settle();
+    if (accepted !== false || stdout.destroyed) {
+      settle();
+      return;
+    }
+    if (settled) return;
+    timer = setTimeout(() => {
+      settle(new ProxyOutputError('MCP proxy stdout remained backpressured; restart the MCP connection.'));
+    }, drainTimeoutMs);
   });
 }
 
@@ -60,8 +79,8 @@ function responseMessages(contentType, body) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-async function emitMessages(messages, stdout) {
-  for (const message of messages) await writeLine(stdout, JSON.stringify(message));
+async function emitMessages(messages, stdout, drainTimeoutMs) {
+  for (const message of messages) await writeLine(stdout, JSON.stringify(message), drainTimeoutMs);
 }
 
 async function boundedText(response, maxBodyBytes) {
@@ -94,7 +113,7 @@ async function boundedText(response, maxBodyBytes) {
 // bytes; a PERSISTENT stream (GET event channel) is capped per event only —
 // total session traffic is legitimately unbounded there. Both limits count
 // raw UTF-8 bytes, never decoded characters.
-async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes }) {
+async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes, drainTimeoutMs }) {
   if (!body?.getReader) return;
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -112,7 +131,7 @@ async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes }) {
       .map(line => line.slice(5).trimStart())
       .join('\n')
       .trim();
-    if (data) await emitMessages([JSON.parse(data)], stdout);
+    if (data) await emitMessages([JSON.parse(data)], stdout, drainTimeoutMs);
   };
   while (true) {
     const { done, value } = await reader.read();
@@ -134,13 +153,17 @@ async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes }) {
   if (buffer.trim()) await emitEvent(buffer);
 }
 
-async function emitResponse(response, stdout, maxBodyBytes) {
+async function emitResponse(response, stdout, maxBodyBytes, drainTimeoutMs) {
   const contentType = response.headers?.get?.('content-type') || '';
   if (contentType.includes('text/event-stream') && response.body?.getReader) {
-    await emitSseStream(response.body, stdout, { maxTotalBytes: maxBodyBytes, maxEventBytes: maxBodyBytes });
+    await emitSseStream(response.body, stdout, {
+      maxTotalBytes: maxBodyBytes,
+      maxEventBytes: maxBodyBytes,
+      drainTimeoutMs,
+    });
     return;
   }
-  await emitMessages(responseMessages(contentType, await boundedText(response, maxBodyBytes)), stdout);
+  await emitMessages(responseMessages(contentType, await boundedText(response, maxBodyBytes)), stdout, drainTimeoutMs);
 }
 
 function safeRemoteError(message) {
@@ -152,6 +175,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   if (typeof fetchImpl !== 'function') throw new Error('MCP proxy is unavailable in this Node runtime.');
   const maxBodyBytes = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES, 65_536, 1_073_741_824);
   const requestTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 3_600_000);
+  const stdoutDrainTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_STDOUT_TIMEOUT_MS', DEFAULT_STDOUT_DRAIN_TIMEOUT_MS, 100, 300_000);
   const workspaceRoot = findWorkspaceRoot(cwd);
   // Missing credentials are a configuration error and still fail the spawn.
   // An expired-but-present credential must NOT kill the proxy: the server
@@ -198,7 +222,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
               code: -32000,
               message: `${credentialError instanceof Error ? credentialError.message : 'Stored project credential is unavailable.'} Re-run the project bind (project_connect) for project ${projectId}; the running proxy picks up fresh credentials automatically.`,
             },
-          }], stdout);
+          }], stdout, stdoutDrainTimeoutMs);
         }
         continue;
       }
@@ -243,7 +267,11 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
             });
             if (eventResponse?.ok && (eventResponse.headers?.get?.('content-type') || '').includes('text/event-stream')) {
               // Persistent channel: per-event cap only; no cumulative cap.
-              await emitSseStream(eventResponse.body, stdout, { maxTotalBytes: null, maxEventBytes: maxBodyBytes });
+              await emitSseStream(eventResponse.body, stdout, {
+                maxTotalBytes: null,
+                maxEventBytes: maxBodyBytes,
+                drainTimeoutMs: stdoutDrainTimeoutMs,
+              });
             }
           } catch {
             // The GET channel is optional; request/response traffic continues over POST.
@@ -252,8 +280,9 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       }
       if (response.status === 202 || response.status === 204) continue;
       try {
-        await emitResponse(response, stdout, maxBodyBytes);
+        await emitResponse(response, stdout, maxBodyBytes, stdoutDrainTimeoutMs);
       } catch (error) {
+        if (error instanceof ProxyOutputError) throw error;
         if (error instanceof Error && error.message.includes('size limit')) throw error;
         throw safeRemoteError('MCP proxy received an invalid response from the project backend.');
       }

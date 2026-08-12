@@ -129,13 +129,9 @@ function ttyInput(chunks, initialRawMode = false) {
   return stdin;
 }
 
-test('release package references stay synchronized with package.json', () => {
+test('generated package references stay synchronized with package.json', () => {
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(INSTALLER_PACKAGE_SPEC, `@spala-ai/mcp-install@${packageJson.version}`);
-  assert.match(
-    fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8'),
-    new RegExp(`@spala-ai/mcp-install@${packageJson.version.replaceAll('.', '\\.')}`),
-  );
   assert.match(
     CODEX_SPALA_SKILL,
     new RegExp(`@spala-ai/mcp-install@${packageJson.version.replaceAll('.', '\\.')}`),

@@ -38,10 +38,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "sync:versioned-docs": "node scripts/sync-versioned-docs.mjs",
-    "check:versioned-docs": "node scripts/sync-versioned-docs.mjs --check",
-    "version": "node scripts/sync-versioned-docs.mjs && git add README.md package.json",
-    "prepack": "node scripts/sync-versioned-docs.mjs --check",
+    "prepack": "node --test test/versionedDocs.test.js",
     "ci": "pnpm test && pnpm pack"
   },
   "engines": {

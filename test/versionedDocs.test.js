@@ -11,4 +11,5 @@ test('README installer commands resolve the current npm release dynamically', ()
   assert.deepEqual(pinnedSpecs, [], 'README must not pin installer commands to a package version');
   assert.ok(dynamicCommands.length > 0, 'README must contain an unversioned installer command');
   assert.match(packageJson.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+  assert.equal(packageJson.author, 'Spala AI <info@spala.ai>');
 });

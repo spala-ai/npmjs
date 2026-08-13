@@ -279,5 +279,7 @@ output omits merged config bodies and client credential data.
 Prefer trusted publishing in CI. For a manual package release:
 
 ```bash
-pnpm publish --access public --provenance
+pnpm publish --access public --no-provenance
 ```
+
+Use `--provenance` only from a supported trusted-publishing CI provider.

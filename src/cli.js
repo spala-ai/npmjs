@@ -1312,7 +1312,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       });
     const selectedUnsupported = plan.skipped.filter(item => item.unsupportedScope);
     const hasSupportedTarget = agentic
-      ? plan.writes.length > 0
+      ? plan.writes.length > 0 || plan.skipped.some(item => item.client === 'claude-code' && item.commandRequired)
       : plan.writes.length > 0 || plan.skipped.some(item => item.commandRequired);
     if (!hasSupportedTarget) {
       throw new Error(selectedUnsupported[0]?.reason || 'No verified workspace-scoped target is available for the selected client.');

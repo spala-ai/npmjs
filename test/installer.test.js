@@ -4346,9 +4346,12 @@ test('Claude Code redeems a verifier-bound project claim without browser OAuth o
   const result = JSON.parse(bindOutput);
   assert.equal(result.agenticCredentialConfigured, true);
   assert.doesNotMatch(bindOutput, new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
-  const claudeConfig = fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8');
-  assert.doesNotMatch(claudeConfig, new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
-  assert.match(claudeConfig, /"type"\s*:\s*"stdio"/);
+  assert.equal(fs.existsSync(path.join(workspace, '.mcp.json')), false);
+  const configure = result.nextSteps.find(step => step.action === 'configure_client' && step.client === 'claude-code');
+  assert.deepEqual(configure.argv.slice(0, 8), [
+    'claude', 'mcp', 'add', '--transport', 'stdio', '--scope', 'local', serverName,
+  ]);
+  assert.doesNotMatch(JSON.stringify(configure), new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
   const stored = JSON.parse(fs.readFileSync(credentialStorePath(env), 'utf8'));
   assert.equal(stored.projects['project-123'].bearerToken, bearerToken);
   assert.equal(stored.claims[requestId], undefined);
@@ -4976,7 +4979,7 @@ test('agentic proxy plans are workspace-only and command hints contain no creden
   assert.equal(unsupported.skipped[0].unsupportedScope, true);
 });
 
-test('agentic proxy plans support claude-code and cursor as writable workspace clients', () => {
+test('agentic proxy plans keep Claude Code private and write Cursor workspace config', () => {
   const workspace = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
 
@@ -4987,12 +4990,16 @@ test('agentic proxy plans support claude-code and cursor as writable workspace c
     serverName: 'spala-project',
   });
   assert.equal(claudePlan.installScope, 'workspace');
-  assert.equal(claudePlan.writes[0].path, path.join(workspace, '.mcp.json'));
-  assert.deepEqual(JSON.parse(claudePlan.writes[0].content).mcpServers['spala-project'], {
-    type: 'stdio',
-    command: 'npx',
-    args: ['--yes', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123'],
-  });
+  assert.equal(claudePlan.writes.length, 0);
+  assert.deepEqual(claudePlan.skipped, [{
+    client: 'claude-code',
+    reason: 'Use the printed project-scoped stdio command for this client.',
+    commandRequired: true,
+  }]);
+  const claudeCommand = buildProxyCommandHints('spala-project', 'project-123');
+  assert.deepEqual(claudeCommand.argv.claudeCode.slice(0, 8), [
+    'claude', 'mcp', 'add', '--transport', 'stdio', '--scope', 'local', 'spala-project',
+  ]);
 
   const cursorPlan = createProxyInstallPlan({
     clientSelection: 'cursor',
@@ -5011,7 +5018,7 @@ test('agentic proxy plans support claude-code and cursor as writable workspace c
   assert.doesNotMatch(serialized, /https?:|bearer|bootstrap/i);
 });
 
-test('unselected claude-code is skipped on workspace binds unless the client is detected', () => {
+test('unselected claude-code is command-managed on workspace binds when the client is detected', () => {
   const workspace = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
   const undetected = createProxyInstallPlan({
@@ -5027,5 +5034,6 @@ test('unselected claude-code is skipped on workspace binds unless the client is 
     projectId: 'project-123',
     serverName: 'spala-project',
   });
-  assert.equal(detected.writes.some(write => write.client === 'claude-code'), true);
+  assert.equal(detected.writes.some(write => write.client === 'claude-code'), false);
+  assert.equal(detected.skipped.some(item => item.client === 'claude-code' && item.commandRequired), true);
 });

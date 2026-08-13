@@ -165,8 +165,10 @@ remote URL is absent from client config and proxy arguments;
 `.spala/project.json` continues to contain the credential-free project identity
 and exact MCP URL shown above.
 
-Codex, Roo, Claude Code, and Cursor receive workspace files. Agentic bootstrap rejects clients that
-cannot be configured atomically in the workspace before the capability is
+Codex, Roo, and Cursor receive workspace files. Claude Code receives a private,
+workspace-associated registration through `claude mcp add --scope local`; this
+avoids the separate approval required by shared `.mcp.json` entries. Agentic
+bootstrap rejects clients that cannot be configured before the capability is
 consumed. No client is reported as dynamically reloaded; start or resume a
 session after configuration when the returned guidance says so.
 
@@ -205,7 +207,7 @@ the requested install scope.
 | Client | User-scoped public MCP | Workspace-scoped project MCP |
 |---|---|---|
 | Codex CLI | Merges `~/.codex/config.toml` and installs a managed routing skill | Merges `.codex/config.toml` under `[mcp_servers.<name>]` |
-| Claude Code | `claude mcp add --scope user` | Merges `.mcp.json` at the workspace root |
+| Claude Code | `claude mcp add --scope user` | `claude mcp add --scope local` (private to the current workspace) |
 | Gemini CLI | Merges `~/.gemini/settings.json` | `gemini mcp add --scope project` |
 | Roo Code | Not verified; fails closed | Merges `.roo/mcp.json` |
 | Cursor | Merges `~/.cursor/mcp.json` | Merges `.cursor/mcp.json` |

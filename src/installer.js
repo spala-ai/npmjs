@@ -30,9 +30,9 @@ export const WRITABLE_CLIENTS = [
 ];
 
 // Clients whose USER-scoped public install is applied via a printed client CLI
-// command instead of a config-file write. Scope matters: claude-code is
-// command-only at user scope but workspace-WRITABLE (.mcp.json) for project
-// binds — clientInstallCapabilities() reports the per-scope truth.
+// command instead of a config-file write. Claude Code project bindings use its
+// private local scope: shared .mcp.json entries require a separate approval and
+// can leave resumed sessions exposing stale tools for a server that never ran.
 export const COMMAND_ONLY_CLIENTS = [
   'claude-code',
 ];
@@ -95,8 +95,8 @@ const ALL_CLIENTS = Object.keys(CLIENT_LABELS);
 
 function installMode(client, installScope) {
   if (installScope === 'workspace') {
-    if (client === 'codex' || client === 'roo' || client === 'claude-code' || client === 'cursor') return 'writable';
-    if (client === 'gemini') return 'command';
+    if (client === 'codex' || client === 'roo' || client === 'cursor') return 'writable';
+    if (client === 'claude-code' || client === 'gemini') return 'command';
     return 'unsupported';
   }
   if (client === 'codex') return 'writable';
@@ -119,7 +119,6 @@ function targetPath(client, env, workspaceRoot, installScope = 'user') {
   if (installScope === 'workspace') {
     if (client === 'codex') return joinPath(env, workspaceRoot, '.codex', 'config.toml');
     if (client === 'roo') return joinPath(env, workspaceRoot, '.roo', 'mcp.json');
-    if (client === 'claude-code') return joinPath(env, workspaceRoot, '.mcp.json');
     if (client === 'cursor') return joinPath(env, workspaceRoot, '.cursor', 'mcp.json');
     return null;
   }
@@ -1082,7 +1081,7 @@ export function buildCommandHints(serverName, mcpUrl, installScope = 'user') {
 export function buildProxyCommandHints(serverName, projectId) {
   const quote = value => `'${String(value).replace(/'/g, `'\\''`)}'`;
   const proxy = proxyCommandForProject(projectId);
-  const claudeArgs = ['claude', 'mcp', 'add', '--transport', 'stdio', '--scope', 'project', serverName, '--', proxy.command, ...proxy.args];
+  const claudeArgs = ['claude', 'mcp', 'add', '--transport', 'stdio', '--scope', 'local', serverName, '--', proxy.command, ...proxy.args];
   const geminiArgs = ['gemini', 'mcp', 'add', '--scope', 'project', serverName, proxy.command, ...proxy.args];
   return {
     claudeCode: claudeArgs.map(quote).join(' '),

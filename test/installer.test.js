@@ -25,7 +25,14 @@ import {
   rollbackInstallPlan,
   serverNameFromUrl,
 } from '../src/installer.js';
-import { credentialStorePath, projectCredentialStatus, readProjectCredential, storeProjectCredential } from '../src/credentialStore.js';
+import {
+  createProjectClaimRequest,
+  credentialStorePath,
+  projectCredentialStatus,
+  readProjectClaimRequest,
+  readProjectCredential,
+  storeProjectCredential,
+} from '../src/credentialStore.js';
 import { runProxy } from '../src/proxy.js';
 import { PassThrough, Readable } from 'node:stream';
 import {
@@ -4581,6 +4588,32 @@ test('Claude Code redeems a verifier-bound project claim without browser OAuth o
   const stored = JSON.parse(fs.readFileSync(credentialStorePath(env), 'utf8'));
   assert.equal(stored.projects['project-123'].bearerToken, bearerToken);
   assert.equal(stored.claims[requestId], undefined);
+});
+
+test('verifier-bound project claims accept a changed client-local server alias only', () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const preparedBinding = {
+    projectId: 'project-alias-migration',
+    projectUrl: 'https://shared.spala.ai/p04946',
+    mcpUrl: 'https://shared.spala.ai/p04946/mcp?scope=builder%2Cproject%2Cdata',
+    serverName: 'spala-shared-spala-ai-p04946',
+  };
+  const authorizationRequest = createProjectClaimRequest(preparedBinding, env, workspace);
+
+  const pending = readProjectClaimRequest(authorizationRequest.requestId, {
+    ...preparedBinding,
+    serverName: 'spala_project_608ef8ceb7ad',
+  }, env, workspace);
+
+  assert.equal(pending.requestId, authorizationRequest.requestId);
+  assert.equal(pending.challenge, authorizationRequest.challenge);
+  assert.throws(() => readProjectClaimRequest(authorizationRequest.requestId, {
+    ...preparedBinding,
+    mcpUrl: 'https://shared.spala.ai/pother/mcp?scope=builder%2Cproject%2Cdata',
+    serverName: 'spala_project_608ef8ceb7ad',
+  }, env, workspace), /does not match this project binding/);
 });
 
 test('exact-url project bind accepts a scoped bootstrap response for a bare requested URL', async () => {

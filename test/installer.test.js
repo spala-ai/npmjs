@@ -4356,6 +4356,42 @@ test('Claude ownership requires the current marker and recognizes only explicit 
   const current = ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', projectId];
   assert.equal(inspect(current).installerOwned, false);
   assert.equal(inspect([...current, MANAGED_PROXY_REGISTRATION_FLAG]).configured, true);
+  fs.writeFileSync(configPath, JSON.stringify({
+    projects: { [workspace]: { mcpServers: {
+      [serverName]: {
+        type: 'stdio',
+        command: 'pnpm',
+        args: [...current, MANAGED_PROXY_REGISTRATION_FLAG],
+        env: {},
+      },
+    } } },
+  }));
+  assert.equal(inspectClaudeLocalProxyRegistration({
+    cwd: workspace,
+    env: { SPALA_MCP_INSTALL_HOME: installHome },
+    projectId,
+    serverName,
+  }).configured, true);
+  for (const rejectedEnv of [{ TOKEN: 'must-not-be-owned' }, [], null]) {
+    fs.writeFileSync(configPath, JSON.stringify({
+      projects: { [workspace]: { mcpServers: {
+        [serverName]: {
+          type: 'stdio',
+          command: 'pnpm',
+          args: [...current, MANAGED_PROXY_REGISTRATION_FLAG],
+          env: rejectedEnv,
+        },
+      } } },
+    }));
+    assert.equal(inspectClaudeLocalProxyRegistration({
+      cwd: workspace,
+      env: { SPALA_MCP_INSTALL_HOME: installHome },
+      projectId,
+      serverName,
+    }).installerOwned, false);
+  }
+  assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.25', 'proxy', '--project-id', projectId]).installerOwned, true);
+  assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.25', 'proxy', '--project-id', projectId, MANAGED_PROXY_REGISTRATION_FLAG]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.23', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.19', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@9.9.9', 'proxy', '--project-id', projectId]).installerOwned, false);
@@ -4832,6 +4868,7 @@ test('Claude Code redeems a verifier-bound project claim and migrates the shared
           type: 'stdio',
           command: 'pnpm',
           args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123', MANAGED_PROXY_REGISTRATION_FLAG],
+          env: {},
         };
       }
       fs.writeFileSync(configPath, JSON.stringify(config));

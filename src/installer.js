@@ -61,6 +61,7 @@ const LEGACY_MANAGED_PROXY_PACKAGE_SPECS = new Set([
   '@spala-ai/mcp-install@0.1.21',
   '@spala-ai/mcp-install@0.1.22',
   '@spala-ai/mcp-install@0.1.23',
+  '@spala-ai/mcp-install@0.1.25',
 ]);
 
 export const CLIENT_LABELS = {
@@ -708,12 +709,21 @@ function managedClaudeProxyCommandForProject(projectId) {
 function installerProxyProjectId(value, { requireType = false } = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const keys = Object.keys(value).sort();
-  const allowedKeys = value.type === undefined
-    ? ['args', 'command']
-    : ['args', 'command', 'type'];
+  const allowedKeys = [
+    'args',
+    'command',
+    ...(value.env === undefined ? [] : ['env']),
+    ...(value.type === undefined ? [] : ['type']),
+  ].sort();
+  const normalizedEmptyEnv = value.env === undefined
+    || (value.env !== null
+      && typeof value.env === 'object'
+      && !Array.isArray(value.env)
+      && Object.keys(value.env).length === 0);
   if (
     keys.length !== allowedKeys.length
     || keys.some((key, index) => key !== allowedKeys[index])
+    || !normalizedEmptyEnv
     || (requireType && value.type !== 'stdio')
     || (value.type !== undefined && value.type !== 'stdio')
   ) return undefined;
@@ -725,7 +735,7 @@ function installerProxyProjectId(value, { requireType = false } = {}) {
   const commandArgs = marked ? args.slice(0, -1) : args;
   const packageSpec = commandArgs[1];
   const installerOwned = marked
-    ? packageSpec === INSTALLER_PACKAGE_SPEC
+    ? packageSpec === INSTALLER_PACKAGE_SPEC || LEGACY_MANAGED_PROXY_PACKAGE_SPECS.has(packageSpec)
     : LEGACY_MANAGED_PROXY_PACKAGE_SPECS.has(packageSpec);
   if (!installerOwned) return undefined;
   if (command === 'pnpm') {

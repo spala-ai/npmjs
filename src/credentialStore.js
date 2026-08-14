@@ -23,6 +23,7 @@ const DIRECTORY_FLAGS = fs.constants.O_RDONLY
   | NOFOLLOW;
 const CREDENTIAL_PUBLICATION_REVISION = Symbol('credentialPublicationRevision');
 const credentialRollbackStates = new WeakMap();
+const PROJECT_CLAIM_PREFIX = '__spala_project_claim__:';
 
 function homeDir(env) {
   return env.SPALA_MCP_CREDENTIAL_HOME || env.HOME || env.USERPROFILE || os.homedir();
@@ -55,7 +56,11 @@ function validateProjectId(value) {
   if (typeof value !== 'string' || !value.trim() || value.length > 200 || /[\0\r\n/\\]/.test(value)) {
     throw new Error('projectId must be a non-empty identifier without path separators.');
   }
-  return value.trim();
+  const projectId = value.trim();
+  if (projectId.startsWith(PROJECT_CLAIM_PREFIX)) {
+    throw new Error('projectId uses a reserved installer namespace.');
+  }
+  return projectId;
 }
 
 function validateBearer(value) {
@@ -1711,6 +1716,76 @@ export function storeProjectCredential({ projectId, mcpUrl, bearerToken, expires
   return { ...result, revision };
 }
 
+export function storeProjectCredentialAndRetire(
+  { projectId, mcpUrl, bearerToken, expiresAt, previousProjectId },
+  env = process.env,
+  workspaceRoot,
+) {
+  const id = validateProjectId(projectId);
+  const previousId = previousProjectId === undefined || previousProjectId === null
+    ? undefined
+    : validateProjectId(previousProjectId);
+  if (!previousId || previousId === id) {
+    return storeProjectCredential({ projectId: id, mcpUrl, bearerToken, expiresAt }, env, workspaceRoot);
+  }
+
+  const url = normalizeMcpUrl(mcpUrl, '', true);
+  const bearer = validateBearer(bearerToken);
+  const expiry = validateExpiresAt(expiresAt);
+  if (Date.parse(expiry) <= Date.now()) throw new Error('Bootstrap response did not include a valid future credential expiry.');
+  const credential = { mcpUrl: url, bearerToken: bearer, expiresAt: expiry, status: 'active' };
+  let previousCredentials;
+  let capturedPrevious = false;
+  const result = updateStore(env, workspaceRoot, store => {
+    if (!capturedPrevious) {
+      previousCredentials = Object.fromEntries([id, previousId].map(currentId => [
+        currentId,
+        Object.hasOwn(store.projects, currentId)
+          ? structuredClone(store.projects[currentId])
+          : null,
+      ]));
+      capturedPrevious = true;
+    }
+    const projects = { ...store.projects, [id]: credential };
+    delete projects[previousId];
+    const changed = JSON.stringify(store.projects[id]) !== JSON.stringify(credential)
+      || Object.hasOwn(store.projects, previousId);
+    return {
+      changed,
+      store: changed
+        ? { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects }
+        : store,
+      value: {
+        changed,
+        projectId: id,
+        retiredProjectId: previousId,
+        expiresAt: expiry,
+        status: 'active',
+      },
+    };
+  });
+  const publicationRevision = result[CREDENTIAL_PUBLICATION_REVISION];
+  if (!result.changed || !publicationRevision) return result;
+
+  const changedIds = [id, previousId].filter(projectId => (
+    JSON.stringify(previousCredentials[projectId])
+    !== JSON.stringify(projectId === id ? credential : null)
+  ));
+  const revision = Object.freeze({ projectId: id, projectIds: Object.freeze(changedIds) });
+  credentialRollbackStates.set(revision, {
+    expectedCredentials: Object.fromEntries(changedIds.map(projectId => [
+      projectId,
+      projectId === id ? structuredClone(credential) : null,
+    ])),
+    generation: publicationRevision.transactionId,
+    previousCredentials: Object.fromEntries(changedIds.map(projectId => [
+      projectId,
+      previousCredentials[projectId],
+    ])),
+  });
+  return { ...result, revision };
+}
+
 export function readProjectCredential(projectId, env = process.env, workspaceRoot) {
   const id = validateProjectId(projectId);
   const { store } = readStore(env, workspaceRoot);
@@ -1757,37 +1832,63 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
     throw new Error('Credential rollback requires a valid publication revision.');
   }
   const id = validateProjectId(revision.projectId);
+  const projectIds = Array.isArray(revision.projectIds)
+    ? revision.projectIds.map(validateProjectId)
+    : [id];
+  const expectedCredentials = rollback.expectedCredentials || { [id]: rollback.credential };
+  const previousCredentials = rollback.previousCredentials || { [id]: rollback.previousCredential };
+  const rollbackResult = ({ changed, restoredProjectIds = [], supersededProjectIds = [] }) => ({
+    changed,
+    projectId: id,
+    ...(projectIds.length > 1 ? { restoredProjectIds } : {}),
+    superseded: supersededProjectIds.length > 0,
+    ...(projectIds.length > 1 ? { supersededProjectIds } : {}),
+  });
+  const credentialMatches = (store, projectId, expected) => {
+    const observed = Object.hasOwn(store.projects, projectId) ? store.projects[projectId] : null;
+    return JSON.stringify(observed) === JSON.stringify(expected);
+  };
   const location = credentialStoreLocation(env, workspaceRoot);
   return withStoreLock(location, () => {
     const { pathState, recovery, store } = readRecoveredStoreAtLocation(location);
-    const currentGeneration = recovery
-      && Object.hasOwn(recovery.projectGenerations, id)
-      ? recovery.projectGenerations[id]
-      : undefined;
-    if (
-      currentGeneration !== rollback.generation
-      ||
-      JSON.stringify(store.projects[id]) !== JSON.stringify(rollback.credential)
-    ) {
+    const restorableProjectIds = projectIds.filter(projectId => {
+      const currentGeneration = recovery
+        && Object.hasOwn(recovery.projectGenerations, projectId)
+        ? recovery.projectGenerations[projectId]
+        : undefined;
+      return currentGeneration === rollback.generation
+        && credentialMatches(store, projectId, expectedCredentials[projectId]);
+    });
+    const supersededProjectIds = projectIds.filter(projectId => !restorableProjectIds.includes(projectId));
+    if (restorableProjectIds.length === 0) {
       credentialRollbackStates.delete(revision);
-      return { changed: false, projectId: id, superseded: true };
+      return rollbackResult({ changed: false, supersededProjectIds });
     }
 
     const update = observed => {
-      if (JSON.stringify(observed.projects[id]) !== JSON.stringify(rollback.credential)) {
+      const projects = { ...observed.projects };
+      const restoredProjectIds = [];
+      const nowSupersededProjectIds = [...supersededProjectIds];
+      for (const projectId of restorableProjectIds) {
+        if (!credentialMatches(observed, projectId, expectedCredentials[projectId])) {
+          nowSupersededProjectIds.push(projectId);
+          continue;
+        }
+        if (previousCredentials[projectId] === null) delete projects[projectId];
+        else projects[projectId] = structuredClone(previousCredentials[projectId]);
+        restoredProjectIds.push(projectId);
+      }
+      if (restoredProjectIds.length === 0) {
         return {
           changed: false,
           store: observed,
-          value: { changed: false, projectId: id, superseded: true },
+          value: rollbackResult({ changed: false, supersededProjectIds: nowSupersededProjectIds }),
         };
       }
-      const projects = { ...observed.projects };
-      if (rollback.previousCredential === null) delete projects[id];
-      else projects[id] = structuredClone(rollback.previousCredential);
       return {
         changed: true,
         store: { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects },
-        value: { changed: true, projectId: id, superseded: false },
+        value: rollbackResult({ changed: true, restoredProjectIds, supersededProjectIds: nowSupersededProjectIds }),
       };
     };
     const result = update(store);
@@ -1835,9 +1936,15 @@ export function rollbackProjectCredentialIfRevision(revision, env = process.env,
 
 export function removeProjectCredential(projectId, env = process.env, workspaceRoot) {
   const id = validateProjectId(projectId);
-  return updateStore(env, workspaceRoot, store => {
+  let previousCredential;
+  let capturedPrevious = false;
+  const result = updateStore(env, workspaceRoot, store => {
     if (!Object.hasOwn(store.projects, id)) {
       return { changed: false, store, value: { changed: false, projectId: id } };
+    }
+    if (!capturedPrevious) {
+      previousCredential = structuredClone(store.projects[id]);
+      capturedPrevious = true;
     }
     const projects = { ...store.projects };
     delete projects[id];
@@ -1845,6 +1952,109 @@ export function removeProjectCredential(projectId, env = process.env, workspaceR
       changed: true,
       store: { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects },
       value: { changed: true, projectId: id },
+    };
+  });
+  const publicationRevision = result[CREDENTIAL_PUBLICATION_REVISION];
+  if (!result.changed || !publicationRevision) return result;
+
+  const revision = Object.freeze({ projectId: id });
+  credentialRollbackStates.set(revision, {
+    expectedCredentials: { [id]: null },
+    generation: publicationRevision.transactionId,
+    previousCredentials: { [id]: previousCredential },
+  });
+  return { ...result, revision };
+}
+
+function validateClaimRequestId(value) {
+  if (typeof value !== 'string' || !/^claim_[A-Za-z0-9_-]{20,80}$/.test(value)) {
+    throw new Error('bootstrapRequestId is invalid. Prepare a fresh project authorization.');
+  }
+  return value;
+}
+
+function claimStorageKey(requestId) {
+  return `${PROJECT_CLAIM_PREFIX}${validateClaimRequestId(requestId)}`;
+}
+
+function isActiveClaim(value, now = Date.now()) {
+  return value
+    && value.kind === 'project_claim'
+    && Number.isFinite(Date.parse(String(value.expiresAt || '')))
+    && Date.parse(value.expiresAt) > now;
+}
+
+export function createProjectClaimRequest(binding, env = process.env, workspaceRoot) {
+  const projectId = validateProjectId(binding.projectId);
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const requestId = `claim_${randomBytes(18).toString('base64url')}`;
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const claim = {
+    kind: 'project_claim',
+    projectId,
+    projectUrl: String(binding.projectUrl),
+    mcpUrl: normalizeMcpUrl(binding.mcpUrl, '', true),
+    serverName: String(binding.serverName),
+    verifier,
+    challenge,
+    expiresAt,
+  };
+  return updateStore(env, workspaceRoot, store => {
+    const projects = { ...store.projects };
+    for (const [key, value] of Object.entries(projects)) {
+      if (!key.startsWith(PROJECT_CLAIM_PREFIX)) continue;
+      // Versions before the claim protocol allowed project IDs in this
+      // namespace. Preserve those credentials; only claim-shaped records are
+      // eligible for expiry cleanup.
+      if (value?.kind !== 'project_claim') continue;
+      if (!isActiveClaim(value)) delete projects[key];
+    }
+    projects[claimStorageKey(requestId)] = claim;
+    const changed = JSON.stringify(projects) !== JSON.stringify(store.projects);
+    return {
+      changed,
+      store: changed ? { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects } : store,
+      value: { requestId, challenge, expiresAt },
+    };
+  });
+}
+
+export function readProjectClaimRequest(requestId, binding, env = process.env, workspaceRoot) {
+  const id = validateClaimRequestId(requestId);
+  const { store } = readStore(env, workspaceRoot);
+  const claim = store.projects[claimStorageKey(id)];
+  if (!isActiveClaim(claim)) {
+    throw new Error('The local project authorization request is missing or expired. Prepare it again.');
+  }
+  const expected = {
+    projectId: validateProjectId(binding.projectId),
+    projectUrl: String(binding.projectUrl),
+    mcpUrl: normalizeMcpUrl(binding.mcpUrl, '', true),
+    serverName: String(binding.serverName),
+  };
+  for (const [key, value] of Object.entries(expected)) {
+    if (claim[key] !== value) throw new Error('The local project authorization request does not match this project binding.');
+  }
+  if (typeof claim.verifier !== 'string' || claim.verifier.length < 43 || claim.verifier.length > 128) {
+    throw new Error('The local project authorization verifier is invalid. Prepare it again.');
+  }
+  return { requestId: id, verifier: claim.verifier, challenge: claim.challenge, expiresAt: claim.expiresAt };
+}
+
+export function removeProjectClaimRequest(requestId, env = process.env, workspaceRoot) {
+  const id = validateClaimRequestId(requestId);
+  const key = claimStorageKey(id);
+  return updateStore(env, workspaceRoot, store => {
+    if (!Object.hasOwn(store.projects, key)) {
+      return { changed: false, store, value: { changed: false, requestId: id } };
+    }
+    const projects = { ...store.projects };
+    delete projects[key];
+    return {
+      changed: true,
+      store: { schemaVersion: CREDENTIAL_STORE_SCHEMA_VERSION, projects },
+      value: { changed: true, requestId: id },
     };
   });
 }

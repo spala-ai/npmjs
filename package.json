@@ -1,6 +1,6 @@
 {
   "name": "@spala-ai/mcp-install",
-  "version": "0.1.16",
+  "version": "0.1.24",
   "description": "Install Spala Public MCP and project MCP servers into local AI coding clients.",
   "homepage": "https://docs.spala.ai/agents/mcp/",
   "readmeFilename": "README.md",

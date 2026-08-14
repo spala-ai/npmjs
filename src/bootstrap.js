@@ -203,29 +203,69 @@ function validateBootstrapScopes(requested, response) {
   }
 }
 
-export async function consumeBootstrap({ bootstrapUrl, mcpUrl, fetchImpl = globalThis.fetch }) {
+export async function consumeBootstrap({
+  bootstrapUrl,
+  mcpUrl,
+  codeVerifier,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 90_000,
+}) {
   const validatedUrl = validateBootstrapUrl(bootstrapUrl, mcpUrl);
   const requestedScopes = parseProjectScopeSet(mcpUrl, 'The requested MCP URL');
+  if (codeVerifier !== undefined && (
+    typeof codeVerifier !== 'string'
+    || codeVerifier.length < 43
+    || codeVerifier.length > 128
+    || !/^[A-Za-z0-9._~-]+$/.test(codeVerifier)
+  )) {
+    throw new Error('The local project authorization verifier is invalid.');
+  }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10 * 60 * 1000) {
+    throw new Error('Bootstrap exchange timeout is invalid.');
+  }
   if (typeof fetchImpl !== 'function') throw new Error('Bootstrap exchange is unavailable in this Node runtime.');
+  const controller = new AbortController();
+  let timeout;
   let response;
-  try {
-    response = await fetchImpl(validatedUrl, {
-      method: 'POST',
-      redirect: 'error',
-      headers: { accept: 'application/json' },
-    });
-  } catch {
-    throw new Error('The one-time project bootstrap exchange failed. Request a fresh project connection.');
-  }
-  if (!response?.ok) {
-    const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
-    throw new Error(`The one-time project bootstrap exchange was rejected${status}. Request a fresh project connection.`);
-  }
   let payload;
+  let failureMessage;
+  const deadline = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new Error('bootstrap timeout'));
+    }, timeoutMs);
+  });
   try {
-    payload = await response.json();
+    response = await Promise.race([
+      fetchImpl(validatedUrl, {
+        method: 'POST',
+        redirect: 'error',
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+          ...(codeVerifier !== undefined ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(codeVerifier !== undefined ? { body: JSON.stringify({ codeVerifier }) } : {}),
+      }),
+      deadline,
+    ]);
+    if (!response?.ok) {
+      const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
+      failureMessage = `The one-time project bootstrap exchange was rejected${status}. Request a fresh project connection.`;
+      throw new Error('bootstrap rejected');
+    }
+    try {
+      payload = await Promise.race([response.json(), deadline]);
+    } catch {
+      if (!controller.signal.aborted) {
+        failureMessage = 'The one-time project bootstrap response was invalid. Request a fresh project connection.';
+      }
+      throw new Error('bootstrap body failed');
+    }
   } catch {
-    throw new Error('The one-time project bootstrap response was invalid. Request a fresh project connection.');
+    throw new Error(failureMessage || 'The one-time project bootstrap exchange failed. Request a fresh project connection.');
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
   const bearerToken = payload?.access_token;
   if (typeof bearerToken !== 'string' || !bearerToken || bearerToken.length > 16 * 1024 || /[\0\r\n]/.test(bearerToken)) {

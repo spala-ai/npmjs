@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
-import { runCli } from '../src/cli.js';
+import { acquireProjectLifecycleLock, runCli } from '../src/cli.js';
 import {
   planProjectBinding,
   readProjectBinding,
@@ -68,6 +68,39 @@ function binding(name) {
     serverName: `spala-${name}-spala-ai`,
   };
 }
+
+test('lifecycle release preserves a replacement lock owned by another operation', async () => {
+  const workspace = tempDirectory();
+  const spalaDirectory = path.join(workspace, '.spala');
+  const lockPath = path.join(spalaDirectory, '.project-lifecycle.lock');
+  const displacedLockPath = path.join(spalaDirectory, '.project-lifecycle.lock.displaced');
+  fs.mkdirSync(spalaDirectory, { mode: 0o700 });
+
+  const lock = await acquireProjectLifecycleLock(workspace);
+  fs.renameSync(lockPath, displacedLockPath);
+  fs.mkdirSync(lockPath, { mode: 0o700 });
+  fs.writeFileSync(path.join(lockPath, 'replacement-owner'), 'new operation');
+
+  await assert.rejects(lock.release(), /ownership changed|compromised/i);
+  assert.equal(fs.readFileSync(path.join(lockPath, 'replacement-owner'), 'utf8'), 'new operation');
+  assert.equal(fs.existsSync(displacedLockPath), true);
+});
+
+test('lifecycle acquisition never reclaims a stale-looking canonical lock', async () => {
+  const workspace = tempDirectory();
+  const spalaDirectory = path.join(workspace, '.spala');
+  const lockPath = path.join(spalaDirectory, '.project-lifecycle.lock');
+  fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(lockPath, 'owner'), 'other process');
+  const old = new Date(0);
+  fs.utimesSync(lockPath, old, old);
+
+  await assert.rejects(
+    acquireProjectLifecycleLock(workspace, { retries: 0 }),
+    /already being held|locked/i,
+  );
+  assert.equal(fs.readFileSync(path.join(lockPath, 'owner'), 'utf8'), 'other process');
+});
 
 function crashReplacement(workspace, stage, {
   attemptedBinding = binding(`crash-${stage}-attempt`),
@@ -419,7 +452,7 @@ test('independent project and MCP URL validation rejects unsafe and ambiguous fo
   assert.equal(fs.existsSync(path.join(workspace, '.spala')), false);
 });
 
-test('failed pending bind does not roll back a later successful concurrent bind', async () => {
+test('failed pending bind releases the lifecycle lock before a later bind publishes', async () => {
   const workspace = tempDirectory();
   const credentialHome = tempDirectory();
   fs.mkdirSync(path.join(workspace, '.git'));
@@ -458,7 +491,7 @@ test('failed pending bind does not roll back a later successful concurrent bind'
         headers: { 'content-type': 'application/json' },
       });
     },
-    storeProjectCredential: () => {
+    storeProjectCredentialAndRetire: () => {
       throw new Error('intentional credential persistence failure');
     },
   });
@@ -466,19 +499,24 @@ test('failed pending bind does not roll back a later successful concurrent bind'
   await fetchStarted.promise;
   assert.equal(readProjectBinding(workspace).binding.projectId, 'project-concurrent-a');
 
-  await runCli(bindArgs({
+  let secondSettled = false;
+  const secondBind = runCli(bindArgs({
     projectId: 'project-concurrent-b',
     projectUrl: 'https://concurrent-b.spala.ai/',
     mcpUrl: 'https://concurrent-b.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
     switchProject: true,
-  }), {}, workspace, quietStreams());
+  }), {}, workspace, quietStreams()).finally(() => { secondSettled = true; });
+
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(secondSettled, false, 'the later bind must wait for the active lifecycle transaction');
 
   finishFetch.resolve();
   await assert.rejects(firstBind, /intentional credential persistence failure|rollback was incomplete/);
+  await secondBind;
   assert.equal(readProjectBinding(workspace).binding.projectId, 'project-concurrent-b');
 });
 
-test('scoped bootstrap canonicalization cannot overwrite a later successful bind', async () => {
+test('scoped bootstrap canonicalization completes before a queued later bind publishes', async () => {
   const workspace = tempDirectory();
   const credentialHome = tempDirectory();
   fs.mkdirSync(path.join(workspace, '.git'));
@@ -519,21 +557,22 @@ test('scoped bootstrap canonicalization cannot overwrite a later successful bind
   await fetchStarted.promise;
   assert.equal(readProjectBinding(workspace).binding.mcpUrl, bareMcpUrl);
 
-  await runCli(bindArgs({
+  let secondSettled = false;
+  const secondBind = runCli(bindArgs({
     projectId: 'project-canonical-concurrent-b',
     projectUrl: 'https://canonical-concurrent-b.spala.ai/',
     mcpUrl: 'https://canonical-concurrent-b.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
     switchProject: true,
-  }), {}, workspace, quietStreams());
-  const laterBinding = readProjectBinding(workspace).binding;
+  }), {}, workspace, quietStreams()).finally(() => { secondSettled = true; });
+
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(secondSettled, false, 'the later bind must wait for bootstrap canonicalization');
 
   finishFetch.resolve();
-  await assert.rejects(
-    firstBind,
-    /Workspace binding changed while the project bind was pending|local rollback was incomplete/,
-  );
-  assert.equal(credentialPersistenceAttempts, 0);
-  assert.deepEqual(readProjectBinding(workspace).binding, laterBinding);
+  await firstBind;
+  await secondBind;
+  assert.equal(credentialPersistenceAttempts, 1);
+  assert.equal(readProjectBinding(workspace).binding.projectId, 'project-canonical-concurrent-b');
 });
 
 test('parent .spala swap after bootstrap consume preserves the replacement binding and cleans the anchor', {
@@ -605,7 +644,7 @@ test('parent .spala swap after bootstrap consume preserves the replacement bindi
   assert.equal(validationReached, true);
   assert.equal(credentialPersistenceAttempts, 0);
   assert.deepEqual(readProjectBinding(workspace).binding, laterBinding);
-  assert.deepEqual(fs.readdirSync(displacedDirectory), []);
+  assert.deepEqual(fs.readdirSync(displacedDirectory), ['.project-lifecycle.lock']);
 });
 
 test('post-credential binding validation rejects success and preserves a concurrent winner', async () => {

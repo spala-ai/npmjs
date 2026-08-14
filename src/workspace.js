@@ -161,10 +161,6 @@ export function validateProjectBinding(input) {
   };
 }
 
-function bindingPath(workspaceRoot) {
-  return path.join(workspaceRoot, PROJECT_BINDING_RELATIVE_PATH);
-}
-
 function pathKind(stat) {
   if (stat.isDirectory()) return 'directory';
   if (stat.isFile()) return 'file';
@@ -381,15 +377,6 @@ function sameBindingRevision(left, right) {
     && left.inode === right.inode
     && left.size === right.size
     && left.modifiedNs === right.modifiedNs;
-}
-
-function assertNotSymlink(filePath, label) {
-  try {
-    if (fs.lstatSync(filePath).isSymbolicLink()) throw new Error(`${label} must not be a symbolic link.`);
-  } catch (error) {
-    if (error && typeof error === 'object' && error.code === 'ENOENT') return;
-    throw error;
-  }
 }
 
 export function readProjectBinding(cwd = process.cwd(), { required = false } = {}) {
@@ -1326,11 +1313,45 @@ export function rollbackProjectBinding(
   );
 }
 
+export function removeProjectBindingIfRevision(
+  cwd,
+  input,
+  expectedRevision,
+  { directoryHandle } = {},
+) {
+  const binding = validateProjectBinding(input);
+  const workspaceRoot = directoryHandle?.workspaceRoot || findWorkspaceRoot(cwd);
+  return withProjectBindingDirectory(
+    workspaceRoot,
+    directoryHandle,
+    handle => {
+      assertBindingDirectoryCurrent(handle);
+      const revision = revisionForBinding(binding, expectedRevision);
+      const result = rollbackBindingInCurrentDirectory(workspaceRoot, revision, null);
+      if (!result.changed) throw bindingConflictError();
+      return { ...result, binding, removedRevision: revision };
+    },
+  );
+}
+
 export function removeProjectBinding(cwd = process.cwd()) {
   const { binding, workspaceRoot } = readProjectBinding(cwd);
   if (!binding) return { binding: null, changed: false, workspaceRoot };
-  const filePath = bindingPath(workspaceRoot);
-  assertNotSymlink(filePath, '.spala/project.json');
-  fs.unlinkSync(filePath);
-  return { binding, changed: true, workspaceRoot };
+  const directoryHandle = openProjectBindingDirectory(workspaceRoot);
+  try {
+    const { revision } = assertProjectBindingRevision(
+      workspaceRoot,
+      binding,
+      undefined,
+      { directoryHandle },
+    );
+    return removeProjectBindingIfRevision(
+      workspaceRoot,
+      binding,
+      revision,
+      { directoryHandle },
+    );
+  } finally {
+    closeProjectBindingDirectory(directoryHandle);
+  }
 }

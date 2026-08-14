@@ -4,12 +4,14 @@ import { execFile as execFileCallback, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import lockfile from 'proper-lockfile';
 import {
   CLIENT_LABELS,
   COMMAND_ONLY_CLIENTS,
   DEFAULT_PROJECT_SCOPE,
   INSTALLER_PACKAGE_SPEC,
   INSTALL_SCOPES,
+  MANAGED_PROXY_REGISTRATION_FLAG,
   PUBLIC_MCP_URL,
   PUBLIC_SERVER_NAME,
   WRITABLE_CLIENTS,
@@ -18,11 +20,14 @@ import {
   clientInstallCapabilities,
   codexRemoteRegistrationTarget,
   createDoctorReport,
+  createClaudeLocalProxyRemovalPlan,
+  createClaudeLocalProxyRestorePlan,
   createInstallPlan,
   createProxyInstallPlan,
   createUninstallPlan,
   formatClientList,
   installPlan,
+  inspectClaudeLocalProxyRegistration,
   mcpEndpointsMatch,
   mcpUrlsMatch,
   rollbackInstallPlan,
@@ -38,10 +43,14 @@ import {
 } from './bootstrap.js';
 import {
   hasProjectCredential,
+  createProjectClaimRequest,
   preflightCredentialStore,
+  readProjectClaimRequest,
   removeProjectCredential,
+  removeProjectClaimRequest,
   rollbackProjectCredentialIfRevision,
   storeProjectCredential,
+  storeProjectCredentialAndRetire,
 } from './credentialStore.js';
 import { runProxy } from './proxy.js';
 import {
@@ -51,7 +60,7 @@ import {
   openProjectBindingDirectory,
   planProjectBinding,
   readProjectBinding,
-  removeProjectBinding,
+  removeProjectBindingIfRevision,
   replaceProjectBindingIfRevision,
   rollbackProjectBinding,
   writeProjectBinding,
@@ -59,15 +68,161 @@ import {
 
 const execFile = promisify(execFileCallback);
 const COMMAND_TIMEOUT_MS = 3000;
+const CLIENT_CONFIG_COMMAND_TIMEOUT_MS = 30_000;
 const AUTH_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 const COMMAND_MAX_OUTPUT_BYTES = 64 * 1024;
+// Fail closed after a crashed owner. Automatic stale deletion cannot be made
+// compare-and-delete atomic with portable Node filesystem APIs; reclaiming a
+// canonical lock can therefore delete a newer owner's replacement.
+const PROJECT_LIFECYCLE_LOCK_STALE_MS = Number.MAX_SAFE_INTEGER;
+const PROJECT_LIFECYCLE_LOCK_UPDATE_MS = 5 * 60 * 1000;
 const CODEX_URL_FIELDS = new Set(['url', 'serverurl', 'httpurl', 'mcpurl', 'endpoint']);
 const DEFAULT_PROJECT_SCOPE_SET = new Set(DEFAULT_PROJECT_SCOPE.split(','));
+const PROJECT_LIFECYCLE_LOCK = Symbol('projectLifecycleLock');
+const localProjectLifecycleLocks = new Map();
 export const SPALA_BACKEND_INTENT = {
   backendProvider: 'Once the user asks to use Spala, treat Spala as the workspace backend provider. Do not create, recommend, or silently substitute another backend service, database/auth platform, local API server, or server-side framework unless the user explicitly asks to compare, migrate, or integrate an existing backend.',
   setupOnly: 'An install, connect, configure, or setup request authorizes setup only: authenticate, complete required account data, create or select the intended project, bind its project MCP, verify the connection, then stop and report that Spala is ready. Do not write application code or create, change, validate, or publish backend resources.',
   buildRequest: 'Continue into implementation only when the user separately asks to build or change the application. Even then, complete account setup and verify the project MCP before writing application code. Frontend code may live in the user workspace, but database, authentication, APIs, server-side logic, and other backend resources must be built through the Spala project MCP rather than as a competing local backend.',
 };
+
+async function acquireLocalProjectLifecycleLock(workspaceRoot) {
+  const key = path.resolve(workspaceRoot);
+  const previous = localProjectLifecycleLocks.get(key) || Promise.resolve();
+  let releaseTicket;
+  const ticket = new Promise(resolve => { releaseTicket = resolve; });
+  const tail = previous.then(() => ticket);
+  localProjectLifecycleLocks.set(key, tail);
+  await previous;
+  return () => {
+    releaseTicket();
+    if (localProjectLifecycleLocks.get(key) === tail) localProjectLifecycleLocks.delete(key);
+  };
+}
+
+export async function acquireProjectLifecycleLock(workspaceRoot, { retries = 100 } = {}) {
+  const root = path.resolve(workspaceRoot);
+  const releaseLocal = await acquireLocalProjectLifecycleLock(root);
+  const directory = path.join(root, '.spala');
+  const target = path.join(directory, 'project-lifecycle');
+  const lockPath = path.join(directory, '.project-lifecycle.lock');
+  let releaseFile;
+  let ownedLockIdentity;
+  let compromisedError;
+  const guardedFs = Object.create(fs);
+  guardedFs.mkdir = (candidate, ...args) => {
+    const callback = args.pop();
+    fs.mkdir(candidate, ...args, error => {
+      if (error || path.resolve(String(candidate)) !== path.resolve(lockPath)) {
+        callback(error);
+        return;
+      }
+      fs.lstat(candidate, (statError, created) => {
+        if (statError) {
+          fs.rmdir(candidate, () => callback(statError));
+          return;
+        }
+        ownedLockIdentity = {
+          dev: created.dev,
+          ino: created.ino,
+          uid: created.uid,
+          gid: created.gid,
+        };
+        callback(null);
+      });
+    });
+  };
+  guardedFs.rmdir = (candidate, callback) => {
+    if (!ownedLockIdentity || path.resolve(String(candidate)) !== path.resolve(lockPath)) {
+      fs.rmdir(candidate, callback);
+      return;
+    }
+    fs.lstat(candidate, (error, current) => {
+      if (error) {
+        callback(error);
+        return;
+      }
+      if (
+        current.dev !== ownedLockIdentity.dev
+        || current.ino !== ownedLockIdentity.ino
+        || current.uid !== ownedLockIdentity.uid
+        || current.gid !== ownedLockIdentity.gid
+      ) {
+        callback(Object.assign(
+          new Error('Project lifecycle lock ownership changed before release.'),
+          { code: 'ECOMPROMISED' },
+        ));
+        return;
+      }
+      fs.rmdir(candidate, callback);
+    });
+  };
+  try {
+    const before = fs.lstatSync(directory, { bigint: true });
+    if (before.isSymbolicLink() || !before.isDirectory()) {
+      throw new Error('.spala must be a real directory before changing the project lifecycle.');
+    }
+    releaseFile = await lockfile.lock(target, {
+      lockfilePath: lockPath,
+      realpath: false,
+      retries: { retries, factor: 1.2, minTimeout: 10, maxTimeout: 100 },
+      stale: PROJECT_LIFECYCLE_LOCK_STALE_MS,
+      update: PROJECT_LIFECYCLE_LOCK_UPDATE_MS,
+      fs: guardedFs,
+      onCompromised: error => { compromisedError = error; },
+    });
+    const after = fs.lstatSync(directory, { bigint: true });
+    if (
+      after.isSymbolicLink()
+      || !after.isDirectory()
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+    ) {
+      throw new Error('.spala changed while acquiring the project lifecycle lock.');
+    }
+    const lockStat = fs.lstatSync(lockPath);
+    if (!lockStat.isDirectory()) throw new Error('Project lifecycle lock must be a directory.');
+    if (typeof process.getuid === 'function' && lockStat.uid !== process.getuid()) {
+      throw new Error('Project lifecycle lock is owned by another user.');
+    }
+    if (
+      !ownedLockIdentity
+      || lockStat.dev !== ownedLockIdentity.dev
+      || lockStat.ino !== ownedLockIdentity.ino
+      || lockStat.uid !== ownedLockIdentity.uid
+      || lockStat.gid !== ownedLockIdentity.gid
+    ) {
+      throw new Error('Project lifecycle lock changed while it was acquired.');
+    }
+    if (process.platform !== 'win32') fs.chmodSync(lockPath, 0o700);
+    return {
+      [PROJECT_LIFECYCLE_LOCK]: true,
+      workspaceRoot: root,
+      async release() {
+        try {
+          try {
+            await releaseFile();
+          } catch (error) {
+            throw compromisedError || error;
+          }
+          if (compromisedError) throw compromisedError;
+        } finally {
+          releaseLocal();
+        }
+      },
+    };
+  } catch (error) {
+    if (releaseFile) await releaseFile().catch(() => undefined);
+    releaseLocal();
+    throw error;
+  }
+}
+
+function assertProjectLifecycleLock(lock, workspaceRoot) {
+  if (!lock?.[PROJECT_LIFECYCLE_LOCK] || lock.workspaceRoot !== path.resolve(workspaceRoot)) {
+    throw new Error('Claude project registration mutation requires the workspace lifecycle lock.');
+  }
+}
 
 function parseArgs(argv) {
   const args = {
@@ -81,6 +236,7 @@ function parseArgs(argv) {
     installScope: undefined,
     json: false,
     manifest: undefined,
+    managedProxyRegistration: false,
     printOnly: false,
     public: false,
     uninstall: false,
@@ -90,6 +246,8 @@ function parseArgs(argv) {
     projectId: undefined,
     projectUrl: undefined,
     bootstrapUrl: undefined,
+    bootstrapClaim: undefined,
+    bootstrapRequestId: undefined,
     bootstrapStdin: false,
     bootstrapFd: undefined,
     switchProject: false,
@@ -109,8 +267,8 @@ function parseArgs(argv) {
   let startIndex = 0;
   if (argv[0] === 'project') {
     const subcommand = argv[1];
-    if (!['bind', 'status', 'unbind', 'disconnect'].includes(subcommand)) {
-      throw new Error('Unknown project command. Use project bind, project status, or project unbind.');
+    if (!['prepare', 'bind', 'status', 'unbind', 'disconnect'].includes(subcommand)) {
+      throw new Error('Unknown project command. Use project prepare, project bind, project status, or project unbind.');
     }
     args.command = subcommand === 'disconnect' ? 'project-unbind' : `project-${subcommand}`;
     startIndex = 2;
@@ -149,6 +307,7 @@ function parseArgs(argv) {
     else if (arg === '--uninstall') args.uninstall = true;
     else if (arg === '--yes' || arg === '-y') args.yes = true;
     else if (arg === '--manifest') args.manifest = requireValue('--manifest', argv[++index]);
+    else if (arg === MANAGED_PROXY_REGISTRATION_FLAG) args.managedProxyRegistration = true;
     else if (arg === '--url') {
       args.urlProvided = true;
       args.url = requireValue('--url', argv[++index]);
@@ -165,6 +324,8 @@ function parseArgs(argv) {
     else if (arg === '--project-id') args.projectId = requireValue('--project-id', argv[++index]);
     else if (arg === '--project-url') args.projectUrl = requireValue('--project-url', argv[++index]);
     else if (arg === '--bootstrap-url') args.bootstrapUrl = requireValue('--bootstrap-url', argv[++index]);
+    else if (arg === '--bootstrap-claim') args.bootstrapClaim = requireValue('--bootstrap-claim', argv[++index]);
+    else if (arg === '--bootstrap-request-id') args.bootstrapRequestId = requireValue('--bootstrap-request-id', argv[++index]);
     else if (arg === '--bootstrap-fd') args.bootstrapFd = Number(requireValue('--bootstrap-fd', argv[++index]));
     else if (arg === '--client') args.client = requireValue('--client', argv[++index]);
     else if (arg === '--name') args.name = requireValue('--name', argv[++index]);
@@ -216,25 +377,39 @@ function parseArgs(argv) {
   if (args.installScope && !INSTALL_SCOPES.includes(args.installScope)) {
     throw new Error(`--install-scope must be one of: ${INSTALL_SCOPES.join(', ')}.`);
   }
-  if (args.command === 'project-bind') {
+  if (args.command === 'project-prepare' || args.command === 'project-bind') {
     if (!args.urlProvided || !args.projectId || !args.projectUrl) {
-      throw new Error('project bind requires --project-id, --project-url, and --url.');
+      throw new Error(`${args.command.replace('-', ' ')} requires --project-id, --project-url, and --url.`);
     }
     args.exactUrl = true;
     args.installScope = args.installScope || 'workspace';
     if (args.installScope !== 'workspace') throw new Error('Project bindings must use --install-scope workspace.');
     if (args.bootstrapUrl) throw new Error('--bootstrap-url is not accepted because command arguments may be inspected. Use --bootstrap-stdin.');
+  }
+  if (args.command === 'project-prepare') {
+    if (args.bootstrapStdin || args.bootstrapFd !== undefined || args.bootstrapClaim || args.bootstrapRequestId) {
+      throw new Error('project prepare creates a new verifier and does not accept bootstrap input.');
+    }
+    if (!args.yes) throw new Error('project prepare requires --yes.');
+  }
+  if (args.command === 'project-bind') {
     if (args.bootstrapFd !== undefined && (!Number.isInteger(args.bootstrapFd) || args.bootstrapFd < 0)) throw new Error('--bootstrap-fd must be a non-negative integer.');
     if (args.bootstrapStdin && args.bootstrapFd !== undefined) throw new Error('Use only one of --bootstrap-stdin or --bootstrap-fd.');
-    if ((args.bootstrapStdin || args.bootstrapFd !== undefined) && !args.yes) throw new Error('Bootstrap capability input requires --yes so it is never mixed with an interactive prompt.');
+    const protectedClaim = Boolean(args.bootstrapClaim || args.bootstrapRequestId);
+    if (Boolean(args.bootstrapClaim) !== Boolean(args.bootstrapRequestId)) throw new Error('Use --bootstrap-claim and --bootstrap-request-id together.');
+    if (protectedClaim && (args.bootstrapStdin || args.bootstrapFd !== undefined)) throw new Error('Use either a verifier-bound claim or stdin bootstrap, not both.');
+    if ((args.bootstrapStdin || args.bootstrapFd !== undefined || protectedClaim) && !args.yes) throw new Error('Bootstrap capability input requires --yes so it is never mixed with an interactive prompt.');
   }
   if (args.command === 'proxy') {
     if (!args.projectId) throw new Error('proxy requires --project-id.');
-    const unsupported = args.client !== 'all' || args.bootstrapUrl || args.bootstrapStdin || args.bootstrapFd !== undefined || args.check || args.cleanupDuplicates || args.doctor || args.dryRun || args.exactUrl || args.installScope || args.json || args.manifest || args.name || args.printOnly || args.projectUrl || args.public || args.scopeProvided || args.switchProject || args.uninstall || args.urlProvided || args.yes;
+    const unsupported = args.client !== 'all' || args.bootstrapUrl || args.bootstrapClaim || args.bootstrapRequestId || args.bootstrapStdin || args.bootstrapFd !== undefined || args.check || args.cleanupDuplicates || args.doctor || args.dryRun || args.exactUrl || args.installScope || args.json || args.manifest || args.name || args.printOnly || args.projectUrl || args.public || args.scopeProvided || args.switchProject || args.uninstall || args.urlProvided || args.yes;
     if (unsupported) throw new Error('proxy only accepts --project-id.');
   }
+  if (args.managedProxyRegistration && args.command !== 'proxy') {
+    throw new Error(`${MANAGED_PROXY_REGISTRATION_FLAG} is reserved for installer-managed proxy registrations.`);
+  }
   if (args.command === 'project-status' || args.command === 'project-unbind') {
-    if (args.urlProvided || args.manifest || args.projectId || args.projectUrl || args.bootstrapUrl || args.bootstrapStdin || args.bootstrapFd !== undefined || args.public || args.scopeProvided || args.installScope) {
+    if (args.urlProvided || args.manifest || args.projectId || args.projectUrl || args.bootstrapUrl || args.bootstrapClaim || args.bootstrapRequestId || args.bootstrapStdin || args.bootstrapFd !== undefined || args.public || args.scopeProvided || args.installScope) {
       throw new Error(`${args.command.replace('-', ' ')} reads the existing workspace binding and does not accept project identity flags.`);
     }
   }
@@ -256,6 +431,7 @@ function usage() {
   spala-ai login --client codex --url <exact-mcp-url> --name <server-name> --json
   spala-ai init --client codex --json
   spala-ai project bind --project-id <id> --project-url <url> --url <exact-mcp-url> --client <client> --yes
+  spala-ai project prepare --project-id <id> --project-url <url> --url <exact-mcp-url> --client claude-code --yes --json
   spala-ai project bind --project-id <id> --project-url <url> --url <exact-mcp-url> --bootstrap-stdin --client <client> --yes
   spala-ai project status --json
   spala-ai project unbind --yes
@@ -295,6 +471,10 @@ Options:
   --project-url <url>
                      Credential-free project URL stored by project bind.
   --bootstrap-stdin  Read one one-time bootstrap URL from stdin so it never appears in process arguments.
+  --bootstrap-claim <url>
+                     Redeem a verifier-bound one-time claim returned by project_connect.
+  --bootstrap-request-id <id>
+                     Match the claim to a local verifier prepared by project prepare.
   --switch           Explicitly replace a different existing workspace binding.
   --dry-run          Print planned changes without writing files.
   --json             Print machine-readable JSON.
@@ -435,6 +615,138 @@ function nextProxySteps(plan) {
   }
   steps.push({ action: 'verify', instruction: 'Start or resume the selected client in this workspace and list the project MCP tools.' });
   return steps;
+}
+
+function sameClaudeRegistration(left, right) {
+  return Boolean(left && right)
+    && left.command === right.command
+    && Array.isArray(left.args)
+    && Array.isArray(right.args)
+    && left.args.length === right.args.length
+    && left.args.every((value, index) => value === right.args[index]);
+}
+
+async function reconcileClaudeProjectRegistration({ cwd, env, projectId, serverName, runCommand, lifecycleLock }) {
+  assertProjectLifecycleLock(lifecycleLock, cwd);
+  const before = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (before.configured) return { changed: false, status: before };
+  if (before.status !== 'missing' && !before.installerOwned) {
+    throw new Error(`Claude Code already has a non-installer-owned ${serverName} registration in this workspace; refusing to replace it.`);
+  }
+  let previousRemoval;
+  if (before.status !== 'missing') {
+    previousRemoval = await removeInstallerOwnedClaudeProjectRegistration({
+      cwd,
+      env,
+      projectId: before.registeredProjectId,
+      serverName,
+      lifecycleLock,
+    });
+  }
+  const command = buildProxyCommandHints(serverName, projectId).argv.claudeCode;
+  try {
+    await runCommand({
+      command: command[0],
+      args: command.slice(1),
+      cwd: before.workspaceRoot,
+      timeoutMs: CLIENT_CONFIG_COMMAND_TIMEOUT_MS,
+      maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+    });
+    const after = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+    if (!after.configured) throw new Error('Claude Code did not persist the expected private project MCP registration.');
+    return {
+      changed: true,
+      status: after,
+      previousRegistration: before.installerRegistration || null,
+      previousProjectId: before.registeredProjectId,
+      previousRemoval: previousRemoval?.removal || null,
+    };
+  } catch (error) {
+    const failures = [];
+    try {
+      const current = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+      if (current.installerOwned) {
+        await removeInstallerOwnedClaudeProjectRegistration({
+          cwd,
+          env,
+          projectId: current.registeredProjectId,
+          serverName,
+          lifecycleLock,
+        });
+      } else if (current.status !== 'missing') {
+        throw new Error(`Claude Code ${serverName} registration changed after the failed command; refusing to overwrite it.`);
+      }
+      if (before.installerRegistration) {
+        installPlan(createClaudeLocalProxyRestorePlan({
+          cwd,
+          env,
+          serverName,
+          registration: before.installerRegistration,
+        }));
+      }
+    } catch (rollbackError) {
+      failures.push(rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
+    }
+    throw new Error(failures.length
+      ? `Claude Code project registration failed and rollback was incomplete: ${failures.join('; ')}`
+      : (error instanceof Error ? error.message : String(error)));
+  }
+}
+
+async function removeInstallerOwnedClaudeProjectRegistration({ cwd, env, projectId, serverName, lifecycleLock }) {
+  assertProjectLifecycleLock(lifecycleLock, cwd);
+  const before = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (!before.installerOwned || before.registeredProjectId !== String(projectId)) return { changed: false, status: before };
+  const plan = createClaudeLocalProxyRemovalPlan({
+    cwd,
+    env,
+    projectId,
+    serverName,
+  });
+  const removal = installPlan(plan);
+  const after = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (after.status !== 'missing') throw new Error('Claude Code did not remove the installer-owned private project MCP registration.');
+  return {
+    changed: true,
+    status: after,
+    removedRegistration: before.installerRegistration,
+    removedProjectId: before.registeredProjectId,
+    removal,
+  };
+}
+
+async function restoreClaudeProjectRegistration({ cwd, env, projectId, serverName, registration, removal, runCommand, lifecycleLock }) {
+  if (!registration) return;
+  assertProjectLifecycleLock(lifecycleLock, cwd);
+  if (removal) {
+    const rollback = rollbackInstallPlan(removal);
+    if (!rollback.ok) throw new Error(rollback.errors.join('; '));
+    const restored = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+    if (!sameClaudeRegistration(restored.installerRegistration, registration)) {
+      throw new Error(`Claude Code ${serverName} registration could not be restored exactly.`);
+    }
+    return;
+  }
+  const current = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (sameClaudeRegistration(current.installerRegistration, registration)) return;
+  if (current.status !== 'missing') {
+    throw new Error(`Claude Code ${serverName} registration changed during rollback; refusing to overwrite it.`);
+  }
+  await runCommand({
+    command: 'claude',
+    args: [
+      'mcp', 'add', '--transport', 'stdio', '--scope', 'local', serverName, '--',
+      registration.command,
+      ...registration.args,
+    ],
+    cwd,
+    timeoutMs: CLIENT_CONFIG_COMMAND_TIMEOUT_MS,
+    maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+  });
+  const restored = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (!sameClaudeRegistration(restored.installerRegistration, registration)) {
+    throw new Error(`Claude Code did not restore the expected private ${serverName} registration.`);
+  }
 }
 
 function readyStatusSteps(serverName = PUBLIC_SERVER_NAME) {
@@ -1166,12 +1478,35 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
   if (args.command === 'project-status') {
     const { binding, workspaceRoot } = readProjectBinding(cwd);
     const credentialConfigured = binding ? hasProjectCredential(binding.projectId, env, workspaceRoot) : false;
+    const claudeRegistration = binding
+      ? inspectClaudeLocalProxyRegistration({ cwd: workspaceRoot, env, projectId: binding.projectId, serverName: binding.serverName })
+      : null;
+    const claudeSelected = args.client !== 'all' && selectedClientNames(args.client).has('claude-code');
+    const registrationMismatch = claudeRegistration?.status === 'mismatched'
+      || claudeRegistration?.status === 'invalid'
+      || (claudeSelected && claudeRegistration?.status !== 'configured');
+    const credentialMissing = Boolean(
+      binding
+      && !credentialConfigured
+      && (claudeSelected || claudeRegistration?.status === 'configured' || claudeRegistration?.status === 'mismatched'),
+    );
+    const ok = Boolean(binding && !registrationMismatch && !credentialMissing);
+    const proxyHints = binding ? buildProxyCommandHints(binding.serverName, binding.projectId) : null;
+    const nextSteps = (registrationMismatch || credentialMissing) && binding
+      ? [{
+        action: 'repair_project_binding',
+        client: 'claude-code',
+        command: proxyHints.claudeCode,
+        argv: proxyHints.argv.claudeCode,
+        instruction: 'Re-run project bind for this project so the installer replaces and verifies both the delegated credential and the private Claude Code registration.',
+      }]
+      : [];
     const payload = binding
-      ? { schemaVersion: 1, command: 'project-status', outcome: 'bound', ok: true, changed: false, binding, bindingFile: '.spala/project.json', agenticCredentialConfigured: credentialConfigured, nextSteps: [] }
+      ? { schemaVersion: 1, command: 'project-status', outcome: ok ? 'bound' : 'needs_action', ok, changed: false, binding, bindingFile: '.spala/project.json', agenticCredentialConfigured: credentialConfigured, claudeRegistration, nextSteps }
       : { schemaVersion: 1, command: 'project-status', outcome: 'not_bound', ok: false, changed: false, binding: null, bindingFile: '.spala/project.json', nextSteps: [] };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-    else io.stdout.write(binding ? `Bound to ${binding.projectId} (${binding.projectUrl}); agentic credential ${credentialConfigured ? 'configured' : 'not configured'}.\n` : 'This workspace is not bound to a Spala project.\n');
-    if (!binding) process.exitCode = 1;
+    else io.stdout.write(binding ? `Bound to ${binding.projectId} (${binding.projectUrl}); agentic credential ${credentialConfigured ? 'configured' : 'not configured'}; Claude registration ${claudeRegistration.status}.\n` : 'This workspace is not bound to a Spala project.\n');
+    if (!ok) process.exitCode = 1;
     return;
   }
 
@@ -1191,16 +1526,84 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         return;
       }
     }
-    const credential = removeProjectCredential(current.binding.projectId, env, current.workspaceRoot);
-    const result = removeProjectBinding(cwd);
+    let bindingDirectory;
+    let lifecycleLock;
+    let claudeRegistration;
+    let credential;
+    let result;
+    try {
+      bindingDirectory = openProjectBindingDirectory(current.workspaceRoot);
+      lifecycleLock = await acquireProjectLifecycleLock(current.workspaceRoot);
+      const asserted = assertProjectBindingRevision(
+        current.workspaceRoot,
+        current.binding,
+        undefined,
+        { directoryHandle: bindingDirectory },
+      );
+      claudeRegistration = await removeInstallerOwnedClaudeProjectRegistration({
+        cwd: current.workspaceRoot,
+        env,
+        projectId: current.binding.projectId,
+        serverName: current.binding.serverName,
+        runCommand: runtime.runCommand || runBoundedCommand,
+        lifecycleLock,
+      });
+      credential = (runtime.removeProjectCredential || removeProjectCredential)(
+        current.binding.projectId,
+        env,
+        current.workspaceRoot,
+      );
+      result = (runtime.removeProjectBindingIfRevision || removeProjectBindingIfRevision)(
+        current.workspaceRoot,
+        current.binding,
+        asserted.revision,
+        { directoryHandle: bindingDirectory },
+      );
+    } catch (error) {
+      const failures = [];
+      if (credential?.revision) {
+        try {
+          const rollback = rollbackProjectCredentialIfRevision(
+            credential.revision,
+            env,
+            current.workspaceRoot,
+          );
+          if (rollback.superseded) failures.push('credential rollback was superseded');
+        } catch (rollbackError) {
+          failures.push(`credential rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      if (claudeRegistration?.changed) {
+        try {
+          await restoreClaudeProjectRegistration({
+            cwd: current.workspaceRoot,
+            env,
+            projectId: claudeRegistration.removedProjectId,
+            serverName: current.binding.serverName,
+            registration: claudeRegistration.removedRegistration,
+            removal: claudeRegistration.removal,
+            runCommand: runtime.runCommand || runBoundedCommand,
+            lifecycleLock,
+          });
+        } catch (rollbackError) {
+          failures.push(`Claude registration rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      throw new Error(failures.length
+        ? `Project unbind failed and local rollback was incomplete: ${failures.join('; ')}`
+        : (error instanceof Error ? error.message : String(error)));
+    } finally {
+      if (lifecycleLock) await lifecycleLock.release();
+      closeProjectBindingDirectory(bindingDirectory);
+    }
     const payload = {
       schemaVersion: 1,
       command: 'project-unbind',
       outcome: 'unbound',
       ok: true,
-      changed: result.changed || credential.changed,
+      changed: result.changed || credential.changed || claudeRegistration.changed,
       bindingFile: '.spala/project.json',
-      nextSteps: [{ action: 'notice', instruction: 'The workspace binding and stored agentic credential were removed. MCP client entries remain configured; remove them explicitly in that client if no longer needed.' }],
+      nextSteps: [{ action: 'notice', instruction: 'The workspace binding, stored agentic credential, and installer-owned private Claude Code registration were removed. Other client configuration and client-owned manual OAuth credentials remain untouched.' }],
     };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     else {
@@ -1247,8 +1650,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
   const uninstallByNameOnly = args.uninstall && Boolean(args.name) && !args.urlProvided && !args.manifest && !args.public;
   const reconcilePublicAliases = isPublicInstall && !args.uninstall;
 
-  if (args.command === 'project-bind') {
-    const agentic = args.bootstrapStdin || args.bootstrapFd !== undefined;
+  if (args.command === 'project-prepare') {
     const requestedBinding = {
       schemaVersion: PROJECT_BINDING_SCHEMA_VERSION,
       projectId: args.projectId,
@@ -1260,47 +1662,94 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       switchProject: args.switchProject,
     });
     const bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
-    const plan = agentic
+    preflightCredentialStore(env, bindingPlan.workspaceRoot);
+    const authorizationRequest = createProjectClaimRequest(bindingPlan.binding, env, bindingPlan.workspaceRoot);
+    const payload = {
+      schemaVersion: 1,
+      command: 'project-prepare',
+      outcome: 'authorization_prepared',
+      ok: true,
+      changed: true,
+      projectId: bindingPlan.binding.projectId,
+      authorizationRequest,
+      nextSteps: [
+        { action: 'connect_project', instruction: 'Call project_connect again with this project, client claude-code, bootstrapRequestId, and bootstrapChallenge.' },
+        { action: 'bind_project', instruction: 'Run the returned verifier-bound project bind command. No browser authentication is required.' },
+      ],
+    };
+    if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    else {
+      io.stdout.write('Prepared a local verifier for delegated project authorization.\n');
+      io.stdout.write(`Bootstrap request ID: ${authorizationRequest.requestId}\n`);
+      io.stdout.write(`Bootstrap challenge: ${authorizationRequest.challenge}\n`);
+      printNextSteps(payload.nextSteps, io);
+    }
+    return;
+  }
+
+  if (args.command === 'project-bind') {
+    const protectedClaim = Boolean(args.bootstrapClaim && args.bootstrapRequestId);
+    const agentic = args.bootstrapStdin || args.bootstrapFd !== undefined || protectedClaim;
+    const requestedBinding = {
+      schemaVersion: PROJECT_BINDING_SCHEMA_VERSION,
+      projectId: args.projectId,
+      projectUrl: args.projectUrl,
+      mcpUrl,
+      serverName,
+    };
+    const bindingInput = preserveExistingCanonicalBinding(cwd, requestedBinding, {
+      switchProject: args.switchProject,
+    });
+    let bindingPlan = planProjectBinding(cwd, bindingInput, { switchProject: args.switchProject });
+    const createBindingInstallPlan = currentBindingPlan => agentic
       ? createProxyInstallPlan({
         clientSelection: args.client,
-        cwd: bindingPlan.workspaceRoot,
+        cwd: currentBindingPlan.workspaceRoot,
         dryRun: args.dryRun,
         env,
-        projectId: bindingPlan.binding.projectId,
+        projectId: currentBindingPlan.binding.projectId,
         serverName,
       })
       : createInstallPlan({
         clientSelection: args.client,
         cleanupDuplicates: args.cleanupDuplicates,
-        cwd: bindingPlan.workspaceRoot,
+        cwd: currentBindingPlan.workspaceRoot,
         dryRun: args.dryRun,
         env,
         exactUrl: true,
         installScope: 'workspace',
         scope: '',
-        mcpUrl: bindingPlan.binding.mcpUrl,
+        mcpUrl: currentBindingPlan.binding.mcpUrl,
         serverName,
       });
-    const selectedUnsupported = plan.skipped.filter(item => item.unsupportedScope);
-    const hasSupportedTarget = agentic
-      ? plan.writes.length > 0
-      : plan.writes.length > 0 || plan.skipped.some(item => item.commandRequired);
-    if (!hasSupportedTarget) {
-      throw new Error(selectedUnsupported[0]?.reason || 'No verified workspace-scoped target is available for the selected client.');
-    }
-    const steps = agentic ? nextProxySteps(plan) : nextSteps(plan, args.client);
-    const basePayload = {
+    const validateBindingInstallPlan = currentPlan => {
+      const selectedUnsupported = currentPlan.skipped.filter(item => item.unsupportedScope);
+      const currentClaudeCommandRequired = agentic
+        && currentPlan.skipped.some(item => item.client === 'claude-code' && item.commandRequired);
+      const hasSupportedTarget = agentic
+        ? currentPlan.writes.length > 0 || currentClaudeCommandRequired
+        : currentPlan.writes.length > 0 || currentPlan.skipped.some(item => item.commandRequired);
+      if (!hasSupportedTarget) {
+        throw new Error(selectedUnsupported[0]?.reason || 'No verified workspace-scoped target is available for the selected client.');
+      }
+      return currentClaudeCommandRequired;
+    };
+    const buildBindingPayload = (currentBindingPlan, currentPlan, currentSteps) => ({
       schemaVersion: 1,
       command: 'project-bind',
       outcome: args.dryRun ? 'planned' : 'bound',
       ok: true,
       changed: false,
-      binding: bindingPlan.binding,
+      binding: currentBindingPlan.binding,
       bindingFile: '.spala/project.json',
       installScope: 'workspace',
-      plan: summarizePlan(plan),
-      nextSteps: steps,
-    };
+      plan: summarizePlan(currentPlan),
+      nextSteps: currentSteps,
+    });
+    let plan = createBindingInstallPlan(bindingPlan);
+    let claudeCommandRequired = validateBindingInstallPlan(plan);
+    let steps = agentic ? nextProxySteps(plan) : nextSteps(plan, args.client);
+    let basePayload = buildBindingPayload(bindingPlan, plan, steps);
     if (args.dryRun) {
       if (args.json) io.stdout.write(`${JSON.stringify(basePayload, null, 2)}\n`);
       else if (agentic) {
@@ -1320,16 +1769,59 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
     let bindingDirectory;
+    let lifecycleLock;
     let credentialRevision;
+    let claudeRegistration;
+    let previousClaudeRegistration;
+    let effectiveBinding = bindingPlan.binding;
     try {
+      // First bind has no .spala directory yet. Create and validate it without
+      // retaining a stale descriptor while another lifecycle operation owns
+      // the cross-process lock, then reopen it after this operation acquires
+      // that lock.
+      const preparedDirectory = openProjectBindingDirectory(bindingPlan.workspaceRoot);
+      closeProjectBindingDirectory(preparedDirectory);
+      lifecycleLock = await acquireProjectLifecycleLock(bindingPlan.workspaceRoot);
+      const lockedBindingInput = preserveExistingCanonicalBinding(cwd, requestedBinding, {
+        switchProject: args.switchProject,
+      });
+      bindingPlan = planProjectBinding(cwd, lockedBindingInput, { switchProject: args.switchProject });
+      plan = createBindingInstallPlan(bindingPlan);
+      claudeCommandRequired = validateBindingInstallPlan(plan);
+      steps = agentic ? nextProxySteps(plan) : nextSteps(plan, args.client);
+      basePayload = buildBindingPayload(bindingPlan, plan, steps);
+      effectiveBinding = bindingPlan.binding;
+      bindingDirectory = openProjectBindingDirectory(bindingPlan.workspaceRoot);
+      if (claudeCommandRequired) {
+        const registration = inspectClaudeLocalProxyRegistration({
+          cwd: bindingPlan.workspaceRoot,
+          env,
+          projectId: bindingPlan.binding.projectId,
+          serverName,
+        });
+        if (registration.status !== 'missing' && !registration.configured && !registration.installerOwned) {
+          throw new Error(`Claude Code already has a non-installer-owned ${serverName} registration in this workspace; refusing to replace it.`);
+        }
+      }
       let bootstrapUrl;
+      let codeVerifier;
       if (agentic) {
-        bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
+        if (protectedClaim) {
+          const pending = readProjectClaimRequest(
+            args.bootstrapRequestId,
+            bindingPlan.binding,
+            env,
+            bindingPlan.workspaceRoot,
+          );
+          bootstrapUrl = args.bootstrapClaim;
+          codeVerifier = pending.verifier;
+        } else {
+          bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
+        }
         preflightCredentialStore(env, bindingPlan.workspaceRoot);
       }
 
       installed = installPlan(plan);
-      bindingDirectory = openProjectBindingDirectory(bindingPlan.workspaceRoot);
       bound = writeProjectBinding(bindingPlan.workspaceRoot, bindingPlan.binding, {
         switchProject: args.switchProject,
         directoryHandle: bindingDirectory,
@@ -1340,7 +1832,9 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           bootstrapUrl,
           projectUrl: bindingPlan.binding.projectUrl,
           mcpUrl: bindingPlan.binding.mcpUrl,
+          codeVerifier,
           fetchImpl: runtime.fetch || globalThis.fetch,
+          timeoutMs: runtime.bootstrapTimeoutMs || 90_000,
         });
         // The consume response is the authority on the endpoint (it may carry
         // the scope query even when the requested URL was bare). Store and
@@ -1350,6 +1844,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           ...bindingPlan.binding,
           mcpUrl: exchanged.mcpUrl,
         };
+        effectiveBinding = exchangedBinding;
         if (exchanged.mcpUrl !== bindingPlan.binding.mcpUrl) {
           bound = replaceProjectBindingIfRevision(
             bindingPlan.workspaceRoot,
@@ -1372,13 +1867,26 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
             rollbackOnFailure: bound.changed,
           },
         );
-        const persistCredential = runtime.storeProjectCredential || storeProjectCredential;
-        const persistedCredential = persistCredential({
+        const previousProjectId = bindingPlan.existing?.projectId !== bindingPlan.binding.projectId
+          ? bindingPlan.existing?.projectId
+          : undefined;
+        const credentialInput = {
           projectId: bindingPlan.binding.projectId,
           mcpUrl: exchanged.mcpUrl,
           bearerToken: exchanged.bearerToken,
           expiresAt: exchanged.expiresAt,
-        }, env, bindingPlan.workspaceRoot);
+        };
+        const persistedCredential = previousProjectId
+          ? (runtime.storeProjectCredentialAndRetire || storeProjectCredentialAndRetire)(
+            { ...credentialInput, previousProjectId },
+            env,
+            bindingPlan.workspaceRoot,
+          )
+          : (runtime.storeProjectCredential || storeProjectCredential)(
+            credentialInput,
+            env,
+            bindingPlan.workspaceRoot,
+          );
         credentialRevision = persistedCredential?.revision;
         assertProjectBindingRevision(
           bindingPlan.workspaceRoot,
@@ -1390,8 +1898,59 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
             rollbackOnFailure: bound.changed,
           },
         );
-        credentialRevision = undefined;
+
+        if (claudeCommandRequired) {
+          claudeRegistration = await reconcileClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: bindingPlan.binding.projectId,
+            serverName,
+            runCommand: runtime.runCommand || runBoundedCommand,
+            lifecycleLock,
+          });
+        }
       }
+
+      if (
+        !agentic
+        && bindingPlan.existing
+        && bindingPlan.existing.projectId !== bindingPlan.binding.projectId
+      ) {
+        const removedCredential = removeProjectCredential(
+          bindingPlan.existing.projectId,
+          env,
+          bindingPlan.workspaceRoot,
+        );
+        credentialRevision = removedCredential.revision;
+      }
+      if (
+        bindingPlan.existing
+        && bindingPlan.existing.projectId !== bindingPlan.binding.projectId
+        && (!claudeCommandRequired || bindingPlan.existing.serverName !== serverName)
+      ) {
+        previousClaudeRegistration = await removeInstallerOwnedClaudeProjectRegistration({
+          cwd: bindingPlan.workspaceRoot,
+          env,
+          projectId: bindingPlan.existing.projectId,
+          serverName: bindingPlan.existing.serverName,
+          runCommand: runtime.runCommand || runBoundedCommand,
+          lifecycleLock,
+        });
+      }
+      assertProjectBindingRevision(
+        bindingPlan.workspaceRoot,
+        effectiveBinding,
+        bound.revision,
+        {
+          directoryHandle: bindingDirectory,
+          failureRollbackBinding: bindingPlan.existing,
+          rollbackOnFailure: bound.changed,
+        },
+      );
+      if (protectedClaim) {
+        removeProjectClaimRequest(args.bootstrapRequestId, env, bindingPlan.workspaceRoot);
+      }
+      credentialRevision = undefined;
     } catch (error) {
       const failures = [];
       if (error && typeof error === 'object' && error.bindingRevisionAfterRecovery) {
@@ -1399,6 +1958,46 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       }
       if (error && typeof error === 'object' && error.bindingRollbackCompleted) {
         bound.changed = false;
+      }
+      if (claudeRegistration?.changed) {
+        try {
+          await removeInstallerOwnedClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: bindingPlan.binding.projectId,
+            serverName,
+            runCommand: runtime.runCommand || runBoundedCommand,
+            lifecycleLock,
+          });
+          await restoreClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: claudeRegistration.previousProjectId,
+            serverName,
+            registration: claudeRegistration.previousRegistration,
+            removal: claudeRegistration.previousRemoval,
+            runCommand: runtime.runCommand || runBoundedCommand,
+            lifecycleLock,
+          });
+        } catch (rollbackError) {
+          failures.push(`Claude registration rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      if (previousClaudeRegistration?.changed) {
+        try {
+          await restoreClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: previousClaudeRegistration.removedProjectId,
+            serverName: bindingPlan.existing.serverName,
+            registration: previousClaudeRegistration.removedRegistration,
+            removal: previousClaudeRegistration.removal,
+            runCommand: runtime.runCommand || runBoundedCommand,
+            lifecycleLock,
+          });
+        } catch (rollbackError) {
+          failures.push(`previous Claude registration rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
       }
       if (credentialRevision) {
         try {
@@ -1430,6 +2029,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       wrapped.changed = failures.length > 0;
       throw wrapped;
     } finally {
+      if (lifecycleLock) await lifecycleLock.release();
       closeProjectBindingDirectory(bindingDirectory);
     }
     const payload = {
@@ -1438,12 +2038,14 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       changed: agentic || bound.changed || installed.writes.length > 0,
       binding: bound.binding,
       agenticCredentialConfigured: agentic,
+      claudeRegistrationConfigured: claudeCommandRequired ? true : undefined,
       plan: summarizeAppliedPlan(plan, installed),
+      nextSteps: steps.filter(step => !(step.action === 'configure_client' && step.client === 'claude-code')),
     };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     else {
       io.stdout.write(`Bound workspace to Spala project ${bound.binding.projectId}.\n`);
-      printNextSteps(steps, io);
+      printNextSteps(payload.nextSteps, io);
     }
     return;
   }

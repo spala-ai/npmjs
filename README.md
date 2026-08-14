@@ -165,9 +165,40 @@ remote URL is absent from client config and proxy arguments;
 `.spala/project.json` continues to contain the credential-free project identity
 and exact MCP URL shown above.
 
-Codex, Roo, Claude Code, and Cursor receive workspace files. Agentic bootstrap rejects clients that
-cannot be configured atomically in the workspace before the capability is
-consumed. No client is reported as dynamically reloaded; start or resume a
+Codex, Roo, and Cursor receive workspace files. Claude Code uses its private
+workspace-local MCP registry (`claude mcp add --scope local`) instead of the
+shared `.mcp.json` approval boundary. The installer verifies that registration
+after writing it and refuses to replace a same-name registration it does not
+own.
+
+For Claude Code, the Public MCP uses a verifier-bound two-call handoff. First,
+prepare the local verifier without exposing it:
+
+```bash
+pnpm dlx @spala-ai/mcp-install project prepare \
+  --project-id "PROJECT_ID" \
+  --project-url "https://shared.spala.ai/PROJECT_SLUG/" \
+  --url "https://shared.spala.ai/PROJECT_SLUG/mcp?scope=builder%2Cproject%2Cdata" \
+  --client claude-code \
+  --yes \
+  --json
+```
+
+Pass only the returned request ID and challenge back to `project_connect`.
+Run its returned `project bind` command containing the verifier-bound one-time
+claim and request ID. The verifier stays in the protected credential store,
+the claim cannot be redeemed without it, and no second browser OAuth approval
+is required. Legacy installer-owned `.mcp.json` project entries are removed
+only after the delegated bind has been reviewed and can be rolled back.
+
+The proxy reads credentials before every request, so a successful re-bind heals
+an already running process. A rejected bearer becomes an actionable JSON-RPC
+error instead of wedging the stdio connection. Startup, remote requests, and
+stdout backpressure are bounded; a disconnected client fails promptly rather
+than waiting indefinitely.
+
+Agentic bootstrap rejects clients that cannot be configured safely for the
+workspace. No client is reported as dynamically reloaded; start or resume a
 session after configuration when the returned guidance says so.
 
 Without `--bootstrap-stdin`, project binding keeps the existing direct remote MCP
@@ -180,9 +211,13 @@ pnpm dlx @spala-ai/mcp-install project status --json
 pnpm dlx @spala-ai/mcp-install project unbind --yes --json
 ```
 
-`project unbind` removes `.spala/project.json` and any installer-owned agentic
-credential for that project. It leaves MCP client configuration and
-client-owned manual OAuth credentials untouched.
+`project status --client claude-code` verifies the binding, delegated
+credential, and private Claude registration together. `project unbind` removes
+`.spala/project.json`, the installer-owned agentic credential, and the exact
+installer-owned private Claude registration. It leaves unrelated MCP entries
+and client-owned manual OAuth credentials untouched. `project bind --switch`
+retires the previous delegated credential and installer-owned private
+registration as part of the switch.
 
 ## Install Scope Versus Tool Scope
 
@@ -205,7 +240,7 @@ the requested install scope.
 | Client | User-scoped public MCP | Workspace-scoped project MCP |
 |---|---|---|
 | Codex CLI | Merges `~/.codex/config.toml` and installs a managed routing skill | Merges `.codex/config.toml` under `[mcp_servers.<name>]` |
-| Claude Code | `claude mcp add --scope user` | Merges `.mcp.json` at the workspace root |
+| Claude Code | `claude mcp add --scope user` | Private `claude mcp add --scope local` registration verified by the installer |
 | Gemini CLI | Merges `~/.gemini/settings.json` | `gemini mcp add --scope project` |
 | Roo Code | Not verified; fails closed | Merges `.roo/mcp.json` |
 | Cursor | Merges `~/.cursor/mcp.json` | Merges `.cursor/mcp.json` |

@@ -2031,8 +2031,12 @@ export function readProjectClaimRequest(requestId, binding, env = process.env, w
     projectId: validateProjectId(binding.projectId),
     projectUrl: String(binding.projectUrl),
     mcpUrl: normalizeMcpUrl(binding.mcpUrl, '', true),
-    serverName: String(binding.serverName),
   };
+  // The server name is a client-local registration alias, not part of the
+  // project authorization boundary. Older bindings and freshly generated
+  // install plans can legitimately use different aliases for the same exact
+  // project MCP. Keep recording it for diagnostics, but bind the verifier to
+  // the project identity and endpoint only.
   for (const [key, value] of Object.entries(expected)) {
     if (claim[key] !== value) throw new Error('The local project authorization request does not match this project binding.');
   }

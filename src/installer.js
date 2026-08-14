@@ -717,6 +717,7 @@ export function inspectClaudeLocalProxyRegistration({ cwd = process.cwd(), env =
   }
   const entry = config?.projects?.[workspaceRoot]?.mcpServers?.[serverName];
   if (!entry) return { status: 'missing', configured: false, path: configPath, workspaceRoot };
+  const installerOwned = projectProxyValueMatches(entry, projectId);
   const expected = proxyCommandForProject(projectId);
   const configured = entry.command === expected.command
     && Array.isArray(entry.args)
@@ -725,6 +726,7 @@ export function inspectClaudeLocalProxyRegistration({ cwd = process.cwd(), env =
   return {
     status: configured ? 'configured' : 'mismatched',
     configured,
+    installerOwned,
     path: configPath,
     workspaceRoot,
   };

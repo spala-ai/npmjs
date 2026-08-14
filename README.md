@@ -190,9 +190,12 @@ pnpm dlx @spala-ai/mcp-install project unbind --yes --json
 registration and reports `needs_action` for a missing or stale launcher instead
 of treating the binding file alone as proof of connectivity.
 
-`project unbind` removes `.spala/project.json` and any installer-owned agentic
-credential for that project. It leaves MCP client configuration and
-client-owned manual OAuth credentials untouched.
+`project unbind` removes `.spala/project.json`, any installer-owned agentic
+credential for that project, and the matching installer-owned private Claude
+Code registration. It leaves other MCP client configuration and client-owned
+manual OAuth credentials untouched. A successful `project bind --switch`
+performs the same credential and private-Claude cleanup for the previous
+project after the replacement binding is established.
 
 ## Install Scope Versus Tool Scope
 

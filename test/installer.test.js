@@ -4179,6 +4179,132 @@ test('project bind, status, and unbind operate from nested workspace directories
   assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
 });
 
+test('project unbind removes only the installer-owned private Claude registration', async () => {
+  const workspace = tempHome();
+  const installHome = tempHome();
+  const credentialHome = tempHome();
+  const serverName = 'spala_project_unbind';
+  fs.mkdirSync(path.join(workspace, '.git'));
+  writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId: 'project-unbind',
+    projectUrl: 'https://shared.spala.ai/punbind/',
+    mcpUrl: 'https://shared.spala.ai/punbind/mcp?scope=builder%2Cproject%2Cdata',
+    serverName,
+  });
+  storeProjectCredential({
+    projectId: 'project-unbind',
+    mcpUrl: 'https://shared.spala.ai/punbind/mcp?scope=builder%2Cproject%2Cdata',
+    bearerToken: 'unbind-secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+  const configPath = path.join(installHome, '.claude.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    projects: {
+      [workspace]: {
+        mcpServers: {
+          [serverName]: {
+            type: 'stdio',
+            command: 'pnpm',
+            args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-unbind'],
+          },
+          unrelated: { type: 'stdio', command: 'node', args: ['server.js'] },
+        },
+      },
+    },
+  }));
+  const commands = [];
+  let output = '';
+
+  await runCli(['project', 'unbind', '--yes', '--json'], {
+    SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+    SPALA_MCP_INSTALL_HOME: installHome,
+  }, workspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+    stdin: { isTTY: false },
+  }, {
+    runCommand: async ({ command, args }) => {
+      commands.push([command, ...args]);
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      delete config.projects[workspace].mcpServers[serverName];
+      fs.writeFileSync(configPath, JSON.stringify(config));
+      return { stdout: '' };
+    },
+  });
+
+  assert.equal(JSON.parse(output).outcome, 'unbound');
+  assert.deepEqual(commands, [['claude', 'mcp', 'remove', '--scope', 'local', serverName]]);
+  assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
+  assert.equal(projectCredentialStatus('project-unbind', { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace).status, 'missing');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  assert.deepEqual(config.projects[workspace].mcpServers.unrelated, { type: 'stdio', command: 'node', args: ['server.js'] });
+});
+
+test('project switch removes the previous delegated credential and private Claude registration', async () => {
+  const workspace = tempHome();
+  const installHome = tempHome();
+  const credentialHome = tempHome();
+  const previousServer = 'spala_project_previous';
+  fs.mkdirSync(path.join(workspace, '.git'));
+  writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId: 'project-previous',
+    projectUrl: 'https://shared.spala.ai/pprevious/',
+    mcpUrl: 'https://shared.spala.ai/pprevious/mcp?scope=builder%2Cproject%2Cdata',
+    serverName: previousServer,
+  });
+  storeProjectCredential({
+    projectId: 'project-previous',
+    mcpUrl: 'https://shared.spala.ai/pprevious/mcp?scope=builder%2Cproject%2Cdata',
+    bearerToken: 'previous-secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+  const configPath = path.join(installHome, '.claude.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    projects: {
+      [workspace]: {
+        mcpServers: {
+          [previousServer]: {
+            type: 'stdio',
+            command: 'pnpm',
+            args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-previous'],
+          },
+        },
+      },
+    },
+  }));
+  const commands = [];
+
+  await runCli([
+    'project', 'bind', '--switch',
+    '--project-id', 'project-next',
+    '--project-url', 'https://shared.spala.ai/pnext/',
+    '--url', 'https://shared.spala.ai/pnext/mcp?scope=builder%2Cproject%2Cdata',
+    '--client', 'codex', '--yes', '--json',
+  ], {
+    SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+    SPALA_MCP_INSTALL_HOME: installHome,
+  }, workspace, {
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    stdin: { isTTY: false },
+  }, {
+    runCommand: async ({ command, args }) => {
+      commands.push([command, ...args]);
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      delete config.projects[workspace].mcpServers[previousServer];
+      fs.writeFileSync(configPath, JSON.stringify(config));
+      return { stdout: '' };
+    },
+  });
+
+  assert.equal(readProjectBinding(workspace).binding.projectId, 'project-next');
+  assert.equal(projectCredentialStatus('project-previous', { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace).status, 'missing');
+  assert.deepEqual(commands, [['claude', 'mcp', 'remove', '--scope', 'local', previousServer]]);
+  assert.equal(JSON.parse(fs.readFileSync(configPath, 'utf8')).projects[workspace].mcpServers[previousServer], undefined);
+});
+
 test('project status rejects a stale Claude project proxy registration', async () => {
   const workspace = tempHome();
   const installHome = tempHome();

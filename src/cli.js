@@ -478,6 +478,21 @@ async function reconcileClaudeProjectRegistration({ cwd, env, projectId, serverN
   return { changed: true, status: after };
 }
 
+async function removeInstallerOwnedClaudeProjectRegistration({ cwd, env, projectId, serverName, runCommand }) {
+  const before = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (!before.installerOwned) return { changed: false, status: before };
+  await runCommand({
+    command: 'claude',
+    args: ['mcp', 'remove', '--scope', 'local', serverName],
+    cwd: before.workspaceRoot,
+    timeoutMs: CLIENT_CONFIG_COMMAND_TIMEOUT_MS,
+    maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+  });
+  const after = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (after.status !== 'missing') throw new Error('Claude Code did not remove the installer-owned private project MCP registration.');
+  return { changed: true, status: after };
+}
+
 function readyStatusSteps(serverName = PUBLIC_SERVER_NAME) {
   if (serverName === PUBLIC_SERVER_NAME) return [publicReadinessStep()];
   return [{
@@ -1241,6 +1256,13 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         return;
       }
     }
+    const claudeRegistration = await removeInstallerOwnedClaudeProjectRegistration({
+      cwd: current.workspaceRoot,
+      env,
+      projectId: current.binding.projectId,
+      serverName: current.binding.serverName,
+      runCommand: runtime.runCommand || runBoundedCommand,
+    });
     const credential = removeProjectCredential(current.binding.projectId, env, current.workspaceRoot);
     const result = removeProjectBinding(cwd);
     const payload = {
@@ -1248,9 +1270,9 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       command: 'project-unbind',
       outcome: 'unbound',
       ok: true,
-      changed: result.changed || credential.changed,
+      changed: result.changed || credential.changed || claudeRegistration.changed,
       bindingFile: '.spala/project.json',
-      nextSteps: [{ action: 'notice', instruction: 'The workspace binding and stored agentic credential were removed. MCP client entries remain configured; remove them explicitly in that client if no longer needed.' }],
+      nextSteps: [{ action: 'notice', instruction: 'The workspace binding, stored agentic credential, and installer-owned private Claude Code registration were removed. Other client configuration and client-owned manual OAuth credentials remain untouched.' }],
     };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     else {
@@ -1406,10 +1428,15 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
     let claudeRegistrationChanged = false;
+    let previousProjectRemoved = false;
+    let previousClaudeRegistrationRemoved = false;
     let credentialSnapshot;
     try {
       let bootstrapUrl;
       let codeVerifier;
+      if (agentic || (bindingPlan.existing && bindingPlan.existing.projectId !== bindingPlan.binding.projectId)) {
+        credentialSnapshot = snapshotCredentialStore(env, bindingPlan.workspaceRoot);
+      }
       if (agentic) {
         if (protectedClaim) {
           const pending = readProjectClaimRequest(
@@ -1423,7 +1450,6 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         } else {
           bootstrapUrl = await readBootstrapCapability({ stdin: io.stdin, fd: args.bootstrapFd, stderr: io.stderr });
         }
-        credentialSnapshot = snapshotCredentialStore(env, bindingPlan.workspaceRoot);
         preflightCredentialStore(env, bindingPlan.workspaceRoot);
       }
 
@@ -1469,9 +1495,28 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           claudeRegistrationChanged = registration.changed;
         }
       }
+      if (bindingPlan.existing && bindingPlan.existing.projectId !== bindingPlan.binding.projectId) {
+        if (bindingPlan.existing.serverName !== bindingPlan.binding.serverName) {
+          const previousRegistration = await removeInstallerOwnedClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: bindingPlan.existing.projectId,
+            serverName: bindingPlan.existing.serverName,
+            runCommand: runtime.runCommand || runBoundedCommand,
+          });
+          previousClaudeRegistrationRemoved = previousRegistration.changed;
+          previousProjectRemoved ||= previousRegistration.changed;
+        }
+        const previousCredential = removeProjectCredential(
+          bindingPlan.existing.projectId,
+          env,
+          bindingPlan.workspaceRoot,
+        );
+        previousProjectRemoved ||= previousCredential.changed;
+      }
     } catch (error) {
       const failures = [];
-      if (agentic && credentialSnapshot !== undefined) {
+      if (credentialSnapshot !== undefined) {
         try {
           restoreCredentialStore(credentialSnapshot);
         } catch (rollbackError) {
@@ -1486,6 +1531,32 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
           failures.push(`binding rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
         }
       }
+      if (claudeRegistrationChanged) {
+        try {
+          await removeInstallerOwnedClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: bindingPlan.binding.projectId,
+            serverName: bindingPlan.binding.serverName,
+            runCommand: runtime.runCommand || runBoundedCommand,
+          });
+        } catch (rollbackError) {
+          failures.push(`new Claude registration rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      if (previousClaudeRegistrationRemoved && bindingPlan.existing) {
+        try {
+          await reconcileClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: bindingPlan.existing.projectId,
+            serverName: bindingPlan.existing.serverName,
+            runCommand: runtime.runCommand || runBoundedCommand,
+          });
+        } catch (rollbackError) {
+          failures.push(`previous Claude registration rollback: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
       failures.push(...rollbackInstallPlan(installed).errors.map(rollbackError => rollbackError instanceof Error ? rollbackError.message : String(rollbackError)));
       const wrapped = new Error(failures.length
         ? `Project binding failed and local rollback was incomplete: ${failures.join('; ')}`
@@ -1496,7 +1567,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     const payload = {
       ...basePayload,
       outcome: 'bound',
-      changed: agentic || bound.changed || installed.writes.length > 0 || claudeRegistrationChanged,
+      changed: agentic || bound.changed || installed.writes.length > 0 || claudeRegistrationChanged || previousProjectRemoved,
       agenticCredentialConfigured: agentic,
       claudeRegistrationConfigured: claudeCommandRequired ? true : undefined,
       plan: summarizeAppliedPlan(plan, installed),

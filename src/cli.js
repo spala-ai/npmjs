@@ -23,6 +23,7 @@ import {
   createUninstallPlan,
   formatClientList,
   installPlan,
+  inspectClaudeLocalProxyRegistration,
   mcpUrlsMatch,
   rollbackInstallPlan,
   normalizeMcpUrl,
@@ -52,6 +53,7 @@ import {
 
 const execFile = promisify(execFileCallback);
 const COMMAND_TIMEOUT_MS = 3000;
+const CLIENT_CONFIG_COMMAND_TIMEOUT_MS = 30_000;
 const AUTH_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 const COMMAND_MAX_OUTPUT_BYTES = 64 * 1024;
 const CODEX_URL_FIELDS = new Set(['url', 'serverurl', 'httpurl', 'mcpurl', 'endpoint']);
@@ -449,6 +451,31 @@ function nextProxySteps(plan) {
   }
   steps.push({ action: 'verify', instruction: 'Start or resume the selected client in this workspace and list the project MCP tools.' });
   return steps;
+}
+
+async function reconcileClaudeProjectRegistration({ cwd, env, projectId, serverName, runCommand }) {
+  const before = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (before.configured) return { changed: false, status: before };
+  if (before.status !== 'missing') {
+    await runCommand({
+      command: 'claude',
+      args: ['mcp', 'remove', '--scope', 'local', serverName],
+      cwd: before.workspaceRoot,
+      timeoutMs: CLIENT_CONFIG_COMMAND_TIMEOUT_MS,
+      maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+    });
+  }
+  const command = buildProxyCommandHints(serverName, projectId).argv.claudeCode;
+  await runCommand({
+    command: command[0],
+    args: command.slice(1),
+    cwd: before.workspaceRoot,
+    timeoutMs: CLIENT_CONFIG_COMMAND_TIMEOUT_MS,
+    maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+  });
+  const after = inspectClaudeLocalProxyRegistration({ cwd, env, projectId, serverName });
+  if (!after.configured) throw new Error('Claude Code did not persist the expected private project MCP registration.');
+  return { changed: true, status: after };
 }
 
 function readyStatusSteps(serverName = PUBLIC_SERVER_NAME) {
@@ -1161,12 +1188,40 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
   if (args.command === 'project-status') {
     const { binding, workspaceRoot } = readProjectBinding(cwd);
     const credentialConfigured = binding ? hasProjectCredential(binding.projectId, env, workspaceRoot) : false;
+    const claudeRegistration = binding
+      ? inspectClaudeLocalProxyRegistration({
+        cwd: workspaceRoot,
+        env,
+        projectId: binding.projectId,
+        serverName: binding.serverName,
+      })
+      : null;
+    const claudeSelected = args.client !== 'all' && selectedClientNames(args.client).has('claude-code');
+    const registrationMismatch = claudeRegistration?.status === 'mismatched'
+      || claudeRegistration?.status === 'invalid'
+      || (claudeSelected && claudeRegistration?.status !== 'configured');
+    const credentialMissing = Boolean(
+      binding
+      && !credentialConfigured
+      && (claudeSelected || claudeRegistration?.status === 'configured' || claudeRegistration?.status === 'mismatched'),
+    );
+    const ok = Boolean(binding && !registrationMismatch && !credentialMissing);
+    const proxyHints = binding ? buildProxyCommandHints(binding.serverName, binding.projectId) : null;
+    const nextSteps = (registrationMismatch || credentialMissing) && binding
+      ? [{
+        action: 'repair_project_binding',
+        client: 'claude-code',
+        command: proxyHints.claudeCode,
+        argv: proxyHints.argv.claudeCode,
+        instruction: 'Re-run project bind for this project so the installer replaces and verifies both the delegated credential and the private Claude Code registration.',
+      }]
+      : [];
     const payload = binding
-      ? { schemaVersion: 1, command: 'project-status', outcome: 'bound', ok: true, changed: false, binding, bindingFile: '.spala/project.json', agenticCredentialConfigured: credentialConfigured, nextSteps: [] }
+      ? { schemaVersion: 1, command: 'project-status', outcome: ok ? 'bound' : 'needs_action', ok, changed: false, binding, bindingFile: '.spala/project.json', agenticCredentialConfigured: credentialConfigured, claudeRegistration, nextSteps }
       : { schemaVersion: 1, command: 'project-status', outcome: 'not_bound', ok: false, changed: false, binding: null, bindingFile: '.spala/project.json', nextSteps: [] };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-    else io.stdout.write(binding ? `Bound to ${binding.projectId} (${binding.projectUrl}); agentic credential ${credentialConfigured ? 'configured' : 'not configured'}.\n` : 'This workspace is not bound to a Spala project.\n');
-    if (!binding) process.exitCode = 1;
+    else io.stdout.write(binding ? `Bound to ${binding.projectId} (${binding.projectUrl}); agentic credential ${credentialConfigured ? 'configured' : 'not configured'}; Claude registration ${claudeRegistration.status}.\n` : 'This workspace is not bound to a Spala project.\n');
+    if (!ok) process.exitCode = 1;
     return;
   }
 
@@ -1311,6 +1366,8 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         serverName,
       });
     const selectedUnsupported = plan.skipped.filter(item => item.unsupportedScope);
+    const claudeCommandRequired = agentic
+      && plan.skipped.some(item => item.client === 'claude-code' && item.commandRequired);
     const hasSupportedTarget = agentic
       ? plan.writes.length > 0 || plan.skipped.some(item => item.client === 'claude-code' && item.commandRequired)
       : plan.writes.length > 0 || plan.skipped.some(item => item.commandRequired);
@@ -1348,6 +1405,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     }
     let installed = { writes: [] };
     let bound = { binding: bindingPlan.binding, changed: false, workspaceRoot: bindingPlan.workspaceRoot };
+    let claudeRegistrationChanged = false;
     let credentialSnapshot;
     try {
       let bootstrapUrl;
@@ -1400,6 +1458,16 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         if (protectedClaim) {
           removeProjectClaimRequest(args.bootstrapRequestId, env, bindingPlan.workspaceRoot);
         }
+        if (claudeCommandRequired) {
+          const registration = await reconcileClaudeProjectRegistration({
+            cwd: bindingPlan.workspaceRoot,
+            env,
+            projectId: bindingPlan.binding.projectId,
+            serverName,
+            runCommand: runtime.runCommand || runBoundedCommand,
+          });
+          claudeRegistrationChanged = registration.changed;
+        }
       }
     } catch (error) {
       const failures = [];
@@ -1428,9 +1496,11 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     const payload = {
       ...basePayload,
       outcome: 'bound',
-      changed: agentic || bound.changed || installed.writes.length > 0,
+      changed: agentic || bound.changed || installed.writes.length > 0 || claudeRegistrationChanged,
       agenticCredentialConfigured: agentic,
+      claudeRegistrationConfigured: claudeCommandRequired ? true : undefined,
       plan: summarizeAppliedPlan(plan, installed),
+      nextSteps: steps.filter(step => !(step.action === 'configure_client' && step.client === 'claude-code')),
     };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     else {

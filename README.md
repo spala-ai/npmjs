@@ -167,10 +167,14 @@ and exact MCP URL shown above.
 
 Codex, Roo, and Cursor receive workspace files. Claude Code receives a private,
 workspace-associated registration through `claude mcp add --scope local`; this
-avoids the separate approval required by shared `.mcp.json` entries. Agentic
-bootstrap rejects clients that cannot be configured before the capability is
-consumed. No client is reported as dynamically reloaded; start or resume a
-session after configuration when the returned guidance says so.
+avoids the separate approval required by shared `.mcp.json` entries. The bind
+command applies that registration itself, replaces stale `npx` registrations
+with the pinned `pnpm dlx` command, removes an installer-owned legacy entry for
+the same project from shared `.mcp.json`, and verifies the exact persisted
+command before reporting `bound`. Agentic bootstrap rejects clients that cannot
+be configured before the capability is consumed. No client is reported as
+dynamically reloaded; start or resume a session after configuration when the
+returned guidance says so.
 
 Without `--bootstrap-stdin`, project binding keeps the existing direct remote MCP
 configuration and manual browser OAuth behavior unchanged.
@@ -181,6 +185,10 @@ Inspect or remove the workspace association:
 pnpm dlx @spala-ai/mcp-install project status --json
 pnpm dlx @spala-ai/mcp-install project unbind --yes --json
 ```
+
+`project status --client claude-code` also checks the private Claude Code
+registration and reports `needs_action` for a missing or stale launcher instead
+of treating the binding file alone as proof of connectivity.
 
 `project unbind` removes `.spala/project.json` and any installer-owned agentic
 credential for that project. It leaves MCP client configuration and

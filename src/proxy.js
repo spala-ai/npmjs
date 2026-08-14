@@ -10,6 +10,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
 // If the MCP client stops consuming stdout, fail the proxy instead of
 // deadlocking its sequential request loop behind one backpressured response.
 const DEFAULT_STDOUT_DRAIN_TIMEOUT_MS = 15_000;
+const DEFAULT_FIRST_INPUT_TIMEOUT_MS = 30_000;
 
 class ProxyOutputError extends Error {}
 
@@ -22,7 +23,9 @@ function writeLine(stdout, text, drainTimeoutMs) {
   // Listeners are attached before write() because close/error may fire
   // synchronously. A bounded drain wait also covers a client that remains open
   // but stops reading after cancelling a large tool response.
-  if (stdout.destroyed || stdout.writableEnded) return Promise.resolve();
+  if (stdout.destroyed || stdout.writableEnded) {
+    return Promise.reject(new ProxyOutputError('MCP proxy stdout is closed.'));
+  }
   if (typeof stdout.once !== 'function') {
     stdout.write(`${text}\n`);
     return Promise.resolve();
@@ -43,7 +46,7 @@ function writeLine(stdout, text, drainTimeoutMs) {
       else resolve();
     };
     const onDrain = () => settle();
-    const onClose = () => settle();
+    const onClose = () => settle(new ProxyOutputError('MCP proxy stdout closed before the response was delivered.'));
     const onError = () => settle(new ProxyOutputError('MCP proxy stdout failed.'));
     stdout.once('drain', onDrain);
     stdout.once('close', onClose);
@@ -56,7 +59,9 @@ function writeLine(stdout, text, drainTimeoutMs) {
       return;
     }
     if (accepted !== false || stdout.destroyed) {
-      settle();
+      settle(stdout.destroyed || stdout.writableEnded
+        ? new ProxyOutputError('MCP proxy stdout closed before the response was delivered.')
+        : undefined);
       return;
     }
     if (settled) return;
@@ -176,6 +181,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   const maxBodyBytes = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES, 65_536, 1_073_741_824);
   const requestTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 3_600_000);
   const stdoutDrainTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_STDOUT_TIMEOUT_MS', DEFAULT_STDOUT_DRAIN_TIMEOUT_MS, 100, 300_000);
+  const firstInputTimeoutMs = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_FIRST_INPUT_TIMEOUT_MS', DEFAULT_FIRST_INPUT_TIMEOUT_MS, 1_000, 300_000);
   const workspaceRoot = findWorkspaceRoot(cwd);
   // Missing credentials are a configuration error and still fail the spawn.
   // An expired-but-present credential must NOT kill the proxy: the server
@@ -190,12 +196,41 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   let sessionId;
   let protocolVersion = DEFAULT_PROTOCOL_VERSION;
   let eventStream;
-  const eventAbort = new AbortController();
+  let eventAbort;
+  let credentialIdentity;
   const input = readline.createInterface({ input: stdin, crlfDelay: Infinity });
 
+  const stopEventStream = async () => {
+    eventAbort?.abort();
+    if (eventStream) await eventStream.catch(() => undefined);
+    eventAbort = undefined;
+    eventStream = undefined;
+  };
+
+  const iterator = input[Symbol.asyncIterator]();
+  const nextInput = async first => {
+    if (!first) return iterator.next();
+    let timeout;
+    try {
+      return await Promise.race([
+        iterator.next(),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('MCP proxy received no client input after startup. Restart the MCP connection.')), firstInputTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  };
+
   try {
-    for await (const line of input) {
+    let firstInput = true;
+    while (true) {
+      const next = await nextInput(firstInput);
+      if (next.done) break;
+      const line = next.value;
       if (!line.trim()) continue;
+      firstInput = false;
       let request;
       try {
         request = JSON.parse(line);
@@ -226,6 +261,12 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
         }
         continue;
       }
+      const nextCredentialIdentity = `${credential.mcpUrl}\n${credential.bearerToken}`;
+      if (credentialIdentity && credentialIdentity !== nextCredentialIdentity) {
+        await stopEventStream();
+        sessionId = undefined;
+      }
+      credentialIdentity = nextCredentialIdentity;
       const headers = {
         accept: 'application/json, text/event-stream',
         authorization: `Bearer ${credential.bearerToken}`,
@@ -245,12 +286,28 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       } catch {
         throw safeRemoteError('MCP proxy could not reach the project backend.');
       }
+      if (response?.status === 401) {
+        await stopEventStream();
+        sessionId = undefined;
+        if (request?.id !== undefined && request?.id !== null) {
+          await emitMessages([{
+            jsonrpc: '2.0',
+            id: request.id,
+            error: {
+              code: -32000,
+              message: `The stored Spala project credential was rejected. Re-run project bind for project ${projectId}; the running proxy picks up the replacement credential automatically.`,
+            },
+          }], stdout, stdoutDrainTimeoutMs);
+        }
+        continue;
+      }
       if (!response?.ok && response?.status !== 202) {
         throw safeRemoteError(`MCP proxy request failed with HTTP ${response?.status || 'error'}.`);
       }
       const returnedSession = response.headers?.get?.('mcp-session-id');
       if (returnedSession) sessionId = returnedSession;
       if (sessionId && !eventStream) {
+        eventAbort = new AbortController();
         const eventHeaders = {
           accept: 'text/event-stream',
           authorization: `Bearer ${credential.bearerToken}`,
@@ -288,7 +345,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       }
     }
   } finally {
-    eventAbort.abort();
-    if (eventStream) await eventStream;
+    input.close();
+    await stopEventStream();
   }
 }

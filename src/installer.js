@@ -643,6 +643,93 @@ export function proxyCommandForProject(projectId, runner = 'pnpm') {
   };
 }
 
+function projectProxyValueMatches(value, projectId) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const command = String(value.command || '');
+  const args = Array.isArray(value.args) ? value.args.map(String) : [];
+  const packagePattern = /^@spala-ai\/mcp-install@\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/;
+  if (command === 'pnpm') {
+    return args.length === 5
+      && args[0] === 'dlx'
+      && packagePattern.test(args[1])
+      && args[2] === 'proxy'
+      && args[3] === '--project-id'
+      && args[4] === String(projectId);
+  }
+  return command === 'npx'
+    && args.length === 5
+    && args[0] === '--yes'
+    && packagePattern.test(args[1])
+    && args[2] === 'proxy'
+    && args[3] === '--project-id'
+    && args[4] === String(projectId);
+}
+
+function planLegacyClaudeProjectCleanup(workspaceRoot, serverName, projectId, dryRun) {
+  const filePath = path.join(workspaceRoot, '.mcp.json');
+  const safetyRoot = workspaceRoot;
+  assertSafePath(filePath, safetyRoot, 'Claude project MCP config path');
+  if (!fs.existsSync(filePath)) return null;
+  const { document, existed, pathState } = readJsonIfExists(filePath, safetyRoot);
+  if (document.root.type !== 'object') throw new Error('Config root must be a JSON object.');
+  const bucketProperty = uniqueProperty(document.root, 'mcpServers', 'Config root');
+  if (!bucketProperty) return null;
+  if (bucketProperty.value.type !== 'object') throw new Error('Config key mcpServers must be a JSON object.');
+  const matches = propertiesNamed(bucketProperty.value, serverName);
+  if (matches.length > 1) throw new Error(`Config key mcpServers contains duplicate ${serverName} keys; refusing to modify it.`);
+  const target = matches[0];
+  if (!target) return null;
+  let value;
+  try {
+    value = JSON.parse(document.source.slice(target.value.start, target.value.end));
+  } catch {
+    return null;
+  }
+  if (!projectProxyValueMatches(value, projectId)) return null;
+  return {
+    client: 'claude-code',
+    path: filePath,
+    action: 'uninstall',
+    backupPath: existed ? `${filePath}.bak-<timestamp>` : undefined,
+    existed,
+    content: applyJsonEdits(document.source, propertyRemovalEdits(bucketProperty.value, [target])),
+    originalContent: document.originalSource,
+    format: 'json',
+    removedEntries: [safeEntry(serverName)],
+    safetyRoot,
+    pathLabel: 'Claude project MCP config path',
+    pathState,
+    dryRun,
+  };
+}
+
+export function inspectClaudeLocalProxyRegistration({ cwd = process.cwd(), env = process.env, projectId, serverName }) {
+  const workspaceRoot = findWorkspaceRoot(cwd);
+  const configPath = joinPath(env, homeDir(env), '.claude.json');
+  const safetyRoot = homeDir(env);
+  assertSafePath(configPath, safetyRoot, 'Claude Code config path');
+  if (!fs.existsSync(configPath)) return { status: 'missing', configured: false, path: configPath, workspaceRoot };
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return { status: 'invalid', configured: false, path: configPath, workspaceRoot };
+  }
+  const entry = config?.projects?.[workspaceRoot]?.mcpServers?.[serverName];
+  if (!entry) return { status: 'missing', configured: false, path: configPath, workspaceRoot };
+  const expected = proxyCommandForProject(projectId);
+  const configured = entry.command === expected.command
+    && Array.isArray(entry.args)
+    && entry.args.length === expected.args.length
+    && entry.args.every((value, index) => value === expected.args[index]);
+  return {
+    status: configured ? 'configured' : 'mismatched',
+    configured,
+    path: configPath,
+    workspaceRoot,
+  };
+}
+
 export function createProxyInstallPlan({ clientSelection = 'all', cwd = process.cwd(), dryRun = false, env = process.env, projectId, serverName }) {
   const workspaceRoot = findWorkspaceRoot(cwd);
   const safeServerName = sanitizeServerName(serverName);
@@ -654,6 +741,10 @@ export function createProxyInstallPlan({ clientSelection = 'all', cwd = process.
   for (const client of selectedClients(clientSelection)) {
     const mode = installMode(client, 'workspace');
     if (mode === 'command') {
+      if (client === 'claude-code') {
+        const cleanup = planLegacyClaudeProjectCleanup(workspaceRoot, safeServerName, projectId, dryRun);
+        if (cleanup) writes.push(cleanup);
+      }
       skipped.push({ client, reason: 'Use the printed project-scoped stdio command for this client.', commandRequired: true });
       continue;
     }

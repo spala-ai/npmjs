@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import http from 'node:http';
 import test from 'node:test';
 import { runBoundedCommand, runCli } from '../src/cli.js';
 import {
@@ -26,7 +27,7 @@ import {
 } from '../src/installer.js';
 import { credentialStorePath, projectCredentialStatus, readProjectCredential, storeProjectCredential } from '../src/credentialStore.js';
 import { runProxy } from '../src/proxy.js';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import {
   findWorkspaceRoot,
   readProjectBinding,
@@ -4178,6 +4179,54 @@ test('project bind, status, and unbind operate from nested workspace directories
   assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
 });
 
+test('project status rejects a stale Claude project proxy registration', async () => {
+  const workspace = tempHome();
+  const installHome = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const binding = writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId: 'project-123',
+    projectUrl: 'https://shared.spala.ai/p123/',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata',
+    serverName: 'spala_project_test',
+  });
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: binding.binding.mcpUrl,
+    bearerToken: 'project-status-secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  fs.writeFileSync(path.join(installHome, '.claude.json'), JSON.stringify({
+    projects: {
+      [workspace]: {
+        mcpServers: {
+          spala_project_test: {
+            type: 'stdio',
+            command: 'npx',
+            args: ['--yes', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123'],
+          },
+        },
+      },
+    },
+  }));
+  let output = '';
+  await runCli(['project', 'status', '--client', 'claude-code', '--json'], {
+    SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+    SPALA_MCP_INSTALL_HOME: installHome,
+  }, workspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+    stdin: { isTTY: false },
+  });
+  const status = JSON.parse(output);
+  assert.equal(status.ok, false);
+  assert.equal(status.outcome, 'needs_action');
+  assert.equal(status.claudeRegistration.status, 'mismatched');
+  assert.match(status.nextSteps[0].instruction, /re-run project bind/i);
+  process.exitCode = undefined;
+});
+
 test('project bind rejects bootstrap grants instead of accepting them through process arguments', async () => {
   const workspace = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
@@ -4275,12 +4324,36 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
 test('Claude Code redeems a verifier-bound project claim without browser OAuth or secret argv', async () => {
   const workspace = tempHome();
   const credentialHome = tempHome();
+  const installHome = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
   fs.mkdirSync(path.join(workspace, '.claude'));
-  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_INSTALL_HOME: installHome };
   const projectUrl = 'https://shared.spala.ai/p123/';
   const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
   const serverName = 'spala_project_test';
+  fs.writeFileSync(path.join(installHome, '.claude.json'), JSON.stringify({
+    projects: {
+      [workspace]: {
+        mcpServers: {
+          [serverName]: {
+            type: 'stdio',
+            command: 'npx',
+            args: ['--yes', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-123'],
+          },
+        },
+      },
+    },
+  }));
+  fs.writeFileSync(path.join(workspace, '.mcp.json'), JSON.stringify({
+    mcpServers: {
+      [serverName]: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['--yes', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-123'],
+      },
+      unrelated: { command: 'node', args: ['server.js'] },
+    },
+  }));
   let prepareOutput = '';
 
   await runCli([
@@ -4312,6 +4385,7 @@ test('Claude Code redeems a verifier-bound project claim without browser OAuth o
   const bearerToken = 'mcp_verifier_bound_project_token';
   let bindOutput = '';
   let exchanges = 0;
+  const registrationCommands = [];
   await runCli([
     'project', 'bind',
     '--project-id', 'project-123',
@@ -4340,18 +4414,44 @@ test('Claude Code redeems a verifier-bound project claim without browser OAuth o
         mcp_url: mcpUrl,
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     },
+    runCommand: async ({ command, args, cwd }) => {
+      registrationCommands.push([command, ...args]);
+      assert.equal(cwd, workspace);
+      const configPath = path.join(installHome, '.claude.json');
+      const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
+      config.projects ||= {};
+      config.projects[workspace] ||= {};
+      config.projects[workspace].mcpServers ||= {};
+      if (args[1] === 'remove') delete config.projects[workspace].mcpServers[serverName];
+      else {
+        config.projects[workspace].mcpServers[serverName] = {
+          type: 'stdio',
+          command: 'pnpm',
+          args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123'],
+        };
+      }
+      fs.writeFileSync(configPath, JSON.stringify(config));
+      return { stdout: '' };
+    },
   });
 
   assert.equal(exchanges, 1);
   const result = JSON.parse(bindOutput);
   assert.equal(result.agenticCredentialConfigured, true);
+  assert.equal(result.claudeRegistrationConfigured, true);
   assert.doesNotMatch(bindOutput, new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
-  assert.equal(fs.existsSync(path.join(workspace, '.mcp.json')), false);
-  const configure = result.nextSteps.find(step => step.action === 'configure_client' && step.client === 'claude-code');
-  assert.deepEqual(configure.argv.slice(0, 8), [
-    'claude', 'mcp', 'add', '--transport', 'stdio', '--scope', 'local', serverName,
+  const migratedSharedConfig = JSON.parse(fs.readFileSync(path.join(workspace, '.mcp.json'), 'utf8'));
+  assert.equal(migratedSharedConfig.mcpServers[serverName], undefined);
+  assert.deepEqual(migratedSharedConfig.mcpServers.unrelated, { command: 'node', args: ['server.js'] });
+  assert.deepEqual(registrationCommands, [
+    ['claude', 'mcp', 'remove', '--scope', 'local', serverName],
+    [
+      'claude', 'mcp', 'add', '--transport', 'stdio', '--scope', 'local', serverName,
+      '--', 'pnpm', 'dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123',
+    ],
   ]);
-  assert.doesNotMatch(JSON.stringify(configure), new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
+  assert.equal(result.nextSteps.some(step => step.action === 'configure_client' && step.client === 'claude-code'), false);
+  assert.doesNotMatch(JSON.stringify(result.nextSteps), new RegExp(`${bearerToken}|${verifier}|${claimUrl}|${requestId}`));
   const stored = JSON.parse(fs.readFileSync(credentialStorePath(env), 'utf8'));
   assert.equal(stored.projects['project-123'].bearerToken, bearerToken);
   assert.equal(stored.claims[requestId], undefined);
@@ -4663,6 +4763,147 @@ test('proxy reads its user credential and forwards bearer auth without printing 
   assert.doesNotMatch(output, new RegExp(bearerToken));
 });
 
+test('proxy carries two sequential requests over one process', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const requests = [1, 2].map(id => ({ jsonrpc: '2.0', id, method: 'tools/list', params: {} }));
+  const output = [];
+  await runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from(requests.map(request => `${JSON.stringify(request)}\n`)),
+    stdout: { write: chunk => { output.push(...String(chunk).trim().split('\n')); return true; } },
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [] } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  assert.deepEqual(output.map(line => JSON.parse(line).id), [1, 2]);
+});
+
+test('proxy binary carries two sequential requests over real OS pipes', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => {
+      const message = JSON.parse(body);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [] } }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: `http://127.0.0.1:${address.port}/mcp`,
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const child = spawn(process.execPath, [
+    path.resolve('bin/spala-mcp-install.js'),
+    'proxy', '--project-id', 'project-123',
+  ], {
+    cwd: workspace,
+    env: { ...process.env, SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const output = [];
+  let pending = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    pending += chunk;
+    const lines = pending.split('\n');
+    pending = lines.pop() || '';
+    output.push(...lines.filter(Boolean).map(line => JSON.parse(line)));
+  });
+  const errors = [];
+  child.stderr.on('data', chunk => errors.push(String(chunk)));
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`);
+  child.stdin.end();
+  const exit = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('proxy binary did not exit after stdin closed'));
+    }, 10_000);
+    child.once('error', reject);
+    child.once('close', code => {
+      clearTimeout(timeout);
+      resolve(code);
+    });
+  });
+  await new Promise(resolve => server.close(resolve));
+  assert.equal(exit, 0, errors.join(''));
+  assert.deepEqual(output.map(message => message.id), [1, 2]);
+});
+
+test('proxy turns a backend 401 into a recoverable JSON-RPC error', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const output = [];
+  let call = 0;
+  await runProxy({
+    projectId: 'project-123',
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from([1, 2].map(id => `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list', params: {} })}\n`)),
+    stdout: { write: chunk => { output.push(...String(chunk).trim().split('\n')); return true; } },
+    fetchImpl: async (_url, options) => {
+      call += 1;
+      if (call === 1) return new Response(JSON.stringify({ error: 'invalid_token' }), { status: 401 });
+      const request = JSON.parse(options.body);
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [] } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const messages = output.map(line => JSON.parse(line));
+  assert.match(messages[0].error.message, /re-run project bind/i);
+  assert.ok(messages[1].result);
+});
+
+test('proxy exits when no MCP client input reaches stdin after startup', async () => {
+  const credentialHome = tempHome();
+  storeProjectCredential({
+    projectId: 'project-123',
+    mcpUrl: 'https://shared.spala.ai/p123/mcp',
+    bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
+  const stdin = new PassThrough();
+  await assert.rejects(runProxy({
+    projectId: 'project-123',
+    env: {
+      SPALA_MCP_CREDENTIAL_HOME: credentialHome,
+      SPALA_MCP_PROXY_FIRST_INPUT_TIMEOUT_MS: '1000',
+    },
+    stdin,
+    stdout: new PassThrough(),
+    fetchImpl: async () => { throw new Error('must not fetch'); },
+  }), /no client input after startup/);
+  stdin.destroy();
+});
+
 test('proxy re-reads credentials per request, errors on expiry, and heals after a re-bind', async () => {
   const credentialHome = tempHome();
   const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
@@ -4800,7 +5041,7 @@ test('proxy SSE limit is cumulative across multiple delimited events', async () 
   }), /size limit/);
 });
 
-test('proxy write waits never hang when stdout closes synchronously inside write()', async () => {
+test('proxy fails when stdout closes synchronously inside write()', async () => {
   const credentialHome = tempHome();
   storeProjectCredential({
     projectId: 'project-123',
@@ -4820,13 +5061,13 @@ test('proxy write waits never hang when stdout closes synchronously inside write
     removeListener: (event, handler) => { if (listeners[event] === handler) delete listeners[event]; },
   };
   const response = { jsonrpc: '2.0', id: 1, result: { tools: [] } };
-  await runProxy({
+  await assert.rejects(runProxy({
     projectId: 'project-123',
     env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
     stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })}\n`]),
     stdout,
     fetchImpl: async () => new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } }),
-  });
+  }), /stdout closed before the response was delivered/);
 });
 
 test('proxy exits when a client leaves stdout permanently backpressured', async () => {

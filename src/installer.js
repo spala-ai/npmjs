@@ -48,8 +48,8 @@ export const PUBLIC_LEGACY_SERVER_NAMES = [
 ];
 export const MCP_REMOTE_VERSION = '0.1.38';
 export const MANAGED_PROXY_REGISTRATION_FLAG = '--spala-installer-managed';
-export { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
-import { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
+export { INSTALLER_MAINTENANCE_SPEC, INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
+import { INSTALLER_MAINTENANCE_SPEC, INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
 
 const LEGACY_MANAGED_PROXY_PACKAGE_SPECS = new Set([
   '@spala-ai/mcp-install@0.1.13',
@@ -65,6 +65,7 @@ const LEGACY_MANAGED_PROXY_PACKAGE_SPECS = new Set([
   '@spala-ai/mcp-install@0.1.23',
   '@spala-ai/mcp-install@0.1.25',
   '@spala-ai/mcp-install@0.1.26',
+  '@spala-ai/mcp-install@0.1.27',
 ]);
 
 export const CLIENT_LABELS = {
@@ -1356,7 +1357,7 @@ export function buildCommandHints(serverName, mcpUrl, installScope = 'user') {
   const isPublicMcp = normalizeComparableMcpUrl(mcpUrl) === normalizeComparableMcpUrl(PUBLIC_MCP_URL);
   const commandScope = installScope === 'workspace' ? 'project' : 'user';
   const codexAddArgs = isPublicMcp && installScope === 'user'
-    ? ['npx', '--yes', INSTALLER_PACKAGE_SPEC, 'init', '--client', 'codex', '--yes', '--json']
+    ? ['npx', '--yes', INSTALLER_MAINTENANCE_SPEC, 'init', '--client', 'codex', '--yes', '--json']
     : null;
   const codexAdd = codexAddArgs?.map(quote).join(' ') || null;
   return {

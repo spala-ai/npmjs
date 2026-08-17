@@ -17,6 +17,7 @@ import {
   createUninstallPlan,
   installPlan,
   inspectClaudeLocalProxyRegistration,
+  INSTALLER_MAINTENANCE_SPEC,
   INSTALLER_PACKAGE_SPEC,
   MANAGED_PROXY_REGISTRATION_FLAG,
   mcpAuthorizationMatches,
@@ -250,7 +251,8 @@ test('shell command hints safely quote command substitution characters', () => {
 
 test('public MCP command hints match the live manifest scope contract', () => {
   const hints = buildCommandHints(PUBLIC_SERVER_NAME, PUBLIC_MCP_URL);
-  assert.ok(hints.codexAdd.includes(INSTALLER_PACKAGE_SPEC), 'codexAdd pins the current package spec');
+  assert.ok(hints.codexAdd.includes(INSTALLER_MAINTENANCE_SPEC), 'codexAdd uses the maintenance package spec');
+  assert.ok(!hints.codexAdd.includes(INSTALLER_PACKAGE_SPEC), 'codexAdd does not persist the tested bind spec');
   assert.equal(hints.codexLogin, null);
   assert.deepEqual(hints.argv.codexLogin, null);
 });
@@ -3043,7 +3045,7 @@ test('command-style init writes public Codex config and managed skill for user s
 
 test('failed init authentication reports changed and explicit init safely retries authentication', async () => {
   const home = tempHome();
-  const retryCommand = `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`;
+  const retryCommand = `pnpm dlx ${INSTALLER_MAINTENANCE_SPEC} login --client codex --json`;
   const secret = 'oauth-failure-code-must-not-leak';
   let errorOutput = '';
   const error = await captureAsyncError(() => runCli(
@@ -3098,7 +3100,7 @@ test('failed init authentication reports changed and explicit init safely retrie
 });
 
 test('unchanged canonical --public --yes retries missing or expired native OAuth without inspecting credentials', async () => {
-  const retryCommand = `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`;
+  const retryCommand = `pnpm dlx ${INSTALLER_MAINTENANCE_SPEC} login --client codex --json`;
 
   for (const authState of ['missing', 'expired']) {
     const home = tempHome();
@@ -3243,7 +3245,7 @@ test('native failed init JSON reports one exact retry command without child outp
   assert.equal(payload.changed, true);
   assert.deepEqual(payload.nextSteps, [{
     action: 'run_command',
-    command: `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`,
+    command: `pnpm dlx ${INSTALLER_MAINTENANCE_SPEC} login --client codex --json`,
   }]);
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(secret));
 });
@@ -4395,6 +4397,7 @@ test('Claude ownership requires the current marker and recognizes only explicit 
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.13', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.14', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.26', 'proxy', '--project-id', projectId]).installerOwned, true);
+  assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.27', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.23', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.19', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@9.9.9', 'proxy', '--project-id', projectId]).installerOwned, false);

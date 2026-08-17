@@ -9,6 +9,7 @@ import {
   CLIENT_LABELS,
   COMMAND_ONLY_CLIENTS,
   DEFAULT_PROJECT_SCOPE,
+  INSTALLER_MAINTENANCE_SPEC,
   INSTALLER_PACKAGE_SPEC,
   INSTALL_SCOPES,
   MANAGED_PROXY_REGISTRATION_FLAG,
@@ -2309,7 +2310,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         ? 'Spala MCP configuration was changed and retained, but browser authentication did not finish.'
         : 'Spala MCP configuration was retained unchanged, but browser authentication did not finish.');
       wrapped.changed = configurationChanged;
-      wrapped.retryCommand = `pnpm dlx ${INSTALLER_PACKAGE_SPEC} login --client codex --json`;
+      wrapped.retryCommand = `pnpm dlx ${INSTALLER_MAINTENANCE_SPEC} login --client codex --json`;
       throw wrapped;
     }
   }

@@ -142,13 +142,11 @@ function ttyInput(chunks, initialRawMode = false) {
   return stdin;
 }
 
-test('generated package references stay synchronized with package.json', () => {
+test('generated package references keep bindings pinned and recovery current', () => {
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(INSTALLER_PACKAGE_SPEC, `@spala-ai/mcp-install@${packageJson.version}`);
-  assert.match(
-    CODEX_SPALA_SKILL,
-    new RegExp(`@spala-ai/mcp-install@${packageJson.version.replaceAll('.', '\\.')}`),
-  );
+  assert.match(CODEX_SPALA_SKILL, /@spala-ai\/mcp-install@latest/);
+  assert.doesNotMatch(CODEX_SPALA_SKILL, /@spala-ai\/mcp-install@0\.1\.\d+/);
 });
 
 test('normalizes missing scope without replacing an existing scope', () => {
@@ -3014,6 +3012,8 @@ test('command-style init writes public Codex config and managed skill for user s
   assert.match(skill, /If it succeeds, do not run `init` or `login`; continue directly to its `spala_start`/);
   assert.match(skill, /If and only if it reports that the server does not exist/);
   assert.match(skill, /login --client codex --url "<binding\.mcpUrl>" --exact-url --name "<binding\.serverName>" --json/);
+  assert.match(skill, /@spala-ai\/mcp-install@latest login --client codex/);
+  assert.doesNotMatch(skill, /@spala-ai\/mcp-install@0\.1\.\d+/);
 
   output = '';
   await runCli(
@@ -4392,6 +4392,9 @@ test('Claude ownership requires the current marker and recognizes only explicit 
   }
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.25', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.25', 'proxy', '--project-id', projectId, MANAGED_PROXY_REGISTRATION_FLAG]).installerOwned, true);
+  assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.13', 'proxy', '--project-id', projectId]).installerOwned, true);
+  assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.14', 'proxy', '--project-id', projectId]).installerOwned, true);
+  assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.26', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.23', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@0.1.19', 'proxy', '--project-id', projectId]).installerOwned, true);
   assert.equal(inspect(['dlx', '@spala-ai/mcp-install@9.9.9', 'proxy', '--project-id', projectId]).installerOwned, false);

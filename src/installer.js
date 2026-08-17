@@ -52,6 +52,8 @@ export { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
 import { INSTALLER_PACKAGE_SPEC } from './packageSpec.js';
 
 const LEGACY_MANAGED_PROXY_PACKAGE_SPECS = new Set([
+  '@spala-ai/mcp-install@0.1.13',
+  '@spala-ai/mcp-install@0.1.14',
   '@spala-ai/mcp-install@0.1.15',
   '@spala-ai/mcp-install@0.1.16',
   '@spala-ai/mcp-install@0.1.17',
@@ -62,6 +64,7 @@ const LEGACY_MANAGED_PROXY_PACKAGE_SPECS = new Set([
   '@spala-ai/mcp-install@0.1.22',
   '@spala-ai/mcp-install@0.1.23',
   '@spala-ai/mcp-install@0.1.25',
+  '@spala-ai/mcp-install@0.1.26',
 ]);
 
 export const CLIENT_LABELS = {

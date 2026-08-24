@@ -33,6 +33,7 @@ import {
   readProjectCredential,
   storeProjectCredential,
 } from '../src/credentialStore.js';
+import { consumeBootstrap } from '../src/bootstrap.js';
 import { runProxy } from '../src/proxy.js';
 import { PassThrough, Readable } from 'node:stream';
 import {
@@ -4654,6 +4655,53 @@ test('exact-url project bind accepts a scoped bootstrap response for a bare requ
   assert.equal(payload.outcome, 'bound');
   const stored = readProjectCredential('project-777', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.mcpUrl, 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('bootstrap exchange retries only a typed retryable not-ready response', async () => {
+  const bootstrapUrl = 'https://activity-stream.spala.ai/mcp/agent-instructions/retryable/consume';
+  const responses = [
+    new Response(JSON.stringify({ error: 'bootstrap_not_ready', retryable: true }), {
+      status: 409,
+      headers: { 'content-type': 'application/json', 'retry-after': '0' },
+    }),
+    new Response(JSON.stringify({
+      access_token: 'mcp_retryable_test_secret',
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      mcp_url: 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  ];
+  let calls = 0;
+  const result = await consumeBootstrap({
+    bootstrapUrl,
+    projectUrl: 'https://activity-stream.spala.ai/',
+    mcpUrl: 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata',
+    fetchImpl: async () => {
+      calls += 1;
+      return responses.shift();
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.mcpUrl, 'https://activity-stream.spala.ai/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('bootstrap exchange does not retry an ordinary conflict', async () => {
+  let calls = 0;
+  await assert.rejects(
+    consumeBootstrap({
+      bootstrapUrl: 'https://activity-stream.spala.ai/mcp/agent-instructions/conflict/consume',
+      projectUrl: 'https://activity-stream.spala.ai/',
+      mcpUrl: 'https://activity-stream.spala.ai/mcp',
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ error: 'invalid_grant', retryable: false }), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    }),
+    /HTTP 409/,
+  );
+  assert.equal(calls, 1);
 });
 
 test('bootstrap endpoint identity ignores scope but rejects other origins and paths', () => {

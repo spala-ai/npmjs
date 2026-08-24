@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import { mcpEndpointsMatch, normalizeComparableMcpUrl } from './installer.js';
 
 const MAX_BOOTSTRAP_CAPABILITY_BYTES = 16 * 1024;
+const MAX_RETRYABLE_BOOTSTRAP_ATTEMPTS = 3;
+const MAX_RETRYABLE_BOOTSTRAP_DELAY_MS = 2_000;
 
 function isLocalHost(hostname) {
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname);
@@ -126,22 +128,38 @@ export async function consumeBootstrap({ bootstrapUrl, projectUrl, mcpUrl, codeV
   }
   if (typeof fetchImpl !== 'function') throw new Error('Bootstrap exchange is unavailable in this Node runtime.');
   let response;
-  try {
-    response = await fetchImpl(validatedUrl, {
-      method: 'POST',
-      redirect: 'error',
-      headers: {
-        accept: 'application/json',
-        ...(codeVerifier !== undefined ? { 'content-type': 'application/json' } : {}),
-      },
-      ...(codeVerifier !== undefined ? { body: JSON.stringify({ codeVerifier }) } : {}),
-    });
-  } catch {
-    throw new Error('The one-time project bootstrap exchange failed. Request a fresh project connection.');
-  }
-  if (!response?.ok) {
-    const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
-    throw new Error(`The one-time project bootstrap exchange was rejected${status}. Request a fresh project connection.`);
+  for (let attempt = 1; attempt <= MAX_RETRYABLE_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+    try {
+      response = await fetchImpl(validatedUrl, {
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          accept: 'application/json',
+          ...(codeVerifier !== undefined ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(codeVerifier !== undefined ? { body: JSON.stringify({ codeVerifier }) } : {}),
+      });
+    } catch {
+      throw new Error('The one-time project bootstrap exchange failed. Request a fresh project connection.');
+    }
+    if (response?.ok) break;
+    let retryable = false;
+    if (response?.status === 409 && typeof response?.clone === 'function') {
+      try {
+        const body = await response.clone().json();
+        retryable = body?.error === 'bootstrap_not_ready' && body?.retryable === true;
+      } catch {}
+    }
+    if (!retryable || attempt === MAX_RETRYABLE_BOOTSTRAP_ATTEMPTS) {
+      const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
+      throw new Error(`The one-time project bootstrap exchange was rejected${status}. Request a fresh project connection.`);
+    }
+    const retryAfterSeconds = Number.parseInt(response.headers?.get?.('retry-after') || '', 10);
+    const delayMs = Math.min(
+      MAX_RETRYABLE_BOOTSTRAP_DELAY_MS,
+      Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0 ? retryAfterSeconds * 1_000 : 1_000,
+    );
+    await new Promise(resolve => setTimeout(resolve, delayMs));
   }
   let payload;
   try {

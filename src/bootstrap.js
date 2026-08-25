@@ -8,6 +8,8 @@ import {
 const MAX_BOOTSTRAP_CAPABILITY_BYTES = 16 * 1024;
 const ALLOWED_PROJECT_SCOPES = new Set(DEFAULT_PROJECT_SCOPE.split(','));
 const BOOTSTRAP_CAPABILITY_ID_PATTERN = /^[A-Za-z0-9_-]{1,512}$/;
+const MAX_RETRYABLE_BOOTSTRAP_ATTEMPTS = 3;
+const MAX_RETRYABLE_BOOTSTRAP_DELAY_MS = 2_000;
 
 function isLocalHost(hostname) {
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname);
@@ -236,23 +238,39 @@ export async function consumeBootstrap({
     }, timeoutMs);
   });
   try {
-    response = await Promise.race([
-      fetchImpl(validatedUrl, {
-        method: 'POST',
-        redirect: 'error',
-        signal: controller.signal,
-        headers: {
-          accept: 'application/json',
-          ...(codeVerifier !== undefined ? { 'content-type': 'application/json' } : {}),
-        },
-        ...(codeVerifier !== undefined ? { body: JSON.stringify({ codeVerifier }) } : {}),
-      }),
-      deadline,
-    ]);
-    if (!response?.ok) {
-      const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
-      failureMessage = `The one-time project bootstrap exchange was rejected${status}. Request a fresh project connection.`;
-      throw new Error('bootstrap rejected');
+    for (let attempt = 1; attempt <= MAX_RETRYABLE_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+      response = await Promise.race([
+        fetchImpl(validatedUrl, {
+          method: 'POST',
+          redirect: 'error',
+          signal: controller.signal,
+          headers: {
+            accept: 'application/json',
+            ...(codeVerifier !== undefined ? { 'content-type': 'application/json' } : {}),
+          },
+          ...(codeVerifier !== undefined ? { body: JSON.stringify({ codeVerifier }) } : {}),
+        }),
+        deadline,
+      ]);
+      if (response?.ok) break;
+      let retryable = false;
+      if (response?.status === 409 && typeof response?.clone === 'function') {
+        try {
+          const body = await response.clone().json();
+          retryable = body?.error === 'bootstrap_not_ready' && body?.retryable === true;
+        } catch {}
+      }
+      if (!retryable || attempt === MAX_RETRYABLE_BOOTSTRAP_ATTEMPTS) {
+        const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
+        failureMessage = `The one-time project bootstrap exchange was rejected${status}. Request a fresh project connection.`;
+        throw new Error('bootstrap rejected');
+      }
+      const retryAfterSeconds = Number.parseInt(response.headers?.get?.('retry-after') || '', 10);
+      const delayMs = Math.min(
+        MAX_RETRYABLE_BOOTSTRAP_DELAY_MS,
+        Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0 ? retryAfterSeconds * 1_000 : 1_000,
+      );
+      await Promise.race([new Promise(resolve => setTimeout(resolve, delayMs)), deadline]);
     }
     try {
       payload = await Promise.race([response.json(), deadline]);

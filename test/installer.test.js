@@ -6419,6 +6419,83 @@ test('proxy recovers from a network failure and backend 503 without restarting',
   assert.equal(cancelled, 1);
 });
 
+test('proxy preserves safe quota metadata and tells agents not to retry a monthly limit', async () => {
+  const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
+  storeProjectCredential({
+    projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+  const output = [];
+  await runProxy({
+    projectId: 'project-123', cwd: workspace,
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call' })}\n`]),
+    stdout: { write: chunk => { output.push(...String(chunk).trim().split('\n')); return true; } },
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: 'secret backend diagnostic must not be forwarded',
+      code: 'PROJECT_BUILDER_MUTATION_LIMIT_EXCEEDED',
+      retryAfterSeconds: 86400,
+      resetAt: '2026-10-01T00:00:00.000Z',
+      limit: {
+        resource: 'builder_mutations',
+        value: 1000,
+        consumed: 1819,
+        projected: 1820,
+        secret: 'must-not-leak',
+      },
+      token: 'must-not-leak',
+    }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '86400' },
+    }),
+  });
+
+  const message = JSON.parse(output[0]);
+  assert.match(message.error.message, /builder mutation quota reached \(1819\/1000\)/i);
+  assert.match(message.error.message, /resets at 2026-10-01T00:00:00\.000Z/i);
+  assert.match(message.error.message, /retrying now will not succeed/i);
+  assert.deepEqual(message.error.data, {
+    httpStatus: 429,
+    code: 'PROJECT_BUILDER_MUTATION_LIMIT_EXCEEDED',
+    retryAfterSeconds: 86400,
+    resetAt: '2026-10-01T00:00:00.000Z',
+    limit: { resource: 'builder_mutations', value: 1000, consumed: 1819, projected: 1820 },
+  });
+  assert.doesNotMatch(output[0], /secret backend diagnostic|must-not-leak/);
+});
+
+test('proxy reports a temporary 429 without forwarding an untrusted backend body', async () => {
+  const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
+  storeProjectCredential({
+    projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+  let output = '';
+  await runProxy({
+    projectId: 'project-123', cwd: workspace,
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`]),
+    stdout: { write: chunk => { output += chunk; return true; } },
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: 'database password is unsafe to expose',
+      code: 'UNTRUSTED_BACKEND_CODE',
+      retryAfterSeconds: 7,
+      resetAt: 'not-a-date',
+      limit: { resource: 'unknown', value: 1, consumed: 1, projected: 2 },
+    }), {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    }),
+  });
+
+  const message = JSON.parse(output);
+  assert.equal(message.error.message, 'Spala project MCP request rate is temporarily limited. Retry after 7 seconds.');
+  assert.deepEqual(message.error.data, { httpStatus: 429, retryAfterSeconds: 7 });
+  assert.doesNotMatch(output, /database password|UNTRUSTED|unknown/);
+});
+
 test('proxy bounds shutdown when a persistent event reader refuses cancellation', async () => {
   const credentialHome = tempHome();
   const workspace = proxyWorkspace();

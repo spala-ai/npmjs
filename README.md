@@ -202,8 +202,9 @@ server name when its URL exactly matches the existing workspace project binding.
 Different URLs and customized entries still require explicit resolution.
 
 Agentic bootstrap rejects clients that cannot be configured safely for the
-workspace. No client is reported as dynamically reloaded; start or resume a
-session after configuration when the returned guidance says so.
+workspace. No client is reported as dynamically reloaded; start a new session
+after configuration when the returned guidance says so. For Codex, use
+`codex fork` to retain conversation context; `codex resume` keeps the old tool set.
 
 Without `--bootstrap-stdin`, project binding keeps the existing direct remote MCP
 configuration and manual browser OAuth behavior unchanged.

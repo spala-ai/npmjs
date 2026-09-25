@@ -148,6 +148,7 @@ test('generated package references keep bindings pinned and recovery current', (
   assert.equal(INSTALLER_PACKAGE_SPEC, `@spala-ai/mcp-install@${packageJson.version}`);
   assert.match(CODEX_SPALA_SKILL, /@spala-ai\/mcp-install@latest/);
   assert.doesNotMatch(CODEX_SPALA_SKILL, /@spala-ai\/mcp-install@0\.1\.\d+/);
+  assert.match(CODEX_SPALA_SKILL, /codex fork.*codex resume/s);
 });
 
 test('normalizes missing scope without replacing an existing scope', () => {
@@ -4009,6 +4010,8 @@ test('exact project handoff writes Codex workspace config and requires a new ses
   ]);
   assert.equal(parsed.nextSteps[0].dynamicReload, false);
   const codexConfig = fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8');
+  assert.match(parsed.nextSteps[0].instruction, /Start a new Codex session/);
+  assert.match(parsed.nextSteps[0].instruction, /codex fork.*codex resume/);
   assert.match(codexConfig, /\[mcp_servers\.spala-shared-spala-ai-p123]/);
   assert.match(codexConfig, new RegExp(JSON.stringify(exactUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });

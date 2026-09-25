@@ -111,7 +111,8 @@ contains only:
 ```
 
 Binding a different project is refused unless `--switch` is supplied. URLs with
-credentials, fragments, or query parameters other than `scope` are rejected.
+credentials, fragments, query parameters other than `scope` and `profile`, or
+any `profile` value other than exactly `guided` are rejected.
 The binding is written atomically with mode `0600`; `.spala` and the binding
 file may not be symbolic links.
 
@@ -196,6 +197,9 @@ an already running process. A rejected bearer becomes an actionable JSON-RPC
 error instead of wedging the stdio connection. Startup, remote requests, and
 stdout backpressure are bounded; a disconnected client fails promptly rather
 than waiting indefinitely.
+For Codex, a re-bind can replace a simple direct remote entry under the same
+server name when its URL exactly matches the existing workspace project binding.
+Different URLs and customized entries still require explicit resolution.
 
 Agentic bootstrap rejects clients that cannot be configured safely for the
 workspace. No client is reported as dynamically reloaded; start or resume a
@@ -230,7 +234,8 @@ These are separate concepts:
 - Public MCP defaults to user install scope and no project tool scope.
 - Project MCP defaults to workspace install scope and
   `builder,project,data` tool scope unless an exact handoff URL is supplied.
-- `--exact-url` validates and preserves the handoff URL without changing it.
+- `--exact-url` validates and preserves the handoff URL without changing it,
+  including an optional exact `profile=guided` query parameter.
 
 ## Client Support
 

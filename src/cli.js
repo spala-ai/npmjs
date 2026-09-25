@@ -552,6 +552,7 @@ function nextSteps(plan, clientSelection = 'all', includeReload = true, { public
   const steps = [];
   const reloadClients = new Set();
   for (const write of plan.writes || []) {
+    if (write.action === 'unchanged') continue;
     if (write.component === 'skill') continue;
     const instruction = write.client === 'codex' && plan.installScope === 'workspace'
       ? 'Start a new or resumed Codex session from this workspace to load .codex/config.toml.'
@@ -562,7 +563,7 @@ function nextSteps(plan, clientSelection = 'all', includeReload = true, { public
     }
   }
 
-  if (includeReload && (plan.writes || []).some(write => write.client === 'codex' && write.component === 'skill') && !reloadClients.has('codex')) {
+  if (includeReload && (plan.writes || []).some(write => write.client === 'codex' && write.component === 'skill' && write.action !== 'unchanged') && !reloadClients.has('codex')) {
     steps.push({ action: 'restart_required', client: 'codex', dynamicReload: false, instruction: CLIENT_RELOAD_GUIDANCE.codex });
     reloadClients.add('codex');
   }
@@ -601,6 +602,7 @@ function nextSteps(plan, clientSelection = 'all', includeReload = true, { public
 function nextProxySteps(plan) {
   const steps = [];
   for (const write of plan.writes || []) {
+    if (write.action === 'unchanged') continue;
     const instruction = CLIENT_RELOAD_GUIDANCE[write.client];
     if (instruction) steps.push({ action: 'restart_required', client: write.client, dynamicReload: false, instruction });
   }
@@ -1710,6 +1712,10 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         env,
         projectId: currentBindingPlan.binding.projectId,
         serverName,
+        replaceRemoteUrl: currentBindingPlan.existing?.projectId === currentBindingPlan.binding.projectId
+          && currentBindingPlan.existing.serverName === serverName
+          ? currentBindingPlan.existing.mcpUrl
+          : undefined,
       })
       : createInstallPlan({
         clientSelection: args.client,

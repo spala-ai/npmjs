@@ -51,8 +51,12 @@ export function validateBootstrapUrl(rawUrl, mcpUrl) {
   if (mcp.username || mcp.password || mcp.hash || trimmedMcpUrl.includes('#')) {
     throw new Error('The requested MCP URL must not contain credentials or a fragment.');
   }
-  if ([...mcp.searchParams.keys()].some(key => key !== 'scope')) {
+  if ([...mcp.searchParams.keys()].some(key => key !== 'scope' && key !== 'profile')) {
     throw new Error('The requested MCP URL contains unsupported query parameters.');
+  }
+  const profileValues = mcp.searchParams.getAll('profile');
+  if (profileValues.length > 1 || (profileValues.length === 1 && profileValues[0] !== 'guided')) {
+    throw new Error('The requested MCP URL profile must occur once with the exact value guided.');
   }
   if (hasAmbiguousPath(trimmedBootstrapUrl, bootstrap) || hasAmbiguousPath(trimmedMcpUrl, mcp)) {
     throw new Error('Bootstrap and MCP URL paths must not contain encoded or ambiguous path segments.');

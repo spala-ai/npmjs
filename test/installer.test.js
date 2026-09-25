@@ -231,6 +231,22 @@ test('exact URL mode validates without canonicalizing or adding scope', () => {
   assert.equal(normalizeMcpUrl('https://example.test/mcp', '', true), 'https://example.test/mcp');
 });
 
+test('exact project MCP URLs preserve the validated guided profile', () => {
+  const guided = 'https://example.test/mcp?scope=builder%2Cproject%2Cdata&profile=guided';
+  assert.equal(normalizeMcpUrl(guided, '', true), guided);
+});
+
+test('project MCP URLs reject invalid profiles and unrelated query keys', () => {
+  for (const url of [
+    'https://example.test/mcp?profile=automatic',
+    'https://example.test/mcp?profile=',
+    'https://example.test/mcp?profile=guided&profile=guided',
+    'https://example.test/mcp?profile=guided&mode=guided',
+  ]) {
+    assert.throws(() => normalizeMcpUrl(url, '', true), /profile|unsupported query parameter/);
+  }
+});
+
 test('rejects unsafe MCP URLs', () => {
   assert.throws(() => normalizeMcpUrl('file:///tmp/mcp'), /must use https/);
   assert.throws(() => normalizeMcpUrl('javascript:alert(1)'), /must use https/);
@@ -3997,6 +4013,29 @@ test('exact project handoff writes Codex workspace config and requires a new ses
   assert.match(codexConfig, new RegExp(JSON.stringify(exactUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
+test('second identical Codex project registration omits restart guidance', async () => {
+  const exactUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata&profile=guided';
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const register = async () => {
+    let output = '';
+    await runCli(
+      ['--url', exactUrl, '--exact-url', '--client', 'codex', '--yes', '--json'],
+      {},
+      workspace,
+      { stdout: { write: chunk => { output += chunk; } }, stderr: { write: () => {} }, stdin: { isTTY: false } },
+    );
+    return JSON.parse(output);
+  };
+
+  const first = await register();
+  const second = await register();
+  assert.equal(first.nextSteps.some(step => step.action === 'restart_required'), true);
+  assert.ok(second.writes.length > 0);
+  assert.equal(second.writes.every(write => write.action === 'unchanged'), true);
+  assert.equal(second.nextSteps.some(step => step.action === 'restart_required'), false);
+});
+
 test('project Roo verification checks the exact workspace URL, not public status', async () => {
   const workspace = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
@@ -4787,6 +4826,73 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   const stored = readProjectCredential('project-123', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.bearerToken, bearerToken);
   assert.equal(stored.mcpUrl, 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('agentic Codex handoff upgrades its existing same-project remote entry to the local proxy', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.codex'));
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const serverName = 'spala_project_existing';
+  writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId: 'project-123',
+    projectUrl: 'https://shared.spala.ai/p123',
+    mcpUrl,
+    serverName,
+  });
+  fs.writeFileSync(path.join(workspace, '.codex', 'config.toml'),
+    `[mcp_servers.${serverName}]\nurl = ${JSON.stringify(mcpUrl)}\n\n[mcp_servers.unrelated]\nurl = "https://other.test/mcp"\n`);
+  let output = '';
+  let calls = 0;
+  await runCli([
+    'project', 'bind', '--project-id', 'project-123',
+    '--project-url', 'https://shared.spala.ai/p123', '--url', mcpUrl,
+    '--name', serverName, '--bootstrap-stdin', '--client', 'codex', '--yes', '--json',
+  ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://shared.spala.ai/p123/mcp/agent-instructions/opaque/consume\n']),
+  }, {
+    fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        access_token: 'mcp_replacement_secret',
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        mcp_url: mcpUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(output).agenticCredentialConfigured, true);
+  assert.doesNotMatch(output, /mcp_replacement_secret/);
+  const config = fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8');
+  assert.match(config, /command = "pnpm"/);
+  assert.match(config, /"proxy","--project-id","project-123"/);
+  assert.match(config, /\[mcp_servers\.unrelated\]\nurl = "https:\/\/other\.test\/mcp"/);
+  assert.doesNotMatch(config, /mcp_replacement_secret|\[mcp_servers\.spala_project_existing\]\nurl =/);
+});
+
+test('agentic Codex handoff refuses to overwrite a different remote URL', async () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.codex'));
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const serverName = 'spala_project_existing';
+  writeProjectBinding(workspace, {
+    schemaVersion: 1, projectId: 'project-123', projectUrl: 'https://shared.spala.ai/p123', mcpUrl, serverName,
+  });
+  const config = `[mcp_servers.${serverName}]\nurl = "https://other.test/mcp"\n`;
+  fs.writeFileSync(path.join(workspace, '.codex', 'config.toml'), config);
+  await assert.rejects(runCli([
+    'project', 'bind', '--project-id', 'project-123', '--project-url', 'https://shared.spala.ai/p123',
+    '--url', mcpUrl, '--name', serverName, '--bootstrap-stdin', '--client', 'codex', '--yes', '--json',
+  ], {}, workspace, {
+    stdout: { write: () => {} }, stderr: { write: () => {} },
+    stdin: Readable.from(['https://shared.spala.ai/p123/mcp/agent-instructions/opaque/consume\n']),
+  }), /refusing to replace it/);
+  assert.equal(fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8'), config);
 });
 
 test('Claude Code redeems a verifier-bound project claim and migrates the shared registration', async () => {

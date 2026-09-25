@@ -199,7 +199,8 @@ stdout backpressure are bounded; a disconnected client fails promptly rather
 than waiting indefinitely.
 For Codex, a re-bind can replace a simple direct remote entry under the same
 server name when its URL exactly matches the existing workspace project binding.
-Different URLs and customized entries still require explicit resolution.
+It can also upgrade a simple older pinned Spala proxy for the same project.
+Different projects, URLs, and customized entries still require explicit resolution.
 
 Agentic bootstrap rejects clients that cannot be configured safely for the
 workspace. No client is reported as dynamically reloaded; start a new session

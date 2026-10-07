@@ -268,17 +268,21 @@ export function normalizeMcpUrl(rawUrl, scope = DEFAULT_PROJECT_SCOPE, preserveE
   if (parsed.hash) {
     throw new Error('MCP URL must not contain a fragment.');
   }
-  const unsupportedParams = [...parsed.searchParams.keys()].filter(key => key !== 'scope');
-  if (unsupportedParams.length) {
-    throw new Error(`MCP URL contains unsupported query parameter(s): ${unsupportedParams.join(', ')}. Only scope is allowed.`);
-  }
   const normalizedPath = parsed.pathname.replace(/\/+$/, '') || '/';
-  if (
-    parsed.protocol === 'https:'
+  const isPublicEndpoint = parsed.protocol === 'https:'
     && parsed.hostname.toLowerCase() === 'mcp.spala.ai'
     && !parsed.port
-    && normalizedPath === '/mcp'
-  ) {
+    && normalizedPath === '/mcp';
+  const allowedParams = new Set(isPublicEndpoint ? ['scope'] : ['scope', 'profile']);
+  const unsupportedParams = [...parsed.searchParams.keys()].filter(key => !allowedParams.has(key));
+  if (unsupportedParams.length) {
+    throw new Error(`MCP URL contains unsupported query parameter(s): ${unsupportedParams.join(', ')}.`);
+  }
+  const profileValues = parsed.searchParams.getAll('profile');
+  if (profileValues.length > 1 || (profileValues.length === 1 && profileValues[0] !== 'guided')) {
+    throw new Error('Project MCP URL profile must occur once with the exact value guided.');
+  }
+  if (isPublicEndpoint) {
     return PUBLIC_MCP_URL;
   }
   if (!parsed.searchParams.get('scope') && scope) {
@@ -350,9 +354,11 @@ export function normalizeComparableMcpUrl(urlString) {
     const parsed = new URL(normalizeMcpUrl(urlString, ''));
     parsed.hash = '';
     const scope = parsed.searchParams.get('scope');
+    const profile = parsed.searchParams.get('profile');
     parsed.search = '';
     parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
     if (scope !== null) parsed.searchParams.set('scope', scope);
+    if (profile !== null) parsed.searchParams.set('profile', profile);
     return parsed.toString();
   } catch {
     return undefined;
@@ -935,7 +941,7 @@ export function createClaudeLocalProxyRestorePlan({
   };
 }
 
-export function createProxyInstallPlan({ clientSelection = 'all', cwd = process.cwd(), dryRun = false, env = process.env, projectId, serverName }) {
+export function createProxyInstallPlan({ clientSelection = 'all', cwd = process.cwd(), dryRun = false, env = process.env, projectId, serverName, replaceRemoteUrl }) {
   const workspaceRoot = findWorkspaceRoot(cwd);
   const safeServerName = sanitizeServerName(serverName);
   const proxy = proxyCommandForProject(projectId);
@@ -960,7 +966,7 @@ export function createProxyInstallPlan({ clientSelection = 'all', cwd = process.
     const filePath = targetPath(client, env, workspaceRoot, 'workspace');
     const safetyRoot = configSafetyRoot(client, env, workspaceRoot, 'workspace');
     if (client === 'codex') {
-      writes.push(planCodexTomlProxyInstall(filePath, safeServerName, proxy.command, proxy.args, dryRun, safetyRoot));
+      writes.push(planCodexTomlProxyInstall(filePath, safeServerName, proxy.command, proxy.args, dryRun, safetyRoot, replaceRemoteUrl));
       continue;
     }
     if (!['roo', 'claude-code', 'cursor'].includes(client) || !filePath) {

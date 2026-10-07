@@ -31,7 +31,7 @@ OAuth and client safety:
 - Before approving browser OAuth, tell the user which signed-in account will authorize the MCP and offer an explicit account switch. Never assume the browser's current account is the intended one.
 - OAuth and payment or upgrade actions are browser actions only. Never request, paste, inspect, or transport OAuth credentials or payment data through terminal input, files, arguments, environment variables, or MCP tool calls.
 - Never read or parse Codex credential files, tokens, browser storage, or MCP secrets. Never hand-roll HTTP/JSON-RPC calls or create helper scripts to bypass MCP client loading.
-- If the MCP was newly installed and its tools are unavailable in this session, stop and ask the user to start or resume a Codex session in this workspace. Do not work around the reload boundary.
+- If the MCP was newly installed and its tools are unavailable in this session, stop and ask the user to start a new Codex session in this workspace. To keep the conversation, use \`codex fork\`; \`codex resume\` reuses the existing session and does not refresh its MCP tools. Do not work around the reload boundary.
 `;
 
 export function planCodexSkillInstall(filePath, dryRun = false, safetyRoot) {

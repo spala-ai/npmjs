@@ -498,7 +498,7 @@ const CLIENT_RELOAD_GUIDANCE = {
   roo: 'Reload the VS Code window running Roo Code to load the updated MCP configuration.',
   'claude-desktop': 'Quit and reopen Claude Desktop to load the updated MCP configuration.',
   zed: 'Reload Zed to load the updated MCP configuration.',
-  codex: 'Start a new or resumed Codex session in this workspace to load the updated MCP configuration. Do not continue with app inspection, design, scaffolding, coding, testing, or QA in the pre-reload session.',
+  codex: 'Start a new Codex session in this workspace to load the updated MCP configuration. To keep the conversation, use codex fork; codex resume reuses the existing session and does not refresh its MCP tools. Do not continue with app inspection, design, scaffolding, coding, testing, or QA in the pre-reload session.',
   'claude-code': 'Start a new Claude Code session in this workspace to load the updated MCP configuration.',
   cursor: 'Reload Cursor (or toggle the MCP server in Cursor settings) to load the updated MCP configuration.',
 };
@@ -552,9 +552,10 @@ function nextSteps(plan, clientSelection = 'all', includeReload = true, { public
   const steps = [];
   const reloadClients = new Set();
   for (const write of plan.writes || []) {
+    if (write.action === 'unchanged') continue;
     if (write.component === 'skill') continue;
     const instruction = write.client === 'codex' && plan.installScope === 'workspace'
-      ? 'Start a new or resumed Codex session from this workspace to load .codex/config.toml.'
+      ? 'Start a new Codex session from this workspace to load .codex/config.toml. To keep the conversation, use codex fork; codex resume reuses the existing session and does not refresh its MCP tools.'
       : CLIENT_RELOAD_GUIDANCE[write.client];
     if (includeReload && instruction && !reloadClients.has(write.client)) {
       steps.push({ action: 'restart_required', client: write.client, dynamicReload: false, instruction });
@@ -562,7 +563,7 @@ function nextSteps(plan, clientSelection = 'all', includeReload = true, { public
     }
   }
 
-  if (includeReload && (plan.writes || []).some(write => write.client === 'codex' && write.component === 'skill') && !reloadClients.has('codex')) {
+  if (includeReload && (plan.writes || []).some(write => write.client === 'codex' && write.component === 'skill' && write.action !== 'unchanged') && !reloadClients.has('codex')) {
     steps.push({ action: 'restart_required', client: 'codex', dynamicReload: false, instruction: CLIENT_RELOAD_GUIDANCE.codex });
     reloadClients.add('codex');
   }
@@ -601,6 +602,7 @@ function nextSteps(plan, clientSelection = 'all', includeReload = true, { public
 function nextProxySteps(plan) {
   const steps = [];
   for (const write of plan.writes || []) {
+    if (write.action === 'unchanged') continue;
     const instruction = CLIENT_RELOAD_GUIDANCE[write.client];
     if (instruction) steps.push({ action: 'restart_required', client: write.client, dynamicReload: false, instruction });
   }
@@ -614,7 +616,7 @@ function nextProxySteps(plan) {
     steps.push({ action: 'configure_client', client: 'gemini', command: commands.geminiCli, argv: commands.argv.geminiCli });
     steps.push({ action: 'restart_required', client: 'gemini', dynamicReload: false, instruction: CLIENT_RELOAD_GUIDANCE.gemini });
   }
-  steps.push({ action: 'verify', instruction: 'Start or resume the selected client in this workspace and list the project MCP tools.' });
+  steps.push({ action: 'verify', instruction: 'Start a new session in this workspace and list the project MCP tools. For Codex, use codex fork to keep the conversation; codex resume does not refresh its MCP tools.' });
   return steps;
 }
 
@@ -1710,6 +1712,10 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
         env,
         projectId: currentBindingPlan.binding.projectId,
         serverName,
+        replaceRemoteUrl: currentBindingPlan.existing?.projectId === currentBindingPlan.binding.projectId
+          && currentBindingPlan.existing.serverName === serverName
+          ? currentBindingPlan.existing.mcpUrl
+          : undefined,
       })
       : createInstallPlan({
         clientSelection: args.client,

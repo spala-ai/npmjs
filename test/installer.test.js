@@ -148,6 +148,7 @@ test('generated package references keep bindings pinned and recovery current', (
   assert.equal(INSTALLER_PACKAGE_SPEC, `@spala-ai/mcp-install@${packageJson.version}`);
   assert.match(CODEX_SPALA_SKILL, /@spala-ai\/mcp-install@latest/);
   assert.doesNotMatch(CODEX_SPALA_SKILL, /@spala-ai\/mcp-install@0\.1\.\d+/);
+  assert.match(CODEX_SPALA_SKILL, /codex fork.*codex resume/s);
 });
 
 test('normalizes missing scope without replacing an existing scope', () => {
@@ -229,6 +230,22 @@ test('exact URL mode validates without canonicalizing or adding scope', () => {
   const scoped = 'https://example.test/mcp/?scope=builder%2Cproject%2Cdata';
   assert.equal(normalizeMcpUrl(scoped, '', true), scoped);
   assert.equal(normalizeMcpUrl('https://example.test/mcp', '', true), 'https://example.test/mcp');
+});
+
+test('exact project MCP URLs preserve the validated guided profile', () => {
+  const guided = 'https://example.test/mcp?scope=builder%2Cproject%2Cdata&profile=guided';
+  assert.equal(normalizeMcpUrl(guided, '', true), guided);
+});
+
+test('project MCP URLs reject invalid profiles and unrelated query keys', () => {
+  for (const url of [
+    'https://example.test/mcp?profile=automatic',
+    'https://example.test/mcp?profile=',
+    'https://example.test/mcp?profile=guided&profile=guided',
+    'https://example.test/mcp?profile=guided&mode=guided',
+  ]) {
+    assert.throws(() => normalizeMcpUrl(url, '', true), /profile|unsupported query parameter/);
+  }
 });
 
 test('rejects unsafe MCP URLs', () => {
@@ -3993,8 +4010,33 @@ test('exact project handoff writes Codex workspace config and requires a new ses
   ]);
   assert.equal(parsed.nextSteps[0].dynamicReload, false);
   const codexConfig = fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8');
+  assert.match(parsed.nextSteps[0].instruction, /Start a new Codex session/);
+  assert.match(parsed.nextSteps[0].instruction, /codex fork.*codex resume/);
   assert.match(codexConfig, /\[mcp_servers\.spala-shared-spala-ai-p123]/);
   assert.match(codexConfig, new RegExp(JSON.stringify(exactUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+test('second identical Codex project registration omits restart guidance', async () => {
+  const exactUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata&profile=guided';
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const register = async () => {
+    let output = '';
+    await runCli(
+      ['--url', exactUrl, '--exact-url', '--client', 'codex', '--yes', '--json'],
+      {},
+      workspace,
+      { stdout: { write: chunk => { output += chunk; } }, stderr: { write: () => {} }, stdin: { isTTY: false } },
+    );
+    return JSON.parse(output);
+  };
+
+  const first = await register();
+  const second = await register();
+  assert.equal(first.nextSteps.some(step => step.action === 'restart_required'), true);
+  assert.ok(second.writes.length > 0);
+  assert.equal(second.writes.every(write => write.action === 'unchanged'), true);
+  assert.equal(second.nextSteps.some(step => step.action === 'restart_required'), false);
 });
 
 test('project Roo verification checks the exact workspace URL, not public status', async () => {
@@ -4787,6 +4829,100 @@ test('agentic project bind consumes bootstrap once and keeps all secrets outside
   const stored = readProjectCredential('project-123', { SPALA_MCP_CREDENTIAL_HOME: credentialHome });
   assert.equal(stored.bearerToken, bearerToken);
   assert.equal(stored.mcpUrl, 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata');
+});
+
+test('agentic Codex handoff upgrades its existing same-project remote entry to the local proxy', async () => {
+  const workspace = tempHome();
+  const credentialHome = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.codex'));
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const serverName = 'spala_project_existing';
+  writeProjectBinding(workspace, {
+    schemaVersion: 1,
+    projectId: 'project-123',
+    projectUrl: 'https://shared.spala.ai/p123',
+    mcpUrl,
+    serverName,
+  });
+  fs.writeFileSync(path.join(workspace, '.codex', 'config.toml'),
+    `[mcp_servers.${serverName}]\nurl = ${JSON.stringify(mcpUrl)}\n\n[mcp_servers.unrelated]\nurl = "https://other.test/mcp"\n`);
+  let output = '';
+  let calls = 0;
+  await runCli([
+    'project', 'bind', '--project-id', 'project-123',
+    '--project-url', 'https://shared.spala.ai/p123', '--url', mcpUrl,
+    '--name', serverName, '--bootstrap-stdin', '--client', 'codex', '--yes', '--json',
+  ], { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace, {
+    stdout: { write: chunk => { output += chunk; } },
+    stderr: { write: () => {} },
+    stdin: Readable.from(['https://shared.spala.ai/p123/mcp/agent-instructions/opaque/consume\n']),
+  }, {
+    fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        access_token: 'mcp_replacement_secret',
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        mcp_url: mcpUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(output).agenticCredentialConfigured, true);
+  assert.doesNotMatch(output, /mcp_replacement_secret/);
+  const config = fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8');
+  assert.match(config, /command = "pnpm"/);
+  assert.match(config, /"proxy","--project-id","project-123"/);
+  assert.match(config, /\[mcp_servers\.unrelated\]\nurl = "https:\/\/other\.test\/mcp"/);
+  assert.doesNotMatch(config, /mcp_replacement_secret|\[mcp_servers\.spala_project_existing\]\nurl =/);
+});
+
+test('Codex project handoff upgrades only a simple older proxy for the same project', () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.codex'));
+  const configPath = path.join(workspace, '.codex', 'config.toml');
+  const previous = '[mcp_servers.spala_project_existing]\ncommand = "pnpm"\nargs = ["dlx","@spala-ai/mcp-install@0.1.29","proxy","--project-id","project-123"]\n\n[mcp_servers.unrelated]\nurl = "https://other.test/mcp"\n';
+  fs.writeFileSync(configPath, previous);
+  const plan = createProxyInstallPlan({ clientSelection: 'codex', cwd: workspace, dryRun: true,
+    projectId: 'project-123', serverName: 'spala_project_existing' });
+  assert.equal(plan.writes[0].action, 'update');
+  assert.match(plan.writes[0].content, new RegExp(INSTALLER_PACKAGE_SPEC.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(plan.writes[0].content, /\[mcp_servers\.unrelated\]\nurl = "https:\/\/other\.test\/mcp"/);
+  assert.equal(fs.readFileSync(configPath, 'utf8'), previous, 'planning must not mutate config');
+
+  for (const altered of [
+    previous.replace('project-123', 'different-project'),
+    previous.replace('command = "pnpm"', 'command = "other"'),
+    previous.replace('"project-123"]', '"project-123"]\nenv = { CUSTOM = "value" }'),
+    previous.replace('"project-123"]', '"project-123"] # customized'),
+  ]) {
+    fs.writeFileSync(configPath, altered);
+    assert.throws(() => createProxyInstallPlan({ clientSelection: 'codex', cwd: workspace, dryRun: true,
+      projectId: 'project-123', serverName: 'spala_project_existing' }), /Refusing to replace/);
+    assert.equal(fs.readFileSync(configPath, 'utf8'), altered);
+  }
+});
+
+test('agentic Codex handoff refuses to overwrite a different remote URL', async () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.codex'));
+  const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
+  const serverName = 'spala_project_existing';
+  writeProjectBinding(workspace, {
+    schemaVersion: 1, projectId: 'project-123', projectUrl: 'https://shared.spala.ai/p123', mcpUrl, serverName,
+  });
+  const config = `[mcp_servers.${serverName}]\nurl = "https://other.test/mcp"\n`;
+  fs.writeFileSync(path.join(workspace, '.codex', 'config.toml'), config);
+  await assert.rejects(runCli([
+    'project', 'bind', '--project-id', 'project-123', '--project-url', 'https://shared.spala.ai/p123',
+    '--url', mcpUrl, '--name', serverName, '--bootstrap-stdin', '--client', 'codex', '--yes', '--json',
+  ], {}, workspace, {
+    stdout: { write: () => {} }, stderr: { write: () => {} },
+    stdin: Readable.from(['https://shared.spala.ai/p123/mcp/agent-instructions/opaque/consume\n']),
+  }), /refusing to replace it/);
+  assert.equal(fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8'), config);
 });
 
 test('Claude Code redeems a verifier-bound project claim and migrates the shared registration', async () => {
@@ -6417,6 +6553,83 @@ test('proxy recovers from a network failure and backend 503 without restarting',
   assert.deepEqual(messages[2], { jsonrpc: '2.0', id: 3, result: { tools: [] } });
   assert.equal(call, 3);
   assert.equal(cancelled, 1);
+});
+
+test('proxy preserves safe quota metadata and tells agents not to retry a monthly limit', async () => {
+  const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
+  storeProjectCredential({
+    projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+  const output = [];
+  await runProxy({
+    projectId: 'project-123', cwd: workspace,
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call' })}\n`]),
+    stdout: { write: chunk => { output.push(...String(chunk).trim().split('\n')); return true; } },
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: 'secret backend diagnostic must not be forwarded',
+      code: 'PROJECT_BUILDER_MUTATION_LIMIT_EXCEEDED',
+      retryAfterSeconds: 86400,
+      resetAt: '2026-10-01T00:00:00.000Z',
+      limit: {
+        resource: 'builder_mutations',
+        value: 1000,
+        consumed: 1819,
+        projected: 1820,
+        secret: 'must-not-leak',
+      },
+      token: 'must-not-leak',
+    }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '86400' },
+    }),
+  });
+
+  const message = JSON.parse(output[0]);
+  assert.match(message.error.message, /builder mutation quota reached \(1819\/1000\)/i);
+  assert.match(message.error.message, /resets at 2026-10-01T00:00:00\.000Z/i);
+  assert.match(message.error.message, /retrying now will not succeed/i);
+  assert.deepEqual(message.error.data, {
+    httpStatus: 429,
+    code: 'PROJECT_BUILDER_MUTATION_LIMIT_EXCEEDED',
+    retryAfterSeconds: 86400,
+    resetAt: '2026-10-01T00:00:00.000Z',
+    limit: { resource: 'builder_mutations', value: 1000, consumed: 1819, projected: 1820 },
+  });
+  assert.doesNotMatch(output[0], /secret backend diagnostic|must-not-leak/);
+});
+
+test('proxy reports a temporary 429 without forwarding an untrusted backend body', async () => {
+  const credentialHome = tempHome();
+  const workspace = proxyWorkspace();
+  storeProjectCredential({
+    projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_proxy_secret',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+  let output = '';
+  await runProxy({
+    projectId: 'project-123', cwd: workspace,
+    env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+    stdin: Readable.from([`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`]),
+    stdout: { write: chunk => { output += chunk; return true; } },
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: 'database password is unsafe to expose',
+      code: 'UNTRUSTED_BACKEND_CODE',
+      retryAfterSeconds: 7,
+      resetAt: 'not-a-date',
+      limit: { resource: 'unknown', value: 1, consumed: 1, projected: 2 },
+    }), {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    }),
+  });
+
+  const message = JSON.parse(output);
+  assert.equal(message.error.message, 'Spala project MCP request rate is temporarily limited. Retry after 7 seconds.');
+  assert.deepEqual(message.error.data, { httpStatus: 429, retryAfterSeconds: 7 });
+  assert.doesNotMatch(output, /database password|UNTRUSTED|unknown/);
 });
 
 test('proxy bounds shutdown when a persistent event reader refuses cancellation', async () => {

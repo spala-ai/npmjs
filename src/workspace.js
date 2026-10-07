@@ -116,13 +116,17 @@ function validateHttpsUrl(rawValue, label, { allowScope = false } = {}) {
   if (parsed.username || parsed.password || parsed.hash) {
     throw new Error(`${label} must not contain credentials or a fragment.`);
   }
-  const allowedParams = allowScope ? new Set(['scope']) : new Set();
+  const allowedParams = allowScope ? new Set(['scope', 'profile']) : new Set();
   const unsupported = [...parsed.searchParams.keys()].filter(key => !allowedParams.has(key));
   if (unsupported.length) {
     throw new Error(`${label} contains unsupported query parameters: ${unsupported.join(', ')}.`);
   }
   if (allowScope && parsed.searchParams.getAll('scope').length > 1) {
     throw new Error(`${label} contains an ambiguous duplicate scope parameter.`);
+  }
+  const profileValues = parsed.searchParams.getAll('profile');
+  if (allowScope && (profileValues.length > 1 || (profileValues.length === 1 && profileValues[0] !== 'guided'))) {
+    throw new Error(`${label} profile must occur once with the exact value guided.`);
   }
   if (value.includes('?') && !parsed.search) {
     throw new Error(`${label} contains an ambiguous empty query.`);

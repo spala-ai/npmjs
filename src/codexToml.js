@@ -454,6 +454,18 @@ function appendProxyTable(source, target, command, args) {
   return `${source}${separator}[${target}]${newline}command = ${JSON.stringify(command)}${newline}args = ${JSON.stringify(args)}${newline}`;
 }
 
+function isOlderSameProjectInstallerProxy(existingCommand, existingArgs, command, args) {
+  if (existingCommand !== 'pnpm' || command !== 'pnpm'
+    || existingArgs.length !== 5 || args.length !== 5
+    || existingArgs[0] !== 'dlx' || args[0] !== 'dlx'
+    || existingArgs[2] !== 'proxy' || args[2] !== 'proxy'
+    || existingArgs[3] !== '--project-id' || args[3] !== '--project-id'
+    || existingArgs[4] !== args[4]) return false;
+  const oldVersion = /^@spala-ai\/mcp-install@0\.1\.(\d+)$/.exec(existingArgs[1]);
+  const newVersion = /^@spala-ai\/mcp-install@0\.1\.(\d+)$/.exec(args[1]);
+  return Boolean(oldVersion && newVersion && Number(oldVersion[1]) < Number(newVersion[1]));
+}
+
 function duplicateReconciliation(document, serverName, mcpUrl, duplicateServerNames) {
   const names = [...new Set(duplicateServerNames.filter(name => name !== serverName))];
   const removedDuplicates = [];
@@ -557,20 +569,73 @@ export function planCodexTomlInstall(filePath, serverName, mcpUrl, dryRun = fals
   };
 }
 
-export function planCodexTomlProxyInstall(filePath, serverName, command, args, dryRun = false, safetyRoot) {
+export function planCodexTomlProxyInstall(filePath, serverName, command, args, dryRun = false, safetyRoot, replaceRemoteUrl) {
   const pathState = assertSafePath(filePath, safetyRoot, 'Codex config path');
   const existed = fs.existsSync(filePath);
   const source = existed ? fs.readFileSync(filePath, 'utf8') : '';
   assertSafePath(filePath, safetyRoot, 'Codex config path', pathState);
   const document = tableRanges(source);
   const target = targetTableName(serverName);
-  const targetTable = serverTableSet(document, serverName).exact;
+  const tableSet = serverTableSet(document, serverName);
+  const targetTable = tableSet.exact;
   if (targetTable) {
     const existingCommand = readString(document, targetTable, 'command');
     const existingArgs = readStringArray(document, targetTable, 'args');
-    if (!existingCommand || !existingArgs) throw new Error(`Existing Codex table ${target} is not a simple stdio proxy configuration; refusing to replace it.`);
+    if (!existingCommand || !existingArgs) {
+      const existingUrl = readUrl(document, targetTable);
+      const assignments = document.assignments.filter(assignment => assignment.tablePath && pathsEqual(assignment.tablePath, targetTable.path));
+      if (
+        !replaceRemoteUrl
+        || existingUrl !== replaceRemoteUrl
+        || tableSet.descendants.length
+        || assignments.length !== 1
+        || assignments[0].path.at(-1) !== 'url'
+      ) {
+        throw new Error(`Existing Codex table ${target} is not a simple stdio proxy configuration; refusing to replace it.`);
+      }
+      const newline = preferredNewline(source);
+      const lines = [...document.lines];
+      lines.splice(assignments[0].line, 1,
+        `command = ${JSON.stringify(command)}${newline}`,
+        `args = ${JSON.stringify(args)}${newline}`);
+      return {
+        client: 'codex',
+        path: filePath,
+        format: 'toml',
+        content: lines.join(''),
+        originalContent: source,
+        action: 'update',
+        existed,
+        dryRun,
+        safetyRoot,
+        pathLabel: 'Codex config path',
+        pathState,
+      };
+    }
     if (existingCommand !== command || JSON.stringify(existingArgs) !== JSON.stringify(args)) {
-      throw new Error(`Refusing to replace existing Codex MCP server "${serverName}" with a different proxy command.`);
+      const assignments = document.assignments.filter(assignment => assignment.tablePath && pathsEqual(assignment.tablePath, targetTable.path));
+      const simpleProxy = !tableSet.descendants.length
+        && assignments.length === 2
+        && assignments.every(assignment => assignment.path.length === targetTable.path.length + 1)
+        && assignments.map(assignment => assignment.path.at(-1)).sort().join(',') === 'args,command'
+        && isOlderSameProjectInstallerProxy(existingCommand, existingArgs, command, args);
+      if (!simpleProxy) {
+        throw new Error(`Refusing to replace existing Codex MCP server "${serverName}" with a different proxy command.`);
+      }
+      const lines = [...document.lines];
+      const newline = preferredNewline(source);
+      for (const assignment of assignments) {
+        const key = assignment.path.at(-1);
+        const expected = key === 'command' ? JSON.stringify(existingCommand) : JSON.stringify(existingArgs);
+        if (lines[assignment.line].trim() !== `${key} = ${expected}`) {
+          throw new Error(`Refusing to replace customized Codex MCP server "${serverName}".`);
+        }
+        lines[assignment.line] = `${key} = ${JSON.stringify(key === 'command' ? command : args)}${newline}`;
+      }
+      return {
+        client: 'codex', path: filePath, format: 'toml', content: lines.join(''), originalContent: source,
+        action: 'update', existed, dryRun, safetyRoot, pathLabel: 'Codex config path', pathState,
+      };
     }
     return {
       client: 'codex',

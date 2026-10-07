@@ -10,6 +10,19 @@ const DEFAULT_STDOUT_DRAIN_TIMEOUT_MS = 15_000;
 const DEFAULT_FIRST_INPUT_TIMEOUT_MS = 30_000;
 const DEFAULT_EVENT_STREAM_STOP_TIMEOUT_MS = 2_000;
 const ERROR_RESPONSE_CANCEL_TIMEOUT_MS = 250;
+const MAX_ERROR_BODY_BYTES = 32 * 1024;
+
+const SAFE_QUOTA_CODES = new Set([
+  'PROJECT_API_REQUEST_LIMIT_EXCEEDED',
+  'PROJECT_BUILDER_MUTATION_LIMIT_EXCEEDED',
+  'PROJECT_MCP_RATE_LIMIT_EXCEEDED',
+]);
+
+const SAFE_LIMIT_RESOURCES = new Set([
+  'api_requests',
+  'builder_mutations',
+  'mcp_rate',
+]);
 
 class ProxyOutputError extends Error {}
 
@@ -130,6 +143,87 @@ async function boundedText(response, maxBodyBytes) {
     throw safeRemoteError('MCP proxy response exceeded the configured size limit.');
   }
   return text;
+}
+
+function safeNonNegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function safePositiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function safeIsoDate(value) {
+  if (typeof value !== 'string' || value.length > 64) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function safeRetryAfter(response, payload) {
+  const fromBody = safePositiveInteger(payload?.retryAfterSeconds);
+  if (fromBody !== undefined) return fromBody;
+  const rawHeader = response?.headers?.get?.('retry-after');
+  if (typeof rawHeader !== 'string' || !/^\d{1,10}$/.test(rawHeader)) return undefined;
+  return safePositiveInteger(Number(rawHeader));
+}
+
+function safeLimit(payload) {
+  const source = payload?.limit;
+  if (!source || typeof source !== 'object' || !SAFE_LIMIT_RESOURCES.has(source.resource)) return undefined;
+  const value = safeNonNegativeInteger(source.value);
+  const consumed = safeNonNegativeInteger(source.consumed);
+  const projected = safeNonNegativeInteger(source.projected);
+  if (value === undefined || consumed === undefined || projected === undefined) return undefined;
+  return { resource: source.resource, value, consumed, projected };
+}
+
+async function safeProxyFailure(response, maxBodyBytes) {
+  let payload;
+  try {
+    const body = await boundedText(response, Math.min(maxBodyBytes, MAX_ERROR_BODY_BYTES));
+    const parsed = body.trim() ? JSON.parse(body) : undefined;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed;
+  } catch {
+    await cancelResponseBody(response);
+  }
+
+  const status = safePositiveInteger(response?.status);
+  const code = SAFE_QUOTA_CODES.has(payload?.code) ? payload.code : undefined;
+  const retryAfterSeconds = safeRetryAfter(response, payload);
+  const resetAt = safeIsoDate(payload?.resetAt);
+  const limit = safeLimit(payload);
+  const data = {
+    ...(status ? { httpStatus: status } : {}),
+    ...(code ? { code } : {}),
+    ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    ...(resetAt ? { resetAt } : {}),
+    ...(limit ? { limit } : {}),
+  };
+
+  if (code === 'PROJECT_BUILDER_MUTATION_LIMIT_EXCEEDED') {
+    const usage = limit ? ` (${limit.consumed}/${limit.value})` : '';
+    const reset = resetAt ? ` It resets at ${resetAt}.` : '';
+    return {
+      message: `Spala organization builder mutation quota reached${usage}.${reset} Wait until reset or add builder capacity; retrying now will not succeed.`,
+      data,
+    };
+  }
+  if (code === 'PROJECT_API_REQUEST_LIMIT_EXCEEDED') {
+    const usage = limit ? ` (${limit.consumed}/${limit.value})` : '';
+    const reset = resetAt ? ` It resets at ${resetAt}.` : '';
+    return {
+      message: `Spala project API request quota reached${usage}.${reset} Wait until reset or add API capacity; retrying now will not succeed.`,
+      data,
+    };
+  }
+  if (code === 'PROJECT_MCP_RATE_LIMIT_EXCEEDED' || status === 429) {
+    const retry = retryAfterSeconds ? ` Retry after ${retryAfterSeconds} seconds.` : ' Retry later.';
+    return { message: `Spala project MCP request rate is temporarily limited.${retry}`, data };
+  }
+  return {
+    message: `MCP proxy request failed with HTTP ${status || 'error'}. Retry the request.`,
+    data,
+  };
 }
 
 // Invariants: a FINITE stream (POST response) is capped by cumulative raw
@@ -261,12 +355,12 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
     }
   };
 
-  const emitRecoverableError = async (request, message) => {
+  const emitRecoverableError = async (request, message, data) => {
     if (request?.id === undefined || request?.id === null) return;
     await emitMessages([{
       jsonrpc: '2.0',
       id: request.id,
-      error: { code: -32000, message },
+      error: { code: -32000, message, ...(data && Object.keys(data).length ? { data } : {}) },
     }], stdout, stdoutDrainTimeoutMs);
   };
 
@@ -373,8 +467,8 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
         continue;
       }
       if (!response?.ok && response?.status !== 202) {
-        await cancelResponseBody(response);
-        await emitRecoverableError(request, `MCP proxy request failed with HTTP ${response?.status || 'error'}. Retry the request.`);
+        const failure = await safeProxyFailure(response, maxBodyBytes);
+        await emitRecoverableError(request, failure.message, failure.data);
         continue;
       }
       const returnedSession = response.headers?.get?.('mcp-session-id');

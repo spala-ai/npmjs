@@ -167,7 +167,7 @@ remote URL is absent from client config and proxy arguments;
 and exact MCP URL shown above.
 
 Codex, Roo, and Cursor receive workspace files. Claude Code uses its private
-workspace-local MCP registry (`claude mcp add --scope local`) instead of the
+repository-local MCP registry (`claude mcp add --scope local`) instead of the
 shared `.mcp.json` approval boundary. The installer verifies that registration
 after writing it and refuses to replace a same-name registration it does not
 own.
@@ -224,6 +224,17 @@ installer-owned private Claude registration. It leaves unrelated MCP entries
 and client-owned manual OAuth credentials untouched. `project bind --switch`
 retires the previous delegated credential and installer-owned private
 registration as part of the switch.
+
+### Claude Code and Git worktrees
+
+Claude Code stores local MCP registrations under the main checkout’s physical
+path in `~/.claude.json`, shared across its Git worktrees. The installer uses
+that same key for verification, removal, and rollback. `.spala/project.json`
+and recovery state remain in the worktree. Unbinding removes the matching
+installer-owned registration from that shared registry; unrelated entries stay
+untouched. Use a separate repository or directory outside the repository when
+you need independent Claude registrations.
+
 
 ## Install Scope Versus Tool Scope
 

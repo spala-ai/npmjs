@@ -12,3 +12,7 @@ Before committing, run:
 pnpm install --frozen-lockfile
 pnpm run ci
 ```
+
+Claude Code registry identity is the main checkout’s physical path, while
+Spala binding/recovery identity stays in the worktree. Keep those paths separate
+and cover registration changes with real Git worktree tests.

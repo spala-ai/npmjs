@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import http from 'node:http';
@@ -4925,11 +4925,18 @@ test('agentic Codex handoff refuses to overwrite a different remote URL', async 
   assert.equal(fs.readFileSync(path.join(workspace, '.codex', 'config.toml'), 'utf8'), config);
 });
 
-test('Claude Code redeems a verifier-bound project claim and migrates the shared registration', async () => {
-  const workspace = tempHome();
+test('Claude Code redeems a verifier-bound project claim from a real worktree and migrates the shared registration', async t => {
+  const fixtureRoot = fs.realpathSync(tempHome());
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  const main = path.join(fixtureRoot, 'main');
+  const workspace = path.join(fixtureRoot, 'linked');
+  fs.mkdirSync(main);
+  const git = (...args) => execFileSync('git', args, { cwd: main, stdio: 'pipe' });
+  git('init');
+  git('-c', 'user.name=Spala AI', '-c', 'user.email=info@spala.ai', 'commit', '--allow-empty', '-m', 'fixture');
+  git('worktree', 'add', '-b', 'linked', workspace);
   const credentialHome = tempHome();
   const installHome = tempHome();
-  fs.mkdirSync(path.join(workspace, '.git'));
   const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_INSTALL_HOME: installHome };
   const projectUrl = 'https://shared.spala.ai/p123/';
   const mcpUrl = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata';
@@ -4940,7 +4947,7 @@ test('Claude Code redeems a verifier-bound project claim and migrates the shared
     args: ['--yes', '@spala-ai/mcp-install@0.1.16', 'proxy', '--project-id', 'project-123'],
   };
   fs.writeFileSync(path.join(installHome, '.claude.json'), JSON.stringify({
-    projects: { [workspace]: { mcpServers: { [serverName]: legacyEntry } } },
+    projects: { [main]: { mcpServers: { [serverName]: legacyEntry } } },
   }));
   fs.writeFileSync(path.join(workspace, '.mcp.json'), JSON.stringify({
     mcpServers: {
@@ -5004,9 +5011,9 @@ test('Claude Code redeems a verifier-bound project claim and migrates the shared
       assert.equal(cwd, workspace);
       const configPath = path.join(installHome, '.claude.json');
       const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      if (args[1] === 'remove') delete config.projects[workspace].mcpServers[serverName];
+      if (args[1] === 'remove') delete config.projects[main].mcpServers[serverName];
       else {
-        config.projects[workspace].mcpServers[serverName] = {
+        config.projects[main].mcpServers[serverName] = {
           type: 'stdio',
           command: 'pnpm',
           args: ['dlx', INSTALLER_PACKAGE_SPEC, 'proxy', '--project-id', 'project-123', MANAGED_PROXY_REGISTRATION_FLAG],

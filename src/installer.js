@@ -16,6 +16,7 @@ import {
 import { assertSafePath } from './pathSafety.js';
 import { applySafeFileWrite, recoverSafeFileWrite, rollbackSafeFileWrite } from './safeFileOps.js';
 import { findWorkspaceRoot } from './workspace.js';
+import { claudeRegistrationRoot } from './claudeRegistrationRoot.js';
 
 export const WRITABLE_CLIENTS = [
   'antigravity',
@@ -31,7 +32,7 @@ export const WRITABLE_CLIENTS = [
 
 // Clients whose USER-scoped public install is applied via a printed client CLI
 // command instead of a config-file write. Claude Code project bindings use its
-// private workspace-local registration so resumed sessions do not inherit a
+// private repository-local registration so resumed sessions do not inherit a
 // shared .mcp.json approval boundary.
 export const COMMAND_ONLY_CLIENTS = [
   'claude-code',
@@ -811,18 +812,19 @@ function planLegacyClaudeProjectCleanup(workspaceRoot, serverName, projectId, dr
 
 export function inspectClaudeLocalProxyRegistration({ cwd = process.cwd(), env = process.env, projectId, serverName }) {
   const workspaceRoot = findWorkspaceRoot(cwd);
+  const registrationRoot = claudeRegistrationRoot(workspaceRoot);
   const configPath = joinPath(env, homeDir(env), '.claude.json');
   const safetyRoot = homeDir(env);
   assertSafePath(configPath, safetyRoot, 'Claude Code config path');
-  if (!fs.existsSync(configPath)) return { status: 'missing', configured: false, installerOwned: false, installerRegistration: null, registeredProjectId: null, path: configPath, workspaceRoot };
+  if (!fs.existsSync(configPath)) return { status: 'missing', configured: false, installerOwned: false, installerRegistration: null, registeredProjectId: null, path: configPath, workspaceRoot, registrationRoot };
   let config;
   try {
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   } catch {
-    return { status: 'invalid', configured: false, installerOwned: false, installerRegistration: null, registeredProjectId: null, path: configPath, workspaceRoot };
+    return { status: 'invalid', configured: false, installerOwned: false, installerRegistration: null, registeredProjectId: null, path: configPath, workspaceRoot, registrationRoot };
   }
-  const entry = config?.projects?.[workspaceRoot]?.mcpServers?.[serverName];
-  if (!entry) return { status: 'missing', configured: false, installerOwned: false, installerRegistration: null, registeredProjectId: null, path: configPath, workspaceRoot };
+  const entry = config?.projects?.[registrationRoot]?.mcpServers?.[serverName];
+  if (!entry) return { status: 'missing', configured: false, installerOwned: false, installerRegistration: null, registeredProjectId: null, path: configPath, workspaceRoot, registrationRoot };
   const registeredProjectId = installerProxyProjectId(entry, { requireType: true }) || null;
   const installerOwned = registeredProjectId !== null;
   const installerRegistration = installerOwned
@@ -834,7 +836,7 @@ export function inspectClaudeLocalProxyRegistration({ cwd = process.cwd(), env =
     && Array.isArray(entry.args)
     && entry.args.length === expected.args.length
     && entry.args.every((value, index) => value === expected.args[index]);
-  return { status: configured ? 'configured' : 'mismatched', configured, installerOwned, installerRegistration, registeredProjectId, path: configPath, workspaceRoot };
+  return { status: configured ? 'configured' : 'mismatched', configured, installerOwned, installerRegistration, registeredProjectId, path: configPath, workspaceRoot, registrationRoot };
 }
 
 export function createClaudeLocalProxyRemovalPlan({
@@ -853,7 +855,7 @@ export function createClaudeLocalProxyRemovalPlan({
   if (document.root.type !== 'object') throw new Error('Claude Code config root must be a JSON object.');
   const projects = uniqueProperty(document.root, 'projects', 'Claude Code config root');
   if (!projects || projects.value.type !== 'object') throw new Error('Claude Code project registry changed before removal.');
-  const workspace = uniqueProperty(projects.value, inspected.workspaceRoot, 'Claude Code project registry');
+  const workspace = uniqueProperty(projects.value, inspected.registrationRoot, 'Claude Code project registry');
   if (!workspace || workspace.value.type !== 'object') throw new Error('Claude Code workspace registry changed before removal.');
   const servers = uniqueProperty(workspace.value, 'mcpServers', 'Claude Code workspace registry');
   if (!servers || servers.value.type !== 'object') throw new Error('Claude Code MCP registry changed before removal.');
@@ -898,13 +900,14 @@ export function createClaudeLocalProxyRestorePlan({
   dryRun = false,
 }) {
   const workspaceRoot = findWorkspaceRoot(cwd);
+  const registrationRoot = claudeRegistrationRoot(workspaceRoot);
   const configPath = joinPath(env, homeDir(env), '.claude.json');
   const safetyRoot = homeDir(env);
   const { document, existed, pathState } = readJsonIfExists(configPath, safetyRoot);
   if (document.root.type !== 'object') throw new Error('Claude Code config root must be a JSON object.');
   const projects = uniqueProperty(document.root, 'projects', 'Claude Code config root');
   if (!projects || projects.value.type !== 'object') throw new Error('Claude Code project registry changed before restoration.');
-  const workspace = uniqueProperty(projects.value, workspaceRoot, 'Claude Code project registry');
+  const workspace = uniqueProperty(projects.value, registrationRoot, 'Claude Code project registry');
   if (!workspace || workspace.value.type !== 'object') throw new Error('Claude Code workspace registry changed before restoration.');
   const servers = uniqueProperty(workspace.value, 'mcpServers', 'Claude Code workspace registry');
   if (!servers || servers.value.type !== 'object') throw new Error('Claude Code MCP registry changed before restoration.');

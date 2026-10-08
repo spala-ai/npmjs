@@ -332,3 +332,15 @@ Prefer trusted publishing in CI. For a manual package release:
 ```bash
 pnpm publish --access public --provenance
 ```
+
+### Update notices
+
+The project proxy checks the public service's tested installer version at MCP
+initialization and every 15 minutes of tool activity. It adds one agent-visible
+notice per newer version per session. Checks are credential-free, bounded to
+1.5 seconds, and fail open for maintenance; project authentication is unchanged.
+The notice asks the agent to reconnect the same project through public
+`project_connect`, execute its exact installer plan, and reload the client at a
+safe stopping point. It never installs an update automatically. Older proxies
+need a one-time reconnect to gain these checks. Remote public MCP code updates
+on the server; native plugin/skill releases have their own update mechanisms.

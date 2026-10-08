@@ -41,7 +41,8 @@ import {
   storeProjectCredential,
   storeProjectCredentialAndRetire,
 } from '../src/credentialStore.js';
-import { runProxy } from '../src/proxy.js';
+import { runProxy as runProxyImpl } from '../src/proxy.js';
+const runProxy = options => runProxyImpl({ updateFetchImpl: async () => new Response('', { status: 503 }), ...options });
 import { PassThrough, Readable } from 'node:stream';
 import {
   findWorkspaceRoot,
@@ -7200,4 +7201,61 @@ test('unselected claude-code is command-managed on workspace binds when the clie
   });
   assert.equal(detected.writes.some(write => write.client === 'claude-code'), false);
   assert.equal(detected.skipped.some(item => item.client === 'claude-code' && item.commandRequired), true);
+});
+
+test('project proxy delivers an update notice through JSON and SSE without altering tool data or exposing credentials', async () => {
+  for (const sse of [false, true]) {
+    const credentialHome = tempHome();
+    const workspace = proxyWorkspace();
+    try {
+      storeProjectCredential({ projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'private-update-test', expiresAt: new Date(Date.now() + 60000).toISOString() }, { SPALA_MCP_CREDENTIAL_HOME: credentialHome }, workspace);
+      let checks = 0;
+      const lines = [];
+      await runProxyImpl({
+        projectId: 'project-123', cwd: workspace, env: { SPALA_MCP_CREDENTIAL_HOME: credentialHome },
+        stdin: Readable.from([1, 2].map(id => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'spala_start', arguments: {} } }) + '\n')),
+        stdout: { write: chunk => { lines.push(JSON.parse(chunk)); return true; } },
+        updateFetchImpl: async (_url, options) => {
+          checks++;
+          assert.deepEqual(options.headers, { accept: 'application/json' });
+          return new Response(JSON.stringify({ installer: { package: '@spala-ai/mcp-install', version: '99.0.0' } }));
+        },
+        fetchImpl: async (_url, options) => {
+          const request = JSON.parse(options.body);
+          const result = JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: 'original result' }], structuredContent: { ok: true } } });
+          return new Response(sse ? `data: ${result}\n\n` : result, { headers: { 'content-type': sse ? 'text/event-stream' : 'application/json' } });
+        },
+      });
+      assert.equal(checks, 1);
+      assert.equal(lines[0].result.content.length, 2);
+      assert.match(lines[0].result.content[1].text, /update available/);
+      assert.deepEqual(lines[0].result.structuredContent, { ok: true });
+      assert.equal(lines[1].result.content.length, 1);
+      assert.doesNotMatch(JSON.stringify(lines), /private-update-test/);
+    } finally {
+      fs.rmSync(credentialHome, { recursive: true, force: true });
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  }
+});
+
+test('current installer upgrades previous marked Claude proxy without claiming an unmarked registration', () => {
+  const workspace = fs.realpathSync(proxyWorkspace());
+  const home = tempHome();
+  const env = { SPALA_MCP_INSTALL_HOME: home, CLAUDE_CONFIG_DIR: home };
+  const serverName = 'spala-project-test';
+  const args = ['dlx', '@spala-ai/mcp-install@0.1.33', 'proxy', '--project-id', 'project-123', MANAGED_PROXY_REGISTRATION_FLAG];
+  const config = { projects: { [fs.realpathSync(workspace)]: { mcpServers: { [serverName]: { type: 'stdio', command: 'pnpm', args } } } } };
+  try {
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify(config));
+    const inspect = () => inspectClaudeLocalProxyRegistration({ cwd: workspace, env, projectId: 'project-123', serverName });
+    assert.equal(inspect().installerOwned, true);
+    assert.equal(inspect().configured, false);
+    args.pop();
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify(config));
+    assert.equal(inspect().installerOwned, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
 });

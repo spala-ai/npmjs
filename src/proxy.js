@@ -1,4 +1,5 @@
 import readline from 'node:readline';
+import { createUpdateCheck } from './updateCheck.js';
 import { projectCredentialStatus, readProjectCredential } from './credentialStore.js';
 import { mcpAuthorizationMatches } from './installer.js';
 import { readProjectBinding } from './workspace.js';
@@ -102,8 +103,8 @@ function responseMessages(contentType, body) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-async function emitMessages(messages, stdout, drainTimeoutMs, signal) {
-  for (const message of messages) await writeLine(stdout, JSON.stringify(message), drainTimeoutMs, signal);
+async function emitMessages(messages, stdout, drainTimeoutMs, signal, transform = message => message) {
+  for (const message of messages) await writeLine(stdout, JSON.stringify(transform(message)), drainTimeoutMs, signal);
 }
 
 async function cancelResponseBody(response) {
@@ -230,7 +231,7 @@ async function safeProxyFailure(response, maxBodyBytes) {
 // bytes; a PERSISTENT stream (GET event channel) is capped per event only —
 // total session traffic is legitimately unbounded there. Both limits count
 // raw UTF-8 bytes, never decoded characters.
-async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes, drainTimeoutMs, onReader, signal }) {
+async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes, drainTimeoutMs, onReader, signal, transform }) {
   if (!body?.getReader) return;
   const reader = body.getReader();
   onReader?.(reader);
@@ -249,7 +250,7 @@ async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes, drain
       .map(line => line.slice(5).trimStart())
       .join('\n')
       .trim();
-    if (data) await emitMessages([JSON.parse(data)], stdout, drainTimeoutMs, signal);
+    if (data) await emitMessages([JSON.parse(data)], stdout, drainTimeoutMs, signal, transform);
   };
   try {
     while (true) {
@@ -275,20 +276,20 @@ async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes, drain
   }
 }
 
-async function emitResponse(response, stdout, maxBodyBytes, drainTimeoutMs) {
+async function emitResponse(response, stdout, maxBodyBytes, drainTimeoutMs, transform) {
   const contentType = response.headers?.get?.('content-type') || '';
   if (contentType.includes('text/event-stream') && response.body?.getReader) {
-    await emitSseStream(response.body, stdout, { maxTotalBytes: maxBodyBytes, maxEventBytes: maxBodyBytes, drainTimeoutMs });
+    await emitSseStream(response.body, stdout, { maxTotalBytes: maxBodyBytes, maxEventBytes: maxBodyBytes, drainTimeoutMs, transform });
     return;
   }
-  await emitMessages(responseMessages(contentType, await boundedText(response, maxBodyBytes)), stdout, drainTimeoutMs);
+  await emitMessages(responseMessages(contentType, await boundedText(response, maxBodyBytes)), stdout, drainTimeoutMs, undefined, transform);
 }
 
 function safeRemoteError(message) {
   return new Error(message, { cause: undefined });
 }
 
-export async function runProxy({ projectId, env = process.env, cwd = process.cwd(), stdin = process.stdin, stdout = process.stdout, fetchImpl = globalThis.fetch }) {
+export async function runProxy({ projectId, env = process.env, cwd = process.cwd(), stdin = process.stdin, stdout = process.stdout, fetchImpl = globalThis.fetch, updateFetchImpl = fetchImpl }) {
   if (!projectId) throw new Error('proxy requires --project-id.');
   if (typeof fetchImpl !== 'function') throw new Error('MCP proxy is unavailable in this Node runtime.');
   const maxBodyBytes = boundedIntFromEnv(env, 'SPALA_MCP_PROXY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES, 65_536, 1_073_741_824);
@@ -305,6 +306,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   } else {
     readProjectCredential(projectId, env, workspaceRoot);
   }
+  const updates = createUpdateCheck({ fetchImpl: updateFetchImpl });
   let sessionId;
   let protocolVersion = DEFAULT_PROTOCOL_VERSION;
   let eventStream;
@@ -395,6 +397,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       } catch {
         throw new Error('MCP proxy received invalid JSON on stdin.');
       }
+      if (request?.method === 'initialize' || request?.method === 'tools/call') await updates.check();
       if (request?.method === 'initialize' && typeof request?.params?.protocolVersion === 'string') {
         protocolVersion = request.params.protocolVersion;
       }
@@ -524,7 +527,7 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       }
       if (response.status === 202 || response.status === 204) continue;
       try {
-        await emitResponse(response, stdout, maxBodyBytes, stdoutDrainTimeoutMs);
+        await emitResponse(response, stdout, maxBodyBytes, stdoutDrainTimeoutMs, message => updates.decorate(message, request));
       } catch (error) {
         if (error instanceof ProxyOutputError) throw error;
         if (error instanceof Error && error.message.includes('size limit')) throw error;

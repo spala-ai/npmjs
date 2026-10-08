@@ -69,6 +69,16 @@ const LEGACY_MANAGED_PROXY_PACKAGE_SPECS = new Set([
   '@spala-ai/mcp-install@0.1.27',
 ]);
 
+const MARKED_PROXY_PACKAGE_SPECS = new Set([
+  ...LEGACY_MANAGED_PROXY_PACKAGE_SPECS,
+  '@spala-ai/mcp-install@0.1.28',
+  '@spala-ai/mcp-install@0.1.29',
+  '@spala-ai/mcp-install@0.1.30',
+  '@spala-ai/mcp-install@0.1.31',
+  '@spala-ai/mcp-install@0.1.32',
+  '@spala-ai/mcp-install@0.1.33',
+]);
+
 export const CLIENT_LABELS = {
   antigravity: 'Antigravity',
   'antigravity-cli': 'Antigravity CLI',
@@ -746,7 +756,7 @@ function installerProxyProjectId(value, { requireType = false } = {}) {
   const commandArgs = marked ? args.slice(0, -1) : args;
   const packageSpec = commandArgs[1];
   const installerOwned = marked
-    ? packageSpec === INSTALLER_PACKAGE_SPEC || LEGACY_MANAGED_PROXY_PACKAGE_SPECS.has(packageSpec)
+    ? packageSpec === INSTALLER_PACKAGE_SPEC || MARKED_PROXY_PACKAGE_SPECS.has(packageSpec)
     : LEGACY_MANAGED_PROXY_PACKAGE_SPECS.has(packageSpec);
   if (!installerOwned) return undefined;
   if (command === 'pnpm') {

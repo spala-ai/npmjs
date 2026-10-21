@@ -6394,7 +6394,7 @@ test('proxy reads its user credential and forwards bearer auth without printing 
       fetchCalls += 1;
       assert.equal(url, 'https://shared.spala.ai/p123/mcp');
       assert.equal(options.headers.authorization, `Bearer ${bearerToken}`);
-      assert.equal(options.redirect, 'error');
+      assert.equal(options.redirect, 'manual');
       assert.deepEqual(JSON.parse(options.body), request);
       return new Response(JSON.stringify(response), {
         status: 200,
@@ -6405,6 +6405,88 @@ test('proxy reads its user credential and forwards bearer auth without printing 
   assert.equal(fetchCalls, 1);
   assert.deepEqual(JSON.parse(output), response);
   assert.doesNotMatch(output, new RegExp(bearerToken));
+});
+
+test('proxy retries one exact-URL cold-start 307 with the original request and deadline', async () => {
+  const credentialHome = tempHome();
+  const url = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject';
+  const workspace = proxyWorkspace('project-123', url);
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  storeProjectCredential({ projectId: 'project-123', mcpUrl: url, bearerToken: 'cold-start-fixture', expiresAt: new Date(Date.now() + 60_000).toISOString() }, env, workspace);
+  const request = { jsonrpc: '2.0', id: 1, method: 'tools/list' };
+  const calls = [];
+  let cancelled = false;
+  let output = '';
+  try {
+    await runProxy({
+      projectId: 'project-123', cwd: workspace, env,
+      stdin: Readable.from([JSON.stringify(request) + '\n']),
+      stdout: { write: chunk => { output += chunk; } },
+      fetchImpl: async (target, options) => {
+        calls.push({ target, options });
+        assert.equal(options.redirect, 'manual');
+        if (calls.length === 1) return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 307, headers: { location: '/p123/mcp?scope=builder%2Cproject' } });
+        assert.equal(cancelled, true);
+        return Response.json({ jsonrpc: '2.0', id: 1, result: { tools: [] } });
+      },
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].target, url);
+    assert.equal(calls[1].target, url);
+    assert.strictEqual(calls[0].options, calls[1].options);
+    assert.equal(calls[1].options.method, 'POST');
+    assert.equal(calls[1].options.body, JSON.stringify(request));
+    assert.equal(calls[1].options.headers.authorization, 'Bearer cold-start-fixture');
+    assert.ok(calls[1].options.signal);
+    assert.deepEqual(JSON.parse(output).result, { tools: [] });
+    assert.doesNotMatch(output, /cold-start-fixture/);
+  } finally {
+    fs.rmSync(credentialHome, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('proxy rejects other redirects without forwarding credentials and bounds repeated cold-start 307s', async t => {
+  const url = 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject';
+  const scenarios = [
+    ['cross origin', 307, 'https://other.invalid/p123/mcp?scope=builder%2Cproject', 1],
+    ['different path', 307, '/other/mcp?scope=builder%2Cproject', 1],
+    ['different query', 307, '/p123/mcp?scope=builder%2Cproject%2Cdata', 1],
+    ['302', 302, url, 1],
+    ['301', 301, url, 1],
+    ['303', 303, url, 1],
+    ['308', 308, url, 1],
+    ['missing location', 307, undefined, 1],
+    ['invalid location', 307, 'https://[', 1],
+    ['repeated 307', 307, url, 2],
+  ];
+  for (const [name, status, location, expectedCalls] of scenarios) await t.test(name, async () => {
+    const credentialHome = tempHome();
+    const workspace = proxyWorkspace('project-123', url);
+    const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+    storeProjectCredential({ projectId: 'project-123', mcpUrl: url, bearerToken: 'redirect-fixture', expiresAt: new Date(Date.now() + 60_000).toISOString() }, env, workspace);
+    let calls = 0, cancelled = 0, output = '';
+    try {
+      await runProxy({
+        projectId: 'project-123', cwd: workspace, env,
+        stdin: Readable.from(['{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n']),
+        stdout: { write: chunk => { output += chunk; } },
+        fetchImpl: async (target, options) => {
+          calls += 1;
+          assert.equal(target, url);
+          assert.equal(options.redirect, 'manual');
+          return new Response(new ReadableStream({ cancel() { cancelled += 1; } }), { status, headers: location === undefined ? {} : { location } });
+        },
+      });
+      assert.equal(calls, expectedCalls);
+      assert.equal(cancelled, expectedCalls);
+      assert.match(JSON.parse(output).error.message, /could not reach/);
+      assert.doesNotMatch(output, /redirect-fixture|other\.invalid/);
+    } finally {
+      fs.rmSync(credentialHome, { recursive: true, force: true });
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
 });
 
 test('proxy carries two sequential requests over one process', async () => {
@@ -6432,16 +6514,23 @@ test('proxy carries two sequential requests over one process', async () => {
   assert.deepEqual(output.map(line => JSON.parse(line).id), [1, 2]);
 });
 
-test('proxy binary carries two sequential requests over real OS pipes', async () => {
+test('proxy binary handles a cold-start 307 and two sequential requests over real OS pipes', async () => {
   const workspace = tempHome();
   const credentialHome = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
+  const received = [];
   const server = http.createServer((request, response) => {
     let body = '';
     request.setEncoding('utf8');
     request.on('data', chunk => { body += chunk; });
     request.on('end', () => {
       const message = JSON.parse(body);
+      received.push({ method: request.method, url: request.url, body, authorization: request.headers.authorization });
+      if (received.length === 1) {
+        response.writeHead(307, { location: request.url });
+        response.end();
+        return;
+      }
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [] } }));
     });
@@ -6488,6 +6577,42 @@ test('proxy binary carries two sequential requests over real OS pipes', async ()
   await new Promise(resolve => server.close(resolve));
   assert.equal(exit, 0, errors.join(''));
   assert.deepEqual(output.map(message => message.id), [1, 2]);
+  assert.equal(received.length, 3);
+  assert.deepEqual(received[0], received[1]);
+});
+
+test('proxy native fetch does not forward credentials to a redirect origin', async () => {
+  let targetRequests = 0, originRequests = 0;
+  const target = http.createServer((_request, response) => { targetRequests += 1; response.end(); });
+  const origin = http.createServer((_request, response) => {
+    originRequests += 1;
+    response.writeHead(307, { location: `http://127.0.0.1:${target.address().port}/mcp` });
+    response.end();
+  });
+  const credentialHome = tempHome();
+  let workspace;
+  try {
+    await Promise.all([target, origin].map(server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve))));
+    const url = `http://127.0.0.1:${origin.address().port}/mcp`;
+    workspace = proxyWorkspace('project-123', url);
+    const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+    storeProjectCredential({ projectId: 'project-123', mcpUrl: url, bearerToken: 'redirect-network-fixture', expiresAt: new Date(Date.now() + 60_000).toISOString() }, env, workspace);
+    let output = '';
+    await runProxy({
+      projectId: 'project-123', cwd: workspace, env,
+      stdin: Readable.from(['{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n']),
+      stdout: { write: chunk => { output += chunk; } },
+      fetchImpl: globalThis.fetch,
+    });
+    assert.equal(originRequests, 1);
+    assert.equal(targetRequests, 0);
+    assert.match(JSON.parse(output).error.message, /could not reach/);
+    assert.doesNotMatch(output, /redirect-network-fixture/);
+  } finally {
+    await Promise.all([target, origin].map(server => new Promise(resolve => server.close(resolve))));
+    fs.rmSync(credentialHome, { recursive: true, force: true });
+    if (workspace) fs.rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test('proxy turns a backend 401 into a recoverable error and continues', async () => {

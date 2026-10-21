@@ -120,6 +120,27 @@ async function cancelResponseBody(response) {
   }
 }
 
+async function fetchProjectRequest(fetchImpl, url, options) {
+  const requestOptions = { ...options, redirect: 'manual' };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetchImpl(url, requestOptions);
+    if (!(response?.status >= 300 && response.status < 400)) return response;
+    const location = response.headers?.get?.('location');
+    let sameUrl = false;
+    try {
+      sameUrl = !!location && new URL(location, url).href === url;
+    } catch {
+      // Invalid redirect locations are rejected without another request.
+    }
+    await cancelResponseBody(response);
+    if (attempt !== 0 || response.status !== 307 || !sameUrl || options.signal?.aborted) {
+      throw safeRemoteError('MCP proxy rejected a backend redirect.');
+    }
+    // A cold-mounted runtime retries its exact original URL. Keep the same
+    // method, body, credentials and deadline; never request the Location URL.
+  }
+}
+
 async function boundedText(response, maxBodyBytes) {
   if (response.body?.getReader) {
     const reader = response.body.getReader();
@@ -435,9 +456,8 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
       if (sessionId) headers['mcp-session-id'] = sessionId;
       let response;
       try {
-        response = await fetchImpl(credential.mcpUrl, {
+        response = await fetchProjectRequest(fetchImpl, credential.mcpUrl, {
           method: 'POST',
-          redirect: 'error',
           headers,
           body: JSON.stringify(request),
           ...(typeof AbortSignal?.timeout === 'function' ? { signal: AbortSignal.timeout(requestTimeoutMs) } : {}),
@@ -488,9 +508,8 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
         };
         const stream = (async () => {
           try {
-            const eventResponse = await fetchImpl(credential.mcpUrl, {
+            const eventResponse = await fetchProjectRequest(fetchImpl, credential.mcpUrl, {
               method: 'GET',
-              redirect: 'error',
               headers: eventHeaders,
               signal: controller.signal,
             });

@@ -1071,3 +1071,45 @@ test('explicit switch replaces bindings with unsupported or noncanonical scopes'
     });
   }
 });
+
+test('delegated bind reports local readiness and credential-only rebind avoids a reload', async () => {
+  const workspace = tempDirectory();
+  const credentialHome = tempDirectory();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  const args = bindArgs({ ...binding('handover'), bootstrap: true });
+  const env = { HOME: tempDirectory(), SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  async function bind() {
+    let output = '';
+    let exchanges = 0;
+    await runCli(args, env, workspace, {
+      stdin: Readable.from(['https://handover.spala.ai/mcp/agent-instructions/opaque/consume\n']),
+      stdout: { write: value => { output += value; } },
+      stderr: { write: () => {} },
+    }, {
+      fetch: async () => {
+        exchanges += 1;
+        return new Response(JSON.stringify({
+          access_token: 'mcp_synthetic_handover_only',
+          expires_at: new Date(Date.now() + 60000).toISOString(),
+          mcp_url: binding('handover').mcpUrl,
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+      storeProjectCredential: () => {},
+    });
+    assert.equal(exchanges, 1, 'only the bootstrap exchange, no claimed project probe');
+    return JSON.parse(output);
+  }
+  const first = await bind();
+  assert.ok(first.nextSteps.some(step => step.action === 'restart_required'));
+  assert.deepEqual(first.readiness, {
+    credentialConfigured: true, projectProbe: 'not_performed',
+    hostClientConnection: 'not_verified', secondProjectOAuthRequired: false,
+  });
+  const second = await bind();
+  assert.equal(second.outcome, 'bound');
+  assert.equal(second.nextSteps.some(step => step.action === 'restart_required'), false);
+  const guidance = second.nextSteps.find(step => step.action === 'verify').instruction;
+  assert.match(guidance, /does not require a client restart or second project OAuth/);
+  assert.match(guidance, /cannot revive a dead client connection/);
+  assert.doesNotMatch(guidance, /Start a new session/);
+});

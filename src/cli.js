@@ -616,7 +616,10 @@ function nextProxySteps(plan) {
     steps.push({ action: 'configure_client', client: 'gemini', command: commands.geminiCli, argv: commands.argv.geminiCli });
     steps.push({ action: 'restart_required', client: 'gemini', dynamicReload: false, instruction: CLIENT_RELOAD_GUIDANCE.gemini });
   }
-  steps.push({ action: 'verify', instruction: 'Start a new session in this workspace and list the project MCP tools. For Codex, use codex fork to keep the conversation; codex resume does not refresh its MCP tools.' });
+  const reloadRequired = steps.some(step => step.action === 'restart_required');
+  steps.push({ action: 'verify', instruction: reloadRequired
+    ? 'After the required client reload, list the project MCP tools in this workspace. Binding alone does not verify the host client connection. No second project OAuth is required for this delegated credential.'
+    : 'The current running proxy reads the fresh credential on its next request; credential-only rebind does not require a client restart or second project OAuth. List the project MCP tools in this workspace to verify the host connection. If the host connection has already closed, reconnect it using the client controls; binding cannot revive a dead client connection.' });
   return steps;
 }
 
@@ -2039,12 +2042,21 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       if (lifecycleLock) await lifecycleLock.release();
       closeProjectBindingDirectory(bindingDirectory);
     }
+    if (agentic) {
+      const appliedPlan = {
+        ...plan,
+        skipped: (plan.skipped || []).map(item => item.client === 'claude-code' && claudeRegistration?.changed === false
+          ? { ...item, commandRequired: false } : item),
+      };
+      steps = nextProxySteps(appliedPlan);
+    }
     const payload = {
       ...basePayload,
       outcome: 'bound',
       changed: agentic || bound.changed || installed.writes.length > 0,
       binding: bound.binding,
       agenticCredentialConfigured: agentic,
+      ...(agentic ? { readiness: { credentialConfigured: true, projectProbe: 'not_performed', hostClientConnection: 'not_verified', secondProjectOAuthRequired: false } } : {}),
       claudeRegistrationConfigured: claudeCommandRequired ? true : undefined,
       plan: summarizeAppliedPlan(plan, installed),
       nextSteps: steps.filter(step => !(step.action === 'configure_client' && step.client === 'claude-code')),

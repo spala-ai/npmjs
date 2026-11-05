@@ -7364,18 +7364,19 @@ test('project proxy delivers an update notice through JSON and SSE without alter
   }
 });
 
-test('current installer upgrades previous marked Claude proxy without claiming an unmarked registration', () => {
+for (const priorVersion of ['0.1.33', '0.1.34']) test(`current installer recognizes marked Claude proxy ${priorVersion} without claiming an unmarked registration`, () => {
   const workspace = fs.realpathSync(proxyWorkspace());
   const home = tempHome();
   const env = { SPALA_MCP_INSTALL_HOME: home, CLAUDE_CONFIG_DIR: home };
   const serverName = 'spala-project-test';
-  const args = ['dlx', '@spala-ai/mcp-install@0.1.33', 'proxy', '--project-id', 'project-123', MANAGED_PROXY_REGISTRATION_FLAG];
+  const priorSpec = `@spala-ai/mcp-install@${priorVersion}`;
+  const args = ['dlx', priorSpec, 'proxy', '--project-id', 'project-123', MANAGED_PROXY_REGISTRATION_FLAG];
   const config = { projects: { [fs.realpathSync(workspace)]: { mcpServers: { [serverName]: { type: 'stdio', command: 'pnpm', args } } } } };
   try {
     fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify(config));
     const inspect = () => inspectClaudeLocalProxyRegistration({ cwd: workspace, env, projectId: 'project-123', serverName });
     assert.equal(inspect().installerOwned, true);
-    assert.equal(inspect().configured, false);
+    assert.equal(inspect().configured, priorSpec === INSTALLER_PACKAGE_SPEC);
     args.pop();
     fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify(config));
     assert.equal(inspect().installerOwned, false);
@@ -7383,4 +7384,104 @@ test('current installer upgrades previous marked Claude proxy without claiming a
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+test('proxy keeps stdio alive after dropped, malformed or timed-out POST bodies without replaying writes', async t => {
+  for (const mode of ['dropped', 'malformed', 'timeout']) await t.test(mode, async () => {
+    const credentialHome = tempHome();
+    const workspace = proxyWorkspace();
+    const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome, SPALA_MCP_PROXY_TIMEOUT_MS: '1000' };
+    storeProjectCredential({ projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_private_body_test', expiresAt: new Date(Date.now() + 60000).toISOString() }, env, workspace);
+    const output = [], calls = [];
+    const keepAlive = setTimeout(() => {}, 3000);
+    try {
+      await runProxy({ projectId: 'project-123', cwd: workspace, env,
+        stdin: Readable.from([1, 2].map(id => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'builder_update_resource', arguments: { marker: id } } }) + '\n')),
+        stdout: { write: chunk => { output.push(JSON.parse(String(chunk))); return true; } },
+        fetchImpl: async (_url, options) => {
+          const request = JSON.parse(options.body); calls.push(request);
+          if (request.id === 1) {
+            if (mode === 'malformed') return new Response('{broken-json private_backend_detail', { headers: { 'content-type': 'application/json' } });
+            return { ok: true, status: 200, headers: { get: () => 'application/json' }, body: { getReader: () => ({
+              read: () => mode === 'dropped' ? Promise.reject(Error('private_backend_detail')) : new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Error('private_backend_detail')), { once: true })),
+              releaseLock() {},
+            }), cancel: async () => {} } };
+          }
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { ok: true } }), { headers: { 'content-type': 'application/json' } });
+        },
+      });
+    } finally { clearTimeout(keepAlive); }
+    assert.deepEqual(calls.map(request => request.id), [1, 2]);
+    assert.equal(output.length, 2);
+    assert.equal(output[0].id, 1); assert.equal(output[0].error.data.requestOutcome, 'unknown');
+    assert.match(output[0].error.message, /may have executed.*check.*before retrying/i);
+    assert.deepEqual(output[1], { jsonrpc: '2.0', id: 2, result: { ok: true } });
+    assert.doesNotMatch(JSON.stringify(output), /mcp_private_body_test|private_backend_detail/);
+  });
+});
+
+test('proxy does not emit a duplicate response when a finite SSE body fails after delivering its result', async () => {
+  const credentialHome = tempHome(), workspace = proxyWorkspace();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  storeProjectCredential({ projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_partial_result_secret', expiresAt: new Date(Date.now() + 60000).toISOString() }, env, workspace);
+  const output = [], calls = [];
+  await runProxy({ projectId: 'project-123', cwd: workspace, env,
+    stdin: Readable.from([1, 2].map(id => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list' }) + '\n')),
+    stdout: { write: chunk => { output.push(JSON.parse(String(chunk))); return true; } },
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body); calls.push(request.id);
+      if (request.id === 2) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 2, result: {} }), { headers: { 'content-type': 'application/json' } });
+      let reads = 0;
+      return { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body: {
+        getReader: () => ({ read: async () => { if (reads++) throw Error('private_stream_failure'); return { value: new TextEncoder().encode('data: {"jsonrpc":"2.0","id":1,"result":{"alreadyDelivered":true}}\n\n'), done: false }; }, releaseLock() {} }), cancel: async () => {},
+      } };
+    },
+  });
+  assert.deepEqual(calls, [1, 2]);
+  assert.deepEqual(output, [{ jsonrpc: '2.0', id: 1, result: { alreadyDelivered: true } }, { jsonrpc: '2.0', id: 2, result: {} }]);
+});
+
+test('a running proxy picks up public handover credentials and resets its old backend session', async () => {
+  const credentialHome = tempHome(), workspace = proxyWorkspace();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const credential = token => ({ projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: token, expiresAt: new Date(Date.now() + 60000).toISOString() });
+  storeProjectCredential(credential('mcp_handover_old_secret'), env, workspace);
+  const stdin = new PassThrough(), output = [], posts = []; let cancelled = 0;
+  stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n');
+  await runProxy({ projectId: 'project-123', cwd: workspace, env, stdin,
+    stdout: { write: chunk => {
+      const message = JSON.parse(String(chunk)); output.push(message);
+      if (message.id === 1) { storeProjectCredential(credential('mcp_handover_new_secret'), env, workspace); stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'); }
+      else stdin.end();
+      return true;
+    } },
+    fetchImpl: async (_url, options) => {
+      if (options.method === 'GET') return new Response(new ReadableStream({ cancel() { cancelled++; } }), { headers: { 'content-type': 'text/event-stream' } });
+      const request = JSON.parse(options.body); posts.push({ id: request.id, authorization: options.headers.authorization, session: options.headers['mcp-session-id'] });
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }), { headers: { 'content-type': 'application/json', ...(request.id === 1 ? { 'mcp-session-id': 'old-session' } : {}) } });
+    },
+  });
+  assert.deepEqual(posts, [{ id: 1, authorization: 'Bearer mcp_handover_old_secret', session: undefined }, { id: 2, authorization: 'Bearer mcp_handover_new_secret', session: undefined }]);
+  assert.equal(cancelled, 1); assert.deepEqual(output.map(message => message.id), [1, 2]);
+  assert.doesNotMatch(JSON.stringify(output), /mcp_handover_(old|new)_secret/);
+});
+
+test('a proxy started before credential handover returns an honest error and accepts the next request after handover', async () => {
+  const credentialHome = tempHome(), workspace = proxyWorkspace();
+  const env = { SPALA_MCP_CREDENTIAL_HOME: credentialHome };
+  const stdin = new PassThrough(), output = []; let calls = 0;
+  stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n');
+  await runProxy({ projectId: 'project-123', cwd: workspace, env, stdin,
+    stdout: { write: chunk => {
+      const message = JSON.parse(String(chunk)); output.push(message);
+      if (message.id === 1) {
+        storeProjectCredential({ projectId: 'project-123', mcpUrl: 'https://shared.spala.ai/p123/mcp', bearerToken: 'mcp_late_handover_secret', expiresAt: new Date(Date.now() + 60000).toISOString() }, env, workspace);
+        stdin.write('{"jsonrpc":"2.0","id":2,"method":"initialize"}\n');
+      } else stdin.end();
+      return true;
+    } },
+    fetchImpl: async (_url, options) => { calls++; const request = JSON.parse(options.body); return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }), { headers: { 'content-type': 'application/json' } }); },
+  });
+  assert.equal(calls, 1); assert.ok(output[0].error); assert.equal(output[0].result, undefined); assert.deepEqual(output[1], { jsonrpc: '2.0', id: 2, result: {} });
+  assert.doesNotMatch(JSON.stringify(output), /mcp_late_handover_secret/);
 });

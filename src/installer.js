@@ -77,6 +77,7 @@ const MARKED_PROXY_PACKAGE_SPECS = new Set([
   '@spala-ai/mcp-install@0.1.31',
   '@spala-ai/mcp-install@0.1.32',
   '@spala-ai/mcp-install@0.1.33',
+  '@spala-ai/mcp-install@0.1.34',
 ]);
 
 export const CLIENT_LABELS = {

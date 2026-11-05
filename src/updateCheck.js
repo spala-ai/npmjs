@@ -68,7 +68,7 @@ export function createUpdateCheck({ fetchImpl = globalThis.fetch, now = Date.now
     },
     decorate(message, request) {
       if (!availableVersion || availableVersion === announcedVersion || message?.id !== request?.id || !message?.result || message.error) return message;
-      const notice = `Spala installer update available: ${installedVersion} → ${availableVersion}. Update this workspace's project MCP at a safe stopping point: call public project_connect for the currently bound project and current client, run the returned exact installer argv, then follow its reload instruction. Do not switch projects, edit credentials, run a parallel OAuth flow, or repeatedly retry in the old session. This is a maintenance notice; the project result is unchanged.`;
+      const notice = `Spala installer update available: ${installedVersion} → ${availableVersion}. Update this workspace's project MCP at a safe stopping point: call public project_connect for the currently bound project and current client, run the returned exact installer argv, then follow its returned guidance. Credential-only rebind with unchanged registration needs no restart; to run an updated proxy binary, relaunch the host connection at a safe stopping point. Do not switch projects, edit credentials, run a parallel OAuth flow, or repeatedly retry in the old session. This is a maintenance notice; the project result is unchanged.`;
       let result;
       if (request.method === 'initialize') {
         result = { ...message.result, instructions: [message.result.instructions, notice].filter(Boolean).join('\n') };

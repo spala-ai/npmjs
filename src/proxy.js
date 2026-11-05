@@ -1,6 +1,6 @@
 import readline from 'node:readline';
 import { createUpdateCheck } from './updateCheck.js';
-import { projectCredentialStatus, readProjectCredential } from './credentialStore.js';
+import { readProjectCredential } from './credentialStore.js';
 import { mcpAuthorizationMatches } from './installer.js';
 import { readProjectBinding } from './workspace.js';
 
@@ -147,18 +147,20 @@ async function boundedText(response, maxBodyBytes) {
     const decoder = new TextDecoder();
     let text = '';
     let bytes = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (value) {
-        bytes += value.byteLength ?? value.length ?? 0;
-        if (bytes > maxBodyBytes) {
-          await reader.cancel?.().catch(() => {});
-          throw safeRemoteError('MCP proxy response exceeded the configured size limit.');
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value) {
+          bytes += value.byteLength ?? value.length ?? 0;
+          if (bytes > maxBodyBytes) {
+            await reader.cancel?.().catch(() => {});
+            throw safeRemoteError('MCP proxy response exceeded the configured size limit.');
+          }
+          text += decoder.decode(value, { stream: true });
         }
-        text += decoder.decode(value, { stream: true });
+        if (done) return text + decoder.decode();
       }
-      if (done) return text + decoder.decode();
-    }
+    } finally { reader.releaseLock?.(); }
   }
   const text = await response.text();
   if (text.length > maxBodyBytes) {
@@ -294,6 +296,7 @@ async function emitSseStream(body, stdout, { maxTotalBytes, maxEventBytes, drain
     if (buffer.trim()) await emitEvent(buffer);
   } finally {
     onReader?.(undefined);
+    reader.releaseLock?.();
   }
 }
 
@@ -322,11 +325,10 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
   if (binding.projectId !== projectId) {
     throw new Error('MCP proxy project does not match the current workspace binding. Rebind this workspace before retrying.');
   }
-  if (projectCredentialStatus(projectId, env, workspaceRoot).status === 'expired') {
-    process.stderr?.write?.(`Spala MCP proxy: stored credential for project ${projectId} is expired; requests will error until the project is re-bound.\n`);
-  } else {
-    readProjectCredential(projectId, env, workspaceRoot);
-  }
+  // A public handover may publish the credential after this stdio process
+  // starts. Validate the immutable binding now and credentials per request;
+  // unavailable credentials must never fabricate initialize success or force
+  // a process restart before the next request can pick up the handover.
   const updates = createUpdateCheck({ fetchImpl: updateFetchImpl });
   let sessionId;
   let protocolVersion = DEFAULT_PROTOCOL_VERSION;
@@ -545,12 +547,24 @@ export async function runProxy({ projectId, env = process.env, cwd = process.cwd
         stream.then(clearSettledStream, clearSettledStream);
       }
       if (response.status === 202 || response.status === 204) continue;
+      let responseDelivered = false;
       try {
-        await emitResponse(response, stdout, maxBodyBytes, stdoutDrainTimeoutMs, message => updates.decorate(message, request));
+        await emitResponse(response, stdout, maxBodyBytes, stdoutDrainTimeoutMs, message => {
+          // If a finite SSE response delivers its result before its reader
+          // fails, do not synthesize a second JSON-RPC response for this ID.
+          if (request?.id !== undefined && request?.id !== null && message?.id === request.id
+            && (Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error'))) responseDelivered = true;
+          return updates.decorate(message, request);
+        });
       } catch (error) {
         if (error instanceof ProxyOutputError) throw error;
         if (error instanceof Error && error.message.includes('size limit')) throw error;
-        throw safeRemoteError('MCP proxy received an invalid response from the project backend.');
+        await cancelResponseBody(response);
+        if (!responseDelivered) await emitRecoverableError(request,
+          'MCP proxy could not read a complete valid backend response. The request may have executed; check its outcome before retrying changes. The connection remains available.',
+          { requestOutcome: 'unknown' });
+        // Never replay the original request: it may already have committed.
+        // The next client request re-reads current credentials as usual.
       }
     }
   } finally {

@@ -193,7 +193,11 @@ is required. Legacy installer-owned `.mcp.json` project entries are removed
 only after the delegated bind has been reviewed and can be rolled back.
 
 The proxy reads credentials before every request, so a successful re-bind heals
-an already running process. A rejected bearer becomes an actionable JSON-RPC
+an already running current proxy on its next request without restarting the client.
+A successful bind confirms local binding and credential configuration, not a
+protected project probe or a connected host client. No second project OAuth is
+needed after delegated binding. A connection the host already closed still needs
+the client’s reconnect controls; binding cannot revive it. A rejected bearer becomes an actionable JSON-RPC
 error instead of wedging the stdio connection. Startup, remote requests, and
 stdout backpressure are bounded; a disconnected client fails promptly rather
 than waiting indefinitely.
@@ -340,7 +344,10 @@ initialization and every 15 minutes of tool activity. It adds one agent-visible
 notice per newer version per session. Checks are credential-free, bounded to
 1.5 seconds, and fail open for maintenance; project authentication is unchanged.
 The notice asks the agent to reconnect the same project through public
-`project_connect`, execute its exact installer plan, and reload the client at a
-safe stopping point. It never installs an update automatically. Older proxies
+`project_connect` and execute its exact installer plan at a safe stopping point.
+A credential-only rebind with unchanged registration needs no client restart.
+A new registration or configuration change needs the returned reload steps;
+updating the proxy binary also requires relaunching the host connection so it
+runs the new version. It never installs an update automatically. Older proxies
 need a one-time reconnect to gain these checks. Remote public MCP code updates
 on the server; native plugin/skill releases have their own update mechanisms.

@@ -461,9 +461,14 @@ function isOlderSameProjectInstallerProxy(existingCommand, existingArgs, command
     || existingArgs[2] !== 'proxy' || args[2] !== 'proxy'
     || existingArgs[3] !== '--project-id' || args[3] !== '--project-id'
     || existingArgs[4] !== args[4]) return false;
-  const oldVersion = /^@spala-ai\/mcp-install@0\.1\.(\d+)$/.exec(existingArgs[1]);
-  const newVersion = /^@spala-ai\/mcp-install@0\.1\.(\d+)$/.exec(args[1]);
-  return Boolean(oldVersion && newVersion && Number(oldVersion[1]) < Number(newVersion[1]));
+  const versionPattern = /^@spala-ai\/mcp-install@(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+  const oldVersion = versionPattern.exec(existingArgs[1])?.slice(1).map(Number);
+  const newVersion = versionPattern.exec(args[1])?.slice(1).map(Number);
+  if (!oldVersion || !newVersion || ![...oldVersion, ...newVersion].every(Number.isSafeInteger)) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (oldVersion[index] !== newVersion[index]) return oldVersion[index] < newVersion[index];
+  }
+  return false;
 }
 
 function duplicateReconciliation(document, serverName, mcpUrl, duplicateServerNames) {

@@ -4878,21 +4878,25 @@ test('agentic Codex handoff upgrades its existing same-project remote entry to t
   assert.doesNotMatch(config, /mcp_replacement_secret|\[mcp_servers\.spala_project_existing\]\nurl =/);
 });
 
-test('Codex project handoff upgrades only a simple older proxy for the same project', () => {
+for (const previousVersion of ['0.1.29', '0.1.34', '1.34.9']) test(`Codex project handoff upgrades only a simple older proxy ${previousVersion} for the same project`, () => {
   const workspace = tempHome();
   fs.mkdirSync(path.join(workspace, '.git'));
   fs.mkdirSync(path.join(workspace, '.codex'));
   const configPath = path.join(workspace, '.codex', 'config.toml');
   const previous = '[mcp_servers.spala_project_existing]\ncommand = "pnpm"\nargs = ["dlx","@spala-ai/mcp-install@0.1.29","proxy","--project-id","project-123"]\n\n[mcp_servers.unrelated]\nurl = "https://other.test/mcp"\n';
-  fs.writeFileSync(configPath, previous);
+  const oldConfig = previous.replace('0.1.29', previousVersion);
+  fs.writeFileSync(configPath, oldConfig);
   const plan = createProxyInstallPlan({ clientSelection: 'codex', cwd: workspace, dryRun: true,
     projectId: 'project-123', serverName: 'spala_project_existing' });
   assert.equal(plan.writes[0].action, 'update');
   assert.match(plan.writes[0].content, new RegExp(INSTALLER_PACKAGE_SPEC.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(plan.writes[0].content, /\[mcp_servers\.unrelated\]\nurl = "https:\/\/other\.test\/mcp"/);
-  assert.equal(fs.readFileSync(configPath, 'utf8'), previous, 'planning must not mutate config');
+  assert.equal(fs.readFileSync(configPath, 'utf8'), oldConfig, 'planning must not mutate config');
 
   for (const altered of [
+    previous.replace('0.1.29', '99.0.0'),
+    previous.replace('0.1.29', '0.1.29-beta'),
+    previous.replace('@spala-ai/mcp-install@0.1.29', '@other/mcp-install@0.1.29'),
     previous.replace('project-123', 'different-project'),
     previous.replace('command = "pnpm"', 'command = "other"'),
     previous.replace('"project-123"]', '"project-123"]\nenv = { CUSTOM = "value" }'),

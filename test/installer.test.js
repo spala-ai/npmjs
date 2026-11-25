@@ -4284,6 +4284,27 @@ test('project bind, status, and unbind operate from nested workspace directories
   assert.ok(bound.nextSteps.every(step => step.action !== 'authenticate_client' && step.action !== 'approve'));
   assert.doesNotMatch(bindIo.output(), /grant|access.?token|refresh.?token|authorization|cookie/i);
   assert.equal(fs.existsSync(path.join(workspace, '.codex', 'config.toml')), true);
+  const notePath = path.join(workspace, '.spala', 'AGENTS.md');
+  assert.deepEqual(bound.agentNote, { file: '.spala/AGENTS.md', action: 'create' });
+  const note = fs.readFileSync(notePath, 'utf8');
+  assert.match(note, /managed-by:@spala-ai\/mcp-install/);
+  assert.match(note, /Project id: `project-123`/);
+  assert.match(note, new RegExp(`Project MCP server: \`${bound.binding.serverName}\``));
+  assert.match(note, /only through its project MCP server/);
+  assert.match(note, /can hand off any project the signed-in account can\s+open/);
+  assert.match(note, /not loaded here\. The connection still exists/);
+
+  const rebindIo = io();
+  await runCli([
+    'project', 'bind',
+    '--project-id', 'project-123',
+    '--project-url', 'https://shared.spala.ai/p123/',
+    '--url', 'https://shared.spala.ai/p123/mcp?scope=builder%2Cproject%2Cdata',
+    '--client', 'codex',
+    '--yes',
+    '--json',
+  ], {}, nested, rebindIo.streams);
+  assert.equal(JSON.parse(rebindIo.output()).agentNote.action, 'unchanged');
 
   const statusIo = io();
   await runCli(['project', 'status', '--json'], {}, nested, statusIo.streams);
@@ -4291,8 +4312,47 @@ test('project bind, status, and unbind operate from nested workspace directories
 
   const unbindIo = io();
   await runCli(['project', 'unbind', '--yes', '--json'], {}, nested, unbindIo.streams);
-  assert.equal(JSON.parse(unbindIo.output()).outcome, 'unbound');
+  const unbound = JSON.parse(unbindIo.output());
+  assert.equal(unbound.outcome, 'unbound');
+  assert.deepEqual(unbound.agentNote, { file: '.spala/AGENTS.md', action: 'removed' });
+  assert.equal(fs.existsSync(notePath), false);
   assert.equal(fs.existsSync(path.join(workspace, '.spala', 'project.json')), false);
+});
+
+test('project bind and unbind leave a hand-written .spala/AGENTS.md untouched', async () => {
+  const workspace = tempHome();
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.mkdirSync(path.join(workspace, '.spala'), { mode: 0o700 });
+  const notePath = path.join(workspace, '.spala', 'AGENTS.md');
+  fs.writeFileSync(notePath, '# My own notes\n');
+  const run = async argv => {
+    let output = '';
+    await runCli(argv, {}, workspace, {
+      stdout: { write: chunk => { output += chunk; } },
+      stderr: { write: () => {} },
+      stdin: { isTTY: false },
+    });
+    return JSON.parse(output);
+  };
+
+  const bound = await run([
+    'project', 'bind',
+    '--project-id', 'project-own-note',
+    '--project-url', 'https://shared.spala.ai/pown/',
+    '--url', 'https://shared.spala.ai/pown/mcp?scope=builder%2Cproject%2Cdata',
+    '--client', 'codex',
+    '--yes',
+    '--json',
+  ]);
+  assert.equal(bound.outcome, 'bound');
+  assert.equal(bound.agentNote.action, 'skipped');
+  assert.match(bound.agentNote.reason, /unmanaged file at \.spala\/AGENTS\.md/);
+  assert.equal(fs.readFileSync(notePath, 'utf8'), '# My own notes\n');
+
+  const unbound = await run(['project', 'unbind', '--yes', '--json']);
+  assert.equal(unbound.outcome, 'unbound');
+  assert.equal(unbound.agentNote.action, 'absent');
+  assert.equal(fs.readFileSync(notePath, 'utf8'), '# My own notes\n');
 });
 
 test('plain project prepare and bind output renders structured next steps without undefined values', async () => {

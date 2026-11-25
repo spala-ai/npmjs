@@ -54,6 +54,7 @@ import {
   storeProjectCredentialAndRetire,
 } from './credentialStore.js';
 import { runProxy } from './proxy.js';
+import { syncWorkspaceAgentNote } from './workspaceNote.js';
 import {
   PROJECT_BINDING_SCHEMA_VERSION,
   assertProjectBindingRevision,
@@ -1602,6 +1603,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       if (lifecycleLock) await lifecycleLock.release();
       closeProjectBindingDirectory(bindingDirectory);
     }
+    const agentNote = syncWorkspaceAgentNote(current.workspaceRoot, null, installPlan);
     const payload = {
       schemaVersion: 1,
       command: 'project-unbind',
@@ -1609,6 +1611,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       ok: true,
       changed: result.changed || credential.changed || claudeRegistration.changed,
       bindingFile: '.spala/project.json',
+      agentNote,
       nextSteps: [{ action: 'notice', instruction: 'The workspace binding, stored agentic credential, and installer-owned private Claude Code registration were removed. Other client configuration and client-owned manual OAuth credentials remain untouched.' }],
     };
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
@@ -2050,9 +2053,11 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
       };
       steps = nextProxySteps(appliedPlan);
     }
+    const agentNote = syncWorkspaceAgentNote(bound.workspaceRoot || bindingPlan.workspaceRoot, bound.binding, installPlan);
     const payload = {
       ...basePayload,
       outcome: 'bound',
+      agentNote,
       changed: agentic || bound.changed || installed.writes.length > 0,
       binding: bound.binding,
       agenticCredentialConfigured: agentic,
@@ -2064,6 +2069,7 @@ export async function runCli(argv, env = process.env, cwd = process.cwd(), strea
     if (args.json) io.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     else {
       io.stdout.write(`Bound workspace to Spala project ${bound.binding.projectId}.\n`);
+      if (agentNote.action === 'create' || agentNote.action === 'update') io.stdout.write(`Wrote agent rules for this project to ${agentNote.file}.\n`);
       printNextSteps(payload.nextSteps, io);
     }
     return;

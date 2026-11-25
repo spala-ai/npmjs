@@ -116,6 +116,16 @@ any `profile` value other than exactly `guided` are rejected.
 The binding is written atomically with mode `0600`; `.spala` and the binding
 file may not be symbolic links.
 
+A successful bind also writes `.spala/AGENTS.md`, a short managed note for
+coding agents. It names the bound project and its MCP server and states the
+working rules: change the backend only through the project MCP, treat missing
+project tools as "not loaded in this session" and reconnect, and remember that
+the public MCP can hand off any project the account can open. The note holds no
+secrets. Rebinding rewrites it and `project unbind` removes it. A file at that
+path without the installer's marker is never replaced or removed; the command
+output then reports `agentNote.action` as `skipped`, and the bind still
+succeeds.
+
 The authenticated Public MCP may supply these non-secret project identity
 values after completing its server-side bootstrap through the Spala control
 plane. Preauthorization grants, dashboard sessions, bearer tokens, OAuth codes,
